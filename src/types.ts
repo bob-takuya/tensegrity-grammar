@@ -85,6 +85,8 @@ export interface ForcePolygon {
 
 // ─── App State ───────────────────────────────────────────────────
 
+import type { RuleMatch, HistoryTree } from './grammar/types';
+
 export interface AppState {
   diagram: DiagramData;
   equilibrium: EquilibriumResult | null;
@@ -92,10 +94,16 @@ export interface AppState {
   forcePolygons: ForcePolygon[];
   selectedIds: string[];
   mode: EditMode;
-  edgeStartNode: string | null;     // for addEdge mode
-  forceStartNode: string | null;    // for addForce mode
+  edgeStartNode: string | null;
+  forceStartNode: string | null;
   undoStack: DiagramData[];
   redoStack: DiagramData[];
+  // Grammar (Phase 2)
+  selectedRuleId: string | null;
+  ruleMatches: RuleMatch[];
+  ruleParams: Record<string, number>;
+  highlightedMatchIndex: number | null;
+  historyTree: HistoryTree | null;
 }
 
 // ─── Actions ─────────────────────────────────────────────────────
@@ -116,4 +124,11 @@ export type AppAction =
   | { type: 'REDO' }
   | { type: 'LOAD_STATE'; data: DiagramData }
   | { type: 'RECOMPUTE' }
-  | { type: 'PUSH_UNDO' };
+  | { type: 'PUSH_UNDO' }
+  // Grammar actions
+  | { type: 'SELECT_RULE'; ruleId: string | null }
+  | { type: 'SET_RULE_PARAM'; key: string; value: number }
+  | { type: 'HIGHLIGHT_MATCH'; index: number | null }
+  | { type: 'APPLY_RULE'; matchIndex: number }
+  | { type: 'NAVIGATE_HISTORY'; historyId: string }
+  | { type: 'AUTO_EXPLORE'; steps: number };

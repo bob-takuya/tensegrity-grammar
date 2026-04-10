@@ -4,11 +4,15 @@ import {
   DiagramData,
   DiagramNode,
   DiagramEdge,
+  ForcePolygon,
 } from '../types';
 import { generateId } from '../utils/id';
 import { computeEquilibrium } from '../engine/equilibrium';
 import { buildHalfEdgeStructure } from '../engine/halfEdge';
 import { constructForceDiagram, computeForcePolygons } from '../engine/forceDiagram';
+import { presetRules } from '../grammar/presets';
+import { createHistoryTree, addHistoryNode, navigateHistory } from '../grammar/history';
+import { RuleMatch } from '../grammar/types';
 
 const MAX_UNDO = 50;
 
@@ -28,7 +32,7 @@ function recompute(state: AppState): AppState {
   const equilibrium = computeEquilibrium(nodes, edges);
 
   let forceDiagram = null;
-  let forcePolygons: import('../types').ForcePolygon[] = [];
+  let forcePolygons: ForcePolygon[] = [];
 
   if (equilibrium.status === 'determinate' && equilibrium.forces.size > 0) {
     try {
@@ -40,7 +44,14 @@ function recompute(state: AppState): AppState {
     forcePolygons = computeForcePolygons(nodes, edges, equilibrium);
   }
 
-  return { ...state, equilibrium, forceDiagram, forcePolygons };
+  // Recompute rule matches if a rule is selected
+  let ruleMatches = state.ruleMatches;
+  if (state.selectedRuleId) {
+    const rule = presetRules.find((r) => r.id === state.selectedRuleId);
+    ruleMatches = rule ? rule.findMatches(state.diagram) : [];
+  }
+
+  return { ...state, equilibrium, forceDiagram, forcePolygons, ruleMatches };
 }
 
 function pushUndo(state: AppState): AppState {
@@ -50,8 +61,9 @@ function pushUndo(state: AppState): AppState {
 }
 
 export function createInitialState(diagram?: DiagramData): AppState {
+  const d = diagram || { nodes: [], edges: [] };
   const state: AppState = {
-    diagram: diagram || { nodes: [], edges: [] },
+    diagram: d,
     equilibrium: null,
     forceDiagram: null,
     forcePolygons: [],
@@ -61,6 +73,12 @@ export function createInitialState(diagram?: DiagramData): AppState {
     forceStartNode: null,
     undoStack: [],
     redoStack: [],
+    // Grammar
+    selectedRuleId: null,
+    ruleMatches: [],
+    ruleParams: {},
+    highlightedMatchIndex: null,
+    historyTree: createHistoryTree(d),
   };
   return recompute(state);
 }
@@ -95,7 +113,6 @@ export function appReducer(state: AppState, action: AppAction): AppState {
 
     case 'ADD_EDGE': {
       if (action.source === action.target) return state;
-      // Check for duplicate
       const exists = state.diagram.edges.some(
         (e) =>
           (e.source === action.source && e.target === action.target) ||
@@ -210,6 +227,145 @@ export function appReducer(state: AppState, action: AppAction): AppState {
 
     case 'PUSH_UNDO':
       return pushUndo(state);
+
+    // ─── Grammar Actions ───────────────────────────────────────────
+
+    case 'SELECT_RULE': {
+      if (action.ruleId === null) {
+        return { ...state, selectedRuleId: null, ruleMatches: [], ruleParams: {}, highlightedMatchIndex: null };
+      }
+      const rule = presetRules.find((r) => r.id === action.ruleId);
+      if (!rule) return state;
+
+      // Set default parameters
+      const ruleParams: Record<string, number> = {};
+      for (const p of rule.parameters) {
+        ruleParams[p.key] = p.defaultValue;
+      }
+      const ruleMatches = rule.findMatches(state.diagram);
+      return { ...state, selectedRuleId: action.ruleId, ruleMatches, ruleParams, highlightedMatchIndex: null };
+    }
+
+    case 'SET_RULE_PARAM': {
+      const ruleParams = { ...state.ruleParams, [action.key]: action.value };
+      return { ...state, ruleParams };
+    }
+
+    case 'HIGHLIGHT_MATCH':
+      return { ...state, highlightedMatchIndex: action.index };
+
+    case 'APPLY_RULE': {
+      const rule = presetRules.find((r) => r.id === state.selectedRuleId);
+      if (!rule) return state;
+      const match = state.ruleMatches[action.matchIndex];
+      if (!match) return state;
+
+      const s = pushUndo(state);
+      const newDiagram = rule.apply(s.diagram, match, s.ruleParams);
+
+      // Update history tree
+      let historyTree = s.historyTree || createHistoryTree(s.diagram);
+      historyTree = addHistoryNode(historyTree, newDiagram, {
+        ruleId: rule.id,
+        ruleName: rule.name,
+        matchLabel: match.label,
+      });
+
+      // Recompute matches for the same rule on the new diagram
+      const newMatches = rule.findMatches(newDiagram);
+
+      return recompute({
+        ...s,
+        diagram: newDiagram,
+        ruleMatches: newMatches,
+        highlightedMatchIndex: null,
+        historyTree,
+        selectedIds: [],
+      });
+    }
+
+    case 'NAVIGATE_HISTORY': {
+      if (!state.historyTree) return state;
+      const targetNode = state.historyTree.nodes.get(action.historyId);
+      if (!targetNode) return state;
+
+      const s = pushUndo(state);
+      const historyTree = navigateHistory(s.historyTree!, action.historyId);
+
+      // Recompute matches
+      let ruleMatches: RuleMatch[] = [];
+      if (state.selectedRuleId) {
+        const rule = presetRules.find((r) => r.id === state.selectedRuleId);
+        if (rule) ruleMatches = rule.findMatches(targetNode.diagram);
+      }
+
+      return recompute({
+        ...s,
+        diagram: cloneDiagram(targetNode.diagram),
+        historyTree,
+        ruleMatches,
+        highlightedMatchIndex: null,
+        selectedIds: [],
+      });
+    }
+
+    case 'AUTO_EXPLORE': {
+      let currentState = state;
+      const steps = Math.min(action.steps, 20);
+
+      for (let i = 0; i < steps; i++) {
+        // Pick a random rule
+        const applicableRules = presetRules
+          .filter((r) => r.category !== 'removal') // avoid removing edges during auto-explore
+          .map((r) => ({ rule: r, matches: r.findMatches(currentState.diagram) }))
+          .filter((rm) => rm.matches.length > 0);
+
+        if (applicableRules.length === 0) break;
+
+        const pick = applicableRules[Math.floor(Math.random() * applicableRules.length)];
+        const matchIdx = Math.floor(Math.random() * pick.matches.length);
+        const match = pick.matches[matchIdx];
+
+        // Use default params with small random perturbation
+        const params: Record<string, number> = {};
+        for (const p of pick.rule.parameters) {
+          const range = p.max - p.min;
+          params[p.key] = p.defaultValue + (Math.random() - 0.5) * range * 0.3;
+          params[p.key] = Math.max(p.min, Math.min(p.max, params[p.key]));
+        }
+
+        const newDiagram = pick.rule.apply(currentState.diagram, match, params);
+
+        let historyTree = currentState.historyTree || createHistoryTree(currentState.diagram);
+        historyTree = addHistoryNode(historyTree, newDiagram, {
+          ruleId: pick.rule.id,
+          ruleName: pick.rule.name,
+          matchLabel: match.label,
+        });
+
+        currentState = {
+          ...currentState,
+          diagram: newDiagram,
+          historyTree,
+        };
+      }
+
+      // Recompute matches
+      let ruleMatches: RuleMatch[] = [];
+      if (currentState.selectedRuleId) {
+        const rule = presetRules.find((r) => r.id === currentState.selectedRuleId);
+        if (rule) ruleMatches = rule.findMatches(currentState.diagram);
+      }
+
+      return recompute({
+        ...pushUndo(state),
+        diagram: currentState.diagram,
+        historyTree: currentState.historyTree,
+        ruleMatches,
+        highlightedMatchIndex: null,
+        selectedIds: [],
+      });
+    }
 
     default:
       return state;

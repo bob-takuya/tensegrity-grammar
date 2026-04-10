@@ -35,7 +35,7 @@ export function FormCanvas() {
   const [dragMoved, setDragMoved] = useState(false);
   const [size, setSize] = useState({ w: 600, h: 500 });
 
-  const { diagram, mode, selectedIds, edgeStartNode, equilibrium } = state;
+  const { diagram, mode, selectedIds, edgeStartNode, equilibrium, ruleMatches, highlightedMatchIndex } = state;
 
   // Resize observer
   useEffect(() => {
@@ -380,6 +380,56 @@ export function FormCanvas() {
       ctx.stroke();
     }
 
+    // ─── Rule match highlights ──────────────────────────────────
+    if (ruleMatches.length > 0) {
+      for (let mi = 0; mi < ruleMatches.length; mi++) {
+        const match = ruleMatches[mi];
+        const isHighlighted = highlightedMatchIndex === mi;
+        const alpha = isHighlighted ? 0.6 : 0.15;
+
+        // Highlight matched edges
+        for (const eid of match.edgeIds) {
+          const edge = diagram.edges.find((e) => e.id === eid);
+          if (!edge) continue;
+          const src = nodeMap.get(edge.source);
+          const tgt = nodeMap.get(edge.target);
+          if (!src || !tgt) continue;
+          const [sx1, sy1] = worldToScreen(src.x, src.y, vt);
+          const [sx2, sy2] = worldToScreen(tgt.x, tgt.y, vt);
+          ctx.strokeStyle = `rgba(255, 152, 0, ${alpha})`;
+          ctx.lineWidth = 6;
+          ctx.beginPath();
+          ctx.moveTo(sx1, sy1);
+          ctx.lineTo(sx2, sy2);
+          ctx.stroke();
+        }
+
+        // Highlight matched nodes
+        for (const nid of match.nodeIds) {
+          const n = nodeMap.get(nid);
+          if (!n) continue;
+          const [sx, sy] = worldToScreen(n.x, n.y, vt);
+          ctx.beginPath();
+          ctx.arc(sx, sy, NODE_RADIUS + 5, 0, Math.PI * 2);
+          ctx.strokeStyle = `rgba(255, 152, 0, ${alpha})`;
+          ctx.lineWidth = 2;
+          ctx.stroke();
+        }
+
+        // Position marker for highlighted match
+        if (isHighlighted) {
+          const [mx, my] = worldToScreen(match.position.x, match.position.y, vt);
+          ctx.beginPath();
+          ctx.arc(mx, my, 10, 0, Math.PI * 2);
+          ctx.fillStyle = 'rgba(255, 152, 0, 0.3)';
+          ctx.fill();
+          ctx.strokeStyle = '#ff9800';
+          ctx.lineWidth = 2;
+          ctx.stroke();
+        }
+      }
+    }
+
     // Status indicator
     if (equilibrium) {
       const statusText =
@@ -401,7 +451,7 @@ export function FormCanvas() {
     ctx.fillStyle = '#888';
     ctx.textAlign = 'left';
     ctx.fillText(`Form Diagram — ${mode}`, 10, 18);
-  }, [diagram, vt, selectedIds, mode, edgeStartNode, equilibrium, size]);
+  }, [diagram, vt, selectedIds, mode, edgeStartNode, equilibrium, ruleMatches, highlightedMatchIndex, size]);
 
   return (
     <div ref={containerRef} className="canvas-container">
