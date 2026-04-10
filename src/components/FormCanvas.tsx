@@ -285,6 +285,39 @@ export function FormCanvas() {
     const nodeMap = new Map(diagram.nodes.map((n) => [n.id, n]));
     const forces = equilibrium?.forces || new Map<string, number>();
 
+    // Plate outlines (compression members with width > 0)
+    for (const edge of diagram.edges) {
+      if (edge.elementType !== 'compression' || edge.plateWidth <= 0) continue;
+      const src = nodeMap.get(edge.source);
+      const tgt = nodeMap.get(edge.target);
+      if (!src || !tgt) continue;
+
+      const dx = tgt.x - src.x;
+      const dy = tgt.y - src.y;
+      const len = Math.sqrt(dx * dx + dy * dy);
+      if (len < 1e-10) continue;
+      const nx = -dy / len * edge.plateWidth / 2;
+      const ny = dx / len * edge.plateWidth / 2;
+
+      const corners = [
+        worldToScreen(src.x + nx, src.y + ny, vt),
+        worldToScreen(tgt.x + nx, tgt.y + ny, vt),
+        worldToScreen(tgt.x - nx, tgt.y - ny, vt),
+        worldToScreen(src.x - nx, src.y - ny, vt),
+      ];
+
+      const isSelected = selectedIds.includes(edge.id);
+      ctx.beginPath();
+      ctx.moveTo(corners[0][0], corners[0][1]);
+      for (let i = 1; i < 4; i++) ctx.lineTo(corners[i][0], corners[i][1]);
+      ctx.closePath();
+      ctx.fillStyle = isSelected ? 'rgba(255,152,0,0.1)' : 'rgba(211,47,47,0.06)';
+      ctx.fill();
+      ctx.strokeStyle = isSelected ? '#ff9800' : 'rgba(211,47,47,0.3)';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+
     // Edges
     for (const edge of diagram.edges) {
       const src = nodeMap.get(edge.source);
@@ -296,6 +329,11 @@ export function FormCanvas() {
       const f = forces.get(edge.id);
       const isSelected = selectedIds.includes(edge.id);
 
+      // Tension cables: dashed
+      if (edge.elementType === 'tension') {
+        ctx.setLineDash([6, 4]);
+      }
+
       // Color by force
       if (f !== undefined && Math.abs(f) > 0.001) {
         if (f > 0) {
@@ -305,14 +343,15 @@ export function FormCanvas() {
         }
         ctx.lineWidth = Math.min(6, 2 + Math.abs(f) * 0.5);
       } else {
-        ctx.strokeStyle = isSelected ? '#ff9800' : '#555';
-        ctx.lineWidth = 2;
+        ctx.strokeStyle = isSelected ? '#ff9800' : (edge.elementType === 'tension' ? '#1976d2' : '#555');
+        ctx.lineWidth = edge.elementType === 'tension' ? 1.5 : 2;
       }
 
       ctx.beginPath();
       ctx.moveTo(sx1, sy1);
       ctx.lineTo(sx2, sy2);
       ctx.stroke();
+      ctx.setLineDash([]);
 
       // Force label
       if (f !== undefined && Math.abs(f) > 0.001) {

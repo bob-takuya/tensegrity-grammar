@@ -27,6 +27,9 @@ export interface DiagramEdge {
   source: string;
   target: string;
   elementType: ElementType;
+  // Plate properties (Phase 3: tensegrity)
+  plateWidth: number;    // width of the plate (perpendicular to edge), world units
+  plateThickness: number; // thickness of the plate (for fabrication), mm
 }
 
 // ─── Diagram Data (serializable snapshot) ────────────────────────
@@ -83,6 +86,36 @@ export interface ForcePolygon {
   residual: Vec2;
 }
 
+// ─── Tensegrity Validation ────────────────────────────────────────
+
+export interface TensegrityResult {
+  isValid: boolean;
+  compressionCount: number;
+  tensionCount: number;
+  issues: string[];
+  // Per-plate info for fabrication
+  plates: PlateInfo[];
+  cables: CableInfo[];
+}
+
+export interface PlateInfo {
+  edgeId: string;
+  label: string;
+  length: number;
+  width: number;
+  thickness: number;
+  // Corner coordinates for DXF export (world coords)
+  corners: [Vec2, Vec2, Vec2, Vec2];
+}
+
+export interface CableInfo {
+  edgeId: string;
+  label: string;
+  length: number;
+  sourceNodeId: string;
+  targetNodeId: string;
+}
+
 // ─── App State ───────────────────────────────────────────────────
 
 import type { RuleMatch, HistoryTree } from './grammar/types';
@@ -116,6 +149,8 @@ export type AppAction =
   | { type: 'SET_SUPPORT'; id: string; support: SupportType }
   | { type: 'SET_EXTERNAL_FORCE'; id: string; fx: number; fy: number }
   | { type: 'SET_ELEMENT_TYPE'; id: string; elementType: ElementType }
+  | { type: 'SET_PLATE_WIDTH'; id: string; width: number }
+  | { type: 'SET_PLATE_THICKNESS'; id: string; thickness: number }
   | { type: 'SELECT'; ids: string[] }
   | { type: 'SET_MODE'; mode: EditMode }
   | { type: 'SET_EDGE_START'; id: string | null }

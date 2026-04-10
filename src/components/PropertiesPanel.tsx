@@ -198,6 +198,42 @@ export function PropertiesPanel() {
             <option value="tension">Tension (cable)</option>
           </select>
         </div>
+        {selectedEdge.elementType === 'compression' && (
+          <>
+            <div className="prop-group">
+              <label>Plate Width</label>
+              <input
+                type="number"
+                step="0.05"
+                min="0.05"
+                value={selectedEdge.plateWidth}
+                onChange={(e) =>
+                  dispatch({
+                    type: 'SET_PLATE_WIDTH',
+                    id: selectedEdge.id,
+                    width: Math.max(0.05, parseFloat(e.target.value) || 0.3),
+                  })
+                }
+              />
+            </div>
+            <div className="prop-group">
+              <label>Plate Thickness (mm)</label>
+              <input
+                type="number"
+                step="0.5"
+                min="0.5"
+                value={selectedEdge.plateThickness}
+                onChange={(e) =>
+                  dispatch({
+                    type: 'SET_PLATE_THICKNESS',
+                    id: selectedEdge.id,
+                    thickness: Math.max(0.5, parseFloat(e.target.value) || 3),
+                  })
+                }
+              />
+            </div>
+          </>
+        )}
         {f !== undefined && (
           <div className="prop-group">
             <label>Computed Force</label>

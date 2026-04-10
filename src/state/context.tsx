@@ -11,9 +11,9 @@ function createDefaultDiagram(): DiagramData {
       { id: 'n2', x: 2, y: 2, support: 'free', externalForce: { x: 0, y: -2 } },
     ],
     edges: [
-      { id: 'e0', source: 'n0', target: 'n1', elementType: 'compression' as const },
-      { id: 'e1', source: 'n0', target: 'n2', elementType: 'compression' as const },
-      { id: 'e2', source: 'n1', target: 'n2', elementType: 'compression' as const },
+      { id: 'e0', source: 'n0', target: 'n1', elementType: 'compression' as const, plateWidth: 0.3, plateThickness: 3 },
+      { id: 'e1', source: 'n0', target: 'n2', elementType: 'compression' as const, plateWidth: 0.3, plateThickness: 3 },
+      { id: 'e2', source: 'n1', target: 'n2', elementType: 'compression' as const, plateWidth: 0.3, plateThickness: 3 },
     ],
   };
 }

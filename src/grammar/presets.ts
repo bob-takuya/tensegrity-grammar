@@ -9,7 +9,7 @@
  * forces automatically after each application.
  */
 
-import { DiagramData, DiagramNode, DiagramEdge } from '../types';
+import { DiagramData, DiagramNode, DiagramEdge, ElementType } from '../types';
 import { GrammarRule, RuleMatch } from './types';
 import { generateId } from '../utils/id';
 import { sub, add, scale, normalize, length, perp, angle } from '../engine/geometry';
@@ -21,6 +21,10 @@ function cloneDiagram(d: DiagramData): DiagramData {
     nodes: d.nodes.map((n) => ({ ...n, externalForce: { ...n.externalForce } })),
     edges: d.edges.map((e) => ({ ...e })),
   };
+}
+
+function newEdge(source: string, target: string, elementType: ElementType = 'compression'): DiagramEdge {
+  return { id: generateId('e'), source, target, elementType, plateWidth: 0.3, plateThickness: 3 };
 }
 
 // ─── Helper: get adjacent edges for a node ───────────────────────
@@ -96,20 +100,10 @@ const edgeSubdivision: GrammarRule = {
       externalForce: { x: 0, y: 0 },
     };
 
-    // Remove original edge, add two new edges
+    // Remove original edge, add two new edges inheriting plate properties
     d.edges.splice(edgeIdx, 1);
-    d.edges.push({
-      id: generateId('e'),
-      source: edge.source,
-      target: newNodeId,
-      elementType: edge.elementType,
-    });
-    d.edges.push({
-      id: generateId('e'),
-      source: newNodeId,
-      target: edge.target,
-      elementType: edge.elementType,
-    });
+    d.edges.push({ ...newEdge(edge.source, newNodeId, edge.elementType), plateWidth: edge.plateWidth, plateThickness: edge.plateThickness });
+    d.edges.push({ ...newEdge(newNodeId, edge.target, edge.elementType), plateWidth: edge.plateWidth, plateThickness: edge.plateThickness });
     d.nodes.push(newNode);
 
     return d;
@@ -162,12 +156,7 @@ const branching: GrammarRule = {
       support: 'free',
       externalForce: { x: 0, y: 0 },
     });
-    d.edges.push({
-      id: generateId('e'),
-      source: nodeId,
-      target: newNodeId,
-      elementType: 'compression',
-    });
+    d.edges.push(newEdge(nodeId, newNodeId));
 
     return d;
   },
@@ -238,10 +227,7 @@ const extension: GrammarRule = {
       externalForce: { x: 0, y: 0 },
     });
     d.edges.push({
-      id: generateId('e'),
-      source: nodeId,
-      target: newNodeId,
-      elementType: 'compression',
+      ...newEdge(nodeId, newNodeId),
     });
 
     return d;
@@ -313,12 +299,7 @@ const triangulation: GrammarRule = {
     );
     if (exists) return d;
 
-    d.edges.push({
-      id: generateId('e'),
-      source: a,
-      target: b,
-      elementType: 'compression',
-    });
+    d.edges.push(newEdge(a, b));
     return d;
   },
 };
@@ -435,10 +416,10 @@ const parallelOffset: GrammarRule = {
       externalForce: { x: 0, y: 0 },
     });
     // Parallel edge
-    d.edges.push({ id: generateId('e'), source: newSrcId, target: newTgtId, elementType: 'compression' });
+    d.edges.push(newEdge(newSrcId, newTgtId));
     // Connecting edges
-    d.edges.push({ id: generateId('e'), source: match.nodeIds[0], target: newSrcId, elementType: 'compression' });
-    d.edges.push({ id: generateId('e'), source: match.nodeIds[1], target: newTgtId, elementType: 'compression' });
+    d.edges.push(newEdge(match.nodeIds[0], newSrcId));
+    d.edges.push(newEdge(match.nodeIds[1], newTgtId));
 
     return d;
   },

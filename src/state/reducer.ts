@@ -126,6 +126,8 @@ export function appReducer(state: AppState, action: AppAction): AppState {
         source: action.source,
         target: action.target,
         elementType: 'compression',
+        plateWidth: 0.3,
+        plateThickness: 3,
       };
       const diagram = {
         ...s.diagram,
@@ -184,6 +186,28 @@ export function appReducer(state: AppState, action: AppAction): AppState {
         ...s.diagram,
         edges: s.diagram.edges.map((e) =>
           e.id === action.id ? { ...e, elementType: action.elementType } : e
+        ),
+      };
+      return recompute({ ...s, diagram });
+    }
+
+    case 'SET_PLATE_WIDTH': {
+      const s = pushUndo(state);
+      const diagram = {
+        ...s.diagram,
+        edges: s.diagram.edges.map((e) =>
+          e.id === action.id ? { ...e, plateWidth: action.width } : e
+        ),
+      };
+      return recompute({ ...s, diagram });
+    }
+
+    case 'SET_PLATE_THICKNESS': {
+      const s = pushUndo(state);
+      const diagram = {
+        ...s.diagram,
+        edges: s.diagram.edges.map((e) =>
+          e.id === action.id ? { ...e, plateThickness: action.thickness } : e
         ),
       };
       return recompute({ ...s, diagram });

@@ -610,3 +610,135 @@
   margin-top: 6px;
   flex-shrink: 0;
 }
+
+/* ─── Tensegrity Panel ────────────────────────────────────────── */
+.tensegrity-panel {
+  padding: 12px;
+  border-bottom: 1px solid #eee;
+}
+
+.tensegrity-panel h3 {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: #888;
+  margin-bottom: 10px;
+}
+
+.tensegrity-panel h4 {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: #999;
+  margin: 10px 0 6px;
+}
+
+.tensegrity-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.tensegrity-status.valid {
+  background: #e8f5e9;
+  color: #2e7d32;
+}
+
+.tensegrity-status.invalid {
+  background: #fff3e0;
+  color: #e65100;
+}
+
+.status-icon {
+  font-size: 14px;
+}
+
+.tensegrity-counts {
+  display: flex;
+  gap: 12px;
+  font-size: 11px;
+  color: #888;
+  margin-top: 6px;
+}
+
+.tensegrity-issues {
+  margin-top: 8px;
+}
+
+.issue-item {
+  font-size: 10px;
+  color: #c62828;
+  padding: 3px 6px;
+  margin-bottom: 2px;
+  background: #ffebee;
+  border-radius: 3px;
+  line-height: 1.4;
+}
+
+.fab-section {
+  margin-top: 4px;
+}
+
+.fab-table {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.fab-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 2px 6px;
+  font-size: 10px;
+  font-family: monospace;
+  background: #fafafa;
+  border-radius: 3px;
+}
+
+.fab-label {
+  font-weight: 600;
+  color: #555;
+}
+
+.fab-detail {
+  color: #888;
+}
+
+.export-section {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid #eee;
+}
+
+.export-buttons {
+  display: flex;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+.export-btn {
+  flex: 1;
+  padding: 5px 0;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  background: #fafafa;
+  cursor: pointer;
+  font-size: 10px;
+  transition: all 0.15s;
+}
+
+.export-btn:hover {
+  background: #e8f5e9;
+  border-color: #4caf50;
+  color: #2e7d32;
+}
+
+.export-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
