@@ -3,10 +3,11 @@
  */
 
 import { Vec3, MorphogenesisState, StructureGraph } from './types';
-import { createK5Cell } from './k5cell';
+import { createK5Cell, verifyEquilibrium, k5EdgePairs } from './k5cell';
 import { adhereCell, suggestNewPositions } from './adhesion';
 import { fuseOneEdge } from './fusion';
 import { isGeneralPosition } from './geometry';
+import { findNullspaceBasis } from './linalg';
 
 export function createEmptyState(): MorphogenesisState {
   return {
@@ -183,27 +184,7 @@ export function autoGrow(
     const cell = adhereCell(state, face, newPos, maxCompDeg);
     if (!cell) continue;
 
-    // Enforce maxCompDeg: fuse (remove) excess struts at nodes that exceed the limit
-    if (maxCompDeg < Infinity) {
-      let changed = true;
-      while (changed) {
-        changed = false;
-        for (const node of state.graph.nodes) {
-          const struts = state.graph.edges.filter(e =>
-            e.type === 'strut' && (e.n[0] === node.id || e.n[1] === node.id)
-          );
-          while (struts.length > maxCompDeg) {
-            // Remove the strut with smallest absolute force density (least important)
-            struts.sort((a, b) => Math.abs(a.forceDensity) - Math.abs(b.forceDensity));
-            fuseOneEdge(state, struts[0].id);
-            struts.shift();
-            changed = true;
-          }
-        }
-      }
-    }
-
-    // Additional random fusion for variety
+    // Random cable fusion for variety (topology change)
     if (Math.random() < fuseProbability) {
       const sharedSet = new Set(face);
       const sharedCables = state.graph.edges.filter(e =>
@@ -215,7 +196,119 @@ export function autoGrow(
     }
   }
 
+  // Recompute force densities from the full equilibrium matrix nullspace,
+  // then optimize strut/cable assignment for Class-k.
+  recomputeForces(state, maxCompDeg);
+
   return state.cells.length > 0;
+}
+
+/**
+ * Recompute force densities on all edges from the equilibrium matrix
+ * nullspace. Then optimize the linear combination of basis vectors
+ * to minimize Class-k violations (max struts per node).
+ */
+function recomputeForces(state: MorphogenesisState, maxCompDeg: number = Infinity): void {
+  const { nodes, edges } = state.graph;
+  if (edges.length === 0 || nodes.length === 0) return;
+
+  const m = edges.length, n = nodes.length;
+  const nodeIdx = new Map(nodes.map((nd, i) => [nd.id, i]));
+
+  // Build 3D equilibrium matrix A (3n × m)
+  const A: number[][] = Array.from({ length: 3 * n }, () => new Array(m).fill(0));
+  const lengths = new Array(m).fill(1);
+  for (let e = 0; e < m; e++) {
+    const [ni, nj] = edges[e].n;
+    const pi = nodes.find(nd => nd.id === ni)!;
+    const pj = nodes.find(nd => nd.id === nj)!;
+    const dx = pj.pos[0] - pi.pos[0], dy = pj.pos[1] - pi.pos[1], dz = pj.pos[2] - pi.pos[2];
+    const len = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    if (len < 1e-12) continue;
+    lengths[e] = len;
+    const ii = nodeIdx.get(ni)!, ij = nodeIdx.get(nj)!;
+    A[3 * ii][e] = dx / len; A[3 * ii + 1][e] = dy / len; A[3 * ii + 2][e] = dz / len;
+    A[3 * ij][e] = -dx / len; A[3 * ij + 1][e] = -dy / len; A[3 * ij + 2][e] = -dz / len;
+  }
+
+  const basis = findNullspaceBasis(A);
+  if (basis.length === 0) return;
+  state.stressBasis = basis;
+
+  // Find the best linear combination of basis vectors:
+  // minimize the number of Class-k violations.
+  // Use random search over coefficient signs (+1 or -1) for each basis vector.
+  const k = basis.length;
+
+  // Build edge-to-node-indices map for fast lookup
+  const edgeNodeMap: [number, number][] = edges.map(e => {
+    const i = nodes.findIndex(nd => nd.id === e.n[0]);
+    const j = nodes.findIndex(nd => nd.id === e.n[1]);
+    return [i, j];
+  });
+
+  // Objective: find coefficients α for basis vectors that minimize
+  // Class-k violations: max(0, strutCount(node) - maxCompDeg) summed over all nodes.
+  // Use random search with continuous coefficients + gradient-like refinement.
+  let bestCoeffs = new Array(k).fill(1);
+  let bestViolations = Infinity;
+
+  const countViolations = (coeffs: number[]): number => {
+    // Build combined vector
+    const strutCount = new Array(n).fill(0);
+    for (let e = 0; e < m; e++) {
+      let val = 0;
+      for (let i = 0; i < k; i++) val += coeffs[i] * basis[i][e];
+      if (val / lengths[e] < -1e-10) {
+        const [ni, nj] = edgeNodeMap[e];
+        if (ni >= 0) strutCount[ni]++;
+        if (nj >= 0) strutCount[nj]++;
+      }
+    }
+    let v = 0;
+    for (let i = 0; i < n; i++) {
+      if (strutCount[i] > maxCompDeg) v += strutCount[i] - maxCompDeg;
+    }
+    return v;
+  };
+
+  // Try many random coefficient vectors
+  const numTrials = Math.min(k * 200, 1000);
+  for (let trial = 0; trial < numTrials; trial++) {
+    const coeffs = new Array(k);
+    for (let i = 0; i < k; i++) coeffs[i] = (Math.random() - 0.5) * 2;
+
+    const v = countViolations(coeffs);
+    if (v < bestViolations) {
+      bestViolations = v;
+      bestCoeffs = [...coeffs];
+      if (v === 0) break;
+    }
+
+    // Also try with one large coefficient (emphasize one cell's stress)
+    if (trial < k * 2) {
+      const single = new Array(k).fill(0);
+      const idx = trial % k;
+      single[idx] = trial < k ? 1 : -1;
+      const vs = countViolations(single);
+      if (vs < bestViolations) {
+        bestViolations = vs;
+        bestCoeffs = [...single];
+        if (vs === 0) break;
+      }
+    }
+  }
+
+  // Apply the best combination
+  const combined = new Array(m).fill(0);
+  for (let i = 0; i < k; i++) {
+    for (let e = 0; e < m; e++) combined[e] += bestCoeffs[i] * basis[i][e];
+  }
+
+  for (let e = 0; e < m; e++) {
+    edges[e].forceDensity = combined[e] / lengths[e];
+    edges[e].type = edges[e].forceDensity > 1e-10 ? 'cable' : edges[e].forceDensity < -1e-10 ? 'strut' : 'cable';
+  }
 }
 
 /**

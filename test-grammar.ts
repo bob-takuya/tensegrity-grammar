@@ -1,15 +1,14 @@
-import { createEmptyState, autoGrow } from './src/morphogenesis/engine';
+import { createEmptyState, autoGrow, verifyEquilibrium } from './src/morphogenesis/engine';
 
-console.log('=== Class-1 vs Unconstrained ===\n');
+console.log('=== Structural Validity + Class-k Check ===\n');
 
 for (const maxCompDeg of [1, 2, 3, Infinity]) {
-  let totalMaxComp = 0, totalCells = 0, totalNodes = 0, trials = 10;
-  for (let t = 0; t < trials; t++) {
+  let eqPass = 0, totalMaxComp = 0, total = 10;
+  for (let t = 0; t < total; t++) {
     const s = createEmptyState();
-    autoGrow(s, 8, { spread: 0.5, fuseProbability: 0.2, maxCompDeg });
-    totalCells += s.cells.length;
-    totalNodes += s.graph.nodes.length;
-
+    autoGrow(s, 8, { spread: 0.5, fuseProbability: 0.1, maxCompDeg });
+    const res = verifyEquilibrium(s.graph.nodes, s.graph.edges);
+    if (res < 1e-6) eqPass++;
     let mc = 0;
     for (const n of s.graph.nodes) {
       const deg = s.graph.edges.filter(e => e.type === 'strut' && (e.n[0] === n.id || e.n[1] === n.id)).length;
@@ -18,5 +17,5 @@ for (const maxCompDeg of [1, 2, 3, Infinity]) {
     totalMaxComp += mc;
   }
   const label = maxCompDeg === Infinity ? '∞' : maxCompDeg.toString();
-  console.log(`maxCompDeg=${label}: avg_class=${(totalMaxComp/trials).toFixed(1)} avg_cells=${(totalCells/trials).toFixed(0)} avg_nodes=${(totalNodes/trials).toFixed(0)}`);
+  console.log(`maxCompDeg=${label}: equilibrium=${eqPass}/${total} avg_class=${(totalMaxComp/total).toFixed(1)}`);
 }
