@@ -2,7 +2,7 @@
  * Morphogenesis Engine: top-level API for cellular morphogenesis.
  */
 
-import { Vec3, MorphogenesisState, StructureGraph } from './types';
+import { Vec3, MorphogenesisState, StructureGraph, K5Cell } from './types';
 import { createK5Cell, verifyEquilibrium, k5EdgePairs } from './k5cell';
 import { adhereCell, suggestNewPositions } from './adhesion';
 import { fuseOneEdge } from './fusion';
@@ -80,111 +80,126 @@ export function grow(
  * @param numCells   Total number of cells to generate
  * @param spreadFn   Optional function to determine growth direction
  */
+/**
+ * Auto-grow using Type II tetrahedral cells (Appendix C of Aloui 2019).
+ *
+ * Each cell is a tetrahedron (4 surface nodes) + its centroid (1 interior node).
+ * The 4 edges from centroid to surface nodes are STRUTS.
+ * The 6 edges between surface nodes are CABLES.
+ *
+ * This guarantees:
+ *   - Surface nodes have exactly 1 strut per cell touching them
+ *   - Shared faces (3 surface nodes) only carry cables
+ *   - The centroid is the only node with multiple struts (4 per cell)
+ *   → Surface nodes achieve Class-1
+ *
+ * Growth: pick a triangular face → place a new vertex + centroid outward.
+ * The new tetrahedron shares the face (3 nodes) with the existing structure.
+ */
 export function autoGrow(
   state: MorphogenesisState,
   numCells: number,
   options: {
     baseRadius?: number;
     layerHeight?: number;
-    spread?: number;        // how much to deviate from straight-up (0=tower, 1=max spread)
+    spread?: number;
     fuseProbability?: number;
-    maxCompDeg?: number;    // max compression edges per node (1 = Class-1, Infinity = no limit)
+    maxCompDeg?: number;
   } = {}
 ): boolean {
   const {
     baseRadius = 1.5,
     layerHeight = 1.5,
     spread = 0.3,
-    fuseProbability = 0.3,
-    maxCompDeg = Infinity,
+    fuseProbability = 0.15,
+    maxCompDeg = 1,
   } = options;
 
-  // Step 1: Seed
+  // Step 1: Seed — first tetrahedron + centroid
   if (state.cells.length === 0) {
     const r = baseRadius;
-    const h = layerHeight;
-    const seedPoints: Vec3[] = [
+    // Regular tetrahedron vertices
+    const tetVerts: Vec3[] = [
       [r, 0, 0],
-      [-r * 0.5, r * 0.866, 0],
-      [-r * 0.5, -r * 0.866, 0],
-      [0, 0, h],                 // top center
-      [r * 0.3, r * 0.3, h * 0.6], // offset point for general position
+      [-r / 3, r * 0.943, 0],
+      [-r / 3, -r * 0.471, r * 0.816],
+      [-r / 3, -r * 0.471, -r * 0.816],
     ];
-    if (!seed(state, seedPoints)) return false;
+    const centroid: Vec3 = [
+      (tetVerts[0][0] + tetVerts[1][0] + tetVerts[2][0] + tetVerts[3][0]) / 4,
+      (tetVerts[0][1] + tetVerts[1][1] + tetVerts[2][1] + tetVerts[3][1]) / 4,
+      (tetVerts[0][2] + tetVerts[1][2] + tetVerts[2][2] + tetVerts[3][2]) / 4,
+    ];
+    // K₅ = 4 tet vertices + centroid
+    if (!seedTypeII(state, tetVerts, centroid)) return false;
   }
 
-  // Step 2: Grow
+  // Step 2: Grow by adding tetrahedra sharing a face
   const targetCells = Math.max(1, numCells);
   while (state.cells.length < targetCells) {
-    // Find boundary faces: triples of nodes that could be extended
     const faces = findGrowableFaces(state);
     if (faces.length === 0) break;
 
-    // Pick a face (prefer higher z for upward growth, with some randomness)
+    // Pick a face (prefer outward-facing with some randomness)
     faces.sort((a, b) => {
       const za = a.reduce((s, id) => s + (state.graph.nodes.find(n => n.id === id)?.pos[2] || 0), 0);
       const zb = b.reduce((s, id) => s + (state.graph.nodes.find(n => n.id === id)?.pos[2] || 0), 0);
-      return zb - za; // highest first
+      return zb - za;
     });
-    const topK = Math.min(3, faces.length);
+    const topK = Math.min(5, faces.length);
     const face = faces[Math.floor(Math.random() * topK)];
 
-    // Growth direction: face normal + random spread
-    const nodes = face.map(id => state.graph.nodes.find(n => n.id === id)!);
-    const cx = nodes.reduce((s, n) => s + n.pos[0], 0) / 3;
-    const cy = nodes.reduce((s, n) => s + n.pos[1], 0) / 3;
-    const cz = nodes.reduce((s, n) => s + n.pos[2], 0) / 3;
+    // Compute face centroid and outward normal
+    const faceNodes = face.map(id => state.graph.nodes.find(n => n.id === id)!);
+    const cx = faceNodes.reduce((s, n) => s + n.pos[0], 0) / 3;
+    const cy = faceNodes.reduce((s, n) => s + n.pos[1], 0) / 3;
+    const cz = faceNodes.reduce((s, n) => s + n.pos[2], 0) / 3;
 
-    // Face normal
-    const a = nodes[0].pos, b = nodes[1].pos, c = nodes[2].pos;
+    const a = faceNodes[0].pos, b = faceNodes[1].pos, c = faceNodes[2].pos;
     const ab: Vec3 = [b[0]-a[0], b[1]-a[1], b[2]-a[2]];
     const ac: Vec3 = [c[0]-a[0], c[1]-a[1], c[2]-a[2]];
     let nx = ab[1]*ac[2] - ab[2]*ac[1];
     let ny = ab[2]*ac[0] - ab[0]*ac[2];
     let nz = ab[0]*ac[1] - ab[1]*ac[0];
     const nl = Math.sqrt(nx*nx + ny*ny + nz*nz);
-    if (nl > 1e-10) { nx /= nl; ny /= nl; nz /= nl; }
-    else { nx = 0; ny = 0; nz = 1; }
+    if (nl > 1e-10) { nx /= nl; ny /= nl; nz /= nl; } else { nx = 0; ny = 0; nz = 1; }
 
-    // Ensure normal points "outward" (away from structure centroid)
-    const structCentroid = [
+    // Point outward from structure centroid
+    const sc = [
       state.graph.nodes.reduce((s, n) => s + n.pos[0], 0) / state.graph.nodes.length,
       state.graph.nodes.reduce((s, n) => s + n.pos[1], 0) / state.graph.nodes.length,
       state.graph.nodes.reduce((s, n) => s + n.pos[2], 0) / state.graph.nodes.length,
     ];
-    const toFace = [cx - structCentroid[0], cy - structCentroid[1], cz - structCentroid[2]];
-    if (nx * toFace[0] + ny * toFace[1] + nz * toFace[2] < 0) {
-      nx = -nx; ny = -ny; nz = -nz;
-    }
+    if (nx*(cx-sc[0]) + ny*(cy-sc[1]) + nz*(cz-sc[2]) < 0) { nx=-nx; ny=-ny; nz=-nz; }
 
-    // Add spread (random deviation from normal)
-    const spreadAngle = spread * Math.PI * 0.5;
-    const theta = Math.random() * spreadAngle;
-    const phi = Math.random() * Math.PI * 2;
-    // Rotate normal by theta around a random perpendicular axis
+    // Add spread
     const rx = (Math.random() - 0.5) * spread;
     const ry = (Math.random() - 0.5) * spread;
     const rz = (Math.random() - 0.5) * spread;
-    const dir: Vec3 = [nx + rx, ny + ry, nz + rz];
-    const dl = Math.sqrt(dir[0]**2 + dir[1]**2 + dir[2]**2);
-    if (dl > 1e-10) { dir[0] /= dl; dir[1] /= dl; dir[2] /= dl; }
+    let dx = nx + rx, dy = ny + ry, dz = nz + rz;
+    const dl = Math.sqrt(dx*dx + dy*dy + dz*dz);
+    if (dl > 1e-10) { dx /= dl; dy /= dl; dz /= dl; }
 
-    // New node positions (2 nodes for sharing 3)
-    const d = layerHeight;
-    const newPos: Vec3[] = [
-      [cx + dir[0] * d + (Math.random()-0.5)*0.5, cy + dir[1] * d + (Math.random()-0.5)*0.5, cz + dir[2] * d + (Math.random()-0.5)*0.5],
-      [cx + dir[0] * d * 0.7 + (Math.random()-0.5)*0.8, cy + dir[1] * d * 0.7 + (Math.random()-0.5)*0.8, cz + dir[2] * d * 0.7 + (Math.random()-0.5)*0.8],
+    // New vertex: offset from face centroid along normal
+    const h = layerHeight * (0.8 + Math.random() * 0.4);
+    const newVert: Vec3 = [cx + dx * h, cy + dy * h, cz + dz * h];
+
+    // Centroid of the new tetrahedron (3 face nodes + new vertex)
+    const tetCentroid: Vec3 = [
+      (cx * 3 + newVert[0]) / 4,
+      (cy * 3 + newVert[1]) / 4,
+      (cz * 3 + newVert[2]) / 4,
     ];
 
-    // Check general position before creating
-    const allPos = [...face.map(id => state.graph.nodes.find(n => n.id === id)!.pos), ...newPos];
+    // K₅ points: [face[0], face[1], face[2], newVert, tetCentroid]
+    const allPos = [...face.map(id => state.graph.nodes.find(n => n.id === id)!.pos), newVert, tetCentroid];
     if (!isGeneralPosition(allPos)) continue;
 
-    // Adhere
-    const cell = adhereCell(state, face, newPos, maxCompDeg);
+    // Create the Type II cell: sharing face[0..2], new nodes = newVert + centroid
+    const cell = adhereTypeII(state, face, newVert, tetCentroid);
     if (!cell) continue;
 
-    // Random cable fusion for variety (topology change)
+    // Optional fusion of a shared cable for variety
     if (Math.random() < fuseProbability) {
       const sharedSet = new Set(face);
       const sharedCables = state.graph.edges.filter(e =>
@@ -196,11 +211,80 @@ export function autoGrow(
     }
   }
 
-  // Recompute force densities from the full equilibrium matrix nullspace,
-  // then optimize strut/cable assignment for Class-k.
+  // Final: recompute forces from the global equilibrium matrix
   recomputeForces(state, maxCompDeg);
-
   return state.cells.length > 0;
+}
+
+/**
+ * Create a Type II K₅ cell: 4 tetrahedral vertices + 1 centroid.
+ * Struts: centroid → each vertex (4 struts).
+ * Cables: all pairs of vertices (6 cables).
+ */
+function seedTypeII(state: MorphogenesisState, tetVerts: Vec3[], centroid: Vec3): boolean {
+  // K₅ points: [v0, v1, v2, v3, centroid]
+  const points: Vec3[] = [...tetVerts, centroid];
+  const cellId = state.nextCellId++;
+  const cell = createK5Cell(state.graph, points, cellId);
+  if (!cell) return false;
+
+  // Force Type II assignment: edges 0-3→4 are struts, 0-1,0-2,0-3,1-2,1-3,2-3 are cables
+  // In K₅ edge order (i<j): (0,1),(0,2),(0,3),(0,4),(1,2),(1,3),(1,4),(2,3),(2,4),(3,4)
+  // Centroid is index 4. Edges to centroid: (0,4),(1,4),(2,4),(3,4) = indices 3,6,8,9
+  const centroidEdges = new Set([3, 6, 8, 9]); // indices of edges touching node 4
+  const pairs = k5EdgePairs();
+  for (let i = 0; i < 10; i++) {
+    const edge = state.graph.edges.find(e => e.id === cell.edgeIds[i])!;
+    const isStrutEdge = centroidEdges.has(i);
+    edge.type = isStrutEdge ? 'strut' : 'cable';
+    edge.typeLocked = true; // Lock Type II assignment
+    if (isStrutEdge && edge.forceDensity > 0) edge.forceDensity = -Math.abs(edge.forceDensity);
+    if (!isStrutEdge && edge.forceDensity < 0) edge.forceDensity = Math.abs(edge.forceDensity);
+  }
+
+  state.cells.push(cell);
+  const fullStress = new Array(state.graph.edges.length).fill(0);
+  const edgeIdToIdx = new Map(state.graph.edges.map((e, i) => [e.id, i]));
+  for (let k = 0; k < cell.edgeIds.length; k++) {
+    const idx = edgeIdToIdx.get(cell.edgeIds[k]);
+    if (idx !== undefined) fullStress[idx] = cell.selfStress[k];
+  }
+  state.stressBasis.push(fullStress);
+  return true;
+}
+
+/**
+ * Adhere a new Type II cell sharing 3 face nodes.
+ * The new cell has: shared[0..2] + newVertex + centroid.
+ * Struts go from centroid to all 4 other nodes.
+ * Cables go between all pairs of the 4 non-centroid nodes.
+ */
+function adhereTypeII(
+  state: MorphogenesisState,
+  faceIds: number[],
+  newVertex: Vec3,
+  centroid: Vec3
+): K5Cell | null {
+  // newPositions = [newVertex, centroid]
+  // In the K₅, local indices: 0,1,2 = shared face, 3 = newVertex, 4 = centroid
+  const cell = adhereCell(state, faceIds, [newVertex, centroid]);
+  if (!cell) return null;
+
+  // Force Type II: edges to centroid (local index 4) are struts, rest are cables
+  const centroidIdx = 4; // local index of centroid in the 5-node cell
+  const pairs = k5EdgePairs();
+  for (let i = 0; i < 10; i++) {
+    const [li, lj] = pairs[i];
+    const edge = state.graph.edges.find(e => e.id === cell.edgeIds[i]);
+    if (!edge) continue;
+    const touchesCentroid = li === centroidIdx || lj === centroidIdx;
+    edge.type = touchesCentroid ? 'strut' : 'cable';
+    edge.typeLocked = true; // Lock Type II assignment
+    if (touchesCentroid && edge.forceDensity > 0) edge.forceDensity = -Math.abs(edge.forceDensity);
+    if (!touchesCentroid && edge.forceDensity < 0) edge.forceDensity = Math.abs(edge.forceDensity);
+  }
+
+  return cell;
 }
 
 /**
@@ -254,22 +338,44 @@ function recomputeForces(state: MorphogenesisState, maxCompDeg: number = Infinit
   let bestViolations = Infinity;
 
   const countViolations = (coeffs: number[]): number => {
-    // Build combined vector
     const strutCount = new Array(n).fill(0);
+    let lockViolations = 0;
+
     for (let e = 0; e < m; e++) {
       let val = 0;
       for (let i = 0; i < k; i++) val += coeffs[i] * basis[i][e];
-      if (val / lengths[e] < -1e-10) {
+      const q = val / lengths[e];
+      const isNeg = q < -1e-10;
+
+      // Penalize violating locked type assignments (heavy penalty)
+      if (edges[e].typeLocked) {
+        if (edges[e].type === 'strut' && !isNeg) lockViolations += 10;
+        if (edges[e].type === 'cable' && isNeg) lockViolations += 10;
+      }
+
+      if (isNeg) {
         const [ni, nj] = edgeNodeMap[e];
         if (ni >= 0) strutCount[ni]++;
         if (nj >= 0) strutCount[nj]++;
       }
     }
-    let v = 0;
+
+    let classViolations = 0;
     for (let i = 0; i < n; i++) {
-      if (strutCount[i] > maxCompDeg) v += strutCount[i] - maxCompDeg;
+      if (strutCount[i] > maxCompDeg) classViolations += strutCount[i] - maxCompDeg;
     }
-    return v;
+
+    // Also penalize cable-only nodes (every node should have at least 1 strut)
+    let cableOnlyPenalty = 0;
+    for (let i = 0; i < n; i++) {
+      if (strutCount[i] === 0) {
+        // Check if this node has any edges at all
+        const hasEdges = edgeNodeMap.some(([a, b]) => a === i || b === i);
+        if (hasEdges) cableOnlyPenalty += 5;
+      }
+    }
+
+    return lockViolations + classViolations + cableOnlyPenalty;
   };
 
   // Try many random coefficient vectors

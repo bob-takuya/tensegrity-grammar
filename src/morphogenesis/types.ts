@@ -21,6 +21,7 @@ export interface MEdge {
   n: [number, number];        // node ids
   type: 'strut' | 'cable' | 'unassigned';
   forceDensity: number;        // w_ij: positive = tension, negative = compression
+  typeLocked: boolean;         // true if set by Type II assignment (don't override)
 }
 
 export interface StructureGraph {

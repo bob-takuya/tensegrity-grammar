@@ -140,6 +140,7 @@ export function createK5Cell(
       n: [nodeIds[li], nodeIds[lj]],
       type: types[idx],
       forceDensity: stress[idx],
+      typeLocked: false,
     });
     edgeIds.push(id);
   }
@@ -255,6 +256,7 @@ export function createK5CellWithSharedNodes(
         n: [ni, nj],
         type: types[idx],
         forceDensity: bestStress[idx],
+        typeLocked: false,
       });
       edgeIds.push(id);
     }
