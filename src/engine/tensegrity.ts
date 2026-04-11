@@ -115,24 +115,20 @@ export function validateTensegrity(diagram: DiagramData): TensegrityResult {
   const plates: PlateInfo[] = compressionEdges.map((e, i) => {
     const src = nodeMap.get(e.source)!;
     const tgt = nodeMap.get(e.target)!;
-    const d = sub({ x: tgt.x, y: tgt.y }, { x: src.x, y: src.y });
-    const len = length(d);
-    const p = scale(normalize(perp(d)), e.plateWidth / 2);
-
-    const corners: [Vec2, Vec2, Vec2, Vec2] = [
-      add({ x: src.x, y: src.y }, p),
-      add({ x: tgt.x, y: tgt.y }, p),
-      sub({ x: tgt.x, y: tgt.y }, p),
-      sub({ x: src.x, y: src.y }, p),
+    const dx = tgt.x - src.x, dy = tgt.y - src.y, dz = tgt.z - src.z;
+    const len3d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    const corners = getPlateCorners(e, nodeMap) || [
+      { x: src.x, y: src.y }, { x: tgt.x, y: tgt.y },
+      { x: tgt.x, y: tgt.y }, { x: src.x, y: src.y },
     ];
 
     return {
       edgeId: e.id,
       label: `P${i + 1}`,
-      length: len,
+      length: len3d,
       width: e.plateWidth,
       thickness: e.plateThickness,
-      corners,
+      corners: corners as [Vec2, Vec2, Vec2, Vec2],
     };
   });
 
@@ -166,17 +162,26 @@ function plateLabel(e: DiagramEdge, nodeMap: Map<string, DiagramNode>): string {
   return `(${src?.x},${src?.y})→(${tgt?.x},${tgt?.y})`;
 }
 
-/** Rough overlap check using bounding box of plate rectangles */
+/** Rough overlap check — skip if plates are at different z levels */
 function platesOverlap(
   a: DiagramEdge,
   b: DiagramEdge,
   nodeMap: Map<string, DiagramNode>
 ): boolean {
+  const srcA = nodeMap.get(a.source), tgtA = nodeMap.get(a.target);
+  const srcB = nodeMap.get(b.source), tgtB = nodeMap.get(b.target);
+  if (!srcA || !tgtA || !srcB || !tgtB) return false;
+
+  // If the z-ranges don't overlap, plates can't collide
+  const zA = [srcA.z, tgtA.z], zB = [srcB.z, tgtB.z];
+  const minZA = Math.min(...zA), maxZA = Math.max(...zA);
+  const minZB = Math.min(...zB), maxZB = Math.max(...zB);
+  if (maxZA < minZB - 0.05 || maxZB < minZA - 0.05) return false;
+
   const cornersA = getPlateCorners(a, nodeMap);
   const cornersB = getPlateCorners(b, nodeMap);
   if (!cornersA || !cornersB) return false;
 
-  // Use Separating Axis Theorem (SAT) for two oriented rectangles
   return satOverlap(cornersA, cornersB);
 }
 
@@ -189,6 +194,17 @@ function getPlateCorners(
   if (!src || !tgt) return null;
 
   const d = sub({ x: tgt.x, y: tgt.y }, { x: src.x, y: src.y });
+  const len = length(d);
+  if (len < 1e-6) {
+    // Vertical plate — use a default direction for the XY outline
+    const hw = e.plateWidth / 2;
+    return [
+      { x: src.x - hw, y: src.y - hw },
+      { x: src.x + hw, y: src.y - hw },
+      { x: src.x + hw, y: src.y + hw },
+      { x: src.x - hw, y: src.y + hw },
+    ];
+  }
   const p = scale(normalize(perp(d)), e.plateWidth / 2);
 
   return [
