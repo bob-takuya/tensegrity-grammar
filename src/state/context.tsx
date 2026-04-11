@@ -4,16 +4,9 @@ import { appReducer, createInitialState } from './reducer';
 
 // ─── Default example: simple Warren truss ────────────────────────
 function createDefaultDiagram(): DiagramData {
-  // Start with just 3 ground supports — no edges. The L-system grammar
-  // grows the tensegrity structure from these anchor points.
-  return {
-    nodes: [
-      { id: 'n0', x: -2, y: -1, z: 0, support: 'pin', externalForce: { x: 0, y: 0 } },
-      { id: 'n1', x: 2, y: -1, z: 0, support: 'pin', externalForce: { x: 0, y: 0 } },
-      { id: 'n2', x: 0, y: 2, z: 0, support: 'pin', externalForce: { x: 0, y: 0 } },
-    ],
-    edges: [],
-  };
+  // Start empty. The L-system tensegrity grammar creates
+  // the entire structure from scratch — no supports needed.
+  return { nodes: [], edges: [] };
 }
 
 interface AppContextType {
