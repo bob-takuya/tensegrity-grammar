@@ -17,6 +17,7 @@ export function appReducer(state: AppState, action: AppAction): AppState {
       autoGrow(morpho, action.numCells, {
         spread: action.spread,
         fuseProbability: action.fuseProbability,
+        maxCompDeg: action.maxCompDeg,
       });
       return { ...state, morpho, selectedNodeIds: [], selectedEdgeIds: [] };
     }

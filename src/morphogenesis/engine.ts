@@ -87,6 +87,7 @@ export function autoGrow(
     layerHeight?: number;
     spread?: number;        // how much to deviate from straight-up (0=tower, 1=max spread)
     fuseProbability?: number;
+    maxCompDeg?: number;    // max compression edges per node (1 = Class-1, Infinity = no limit)
   } = {}
 ): boolean {
   const {
@@ -94,6 +95,7 @@ export function autoGrow(
     layerHeight = 1.5,
     spread = 0.3,
     fuseProbability = 0.3,
+    maxCompDeg = Infinity,
   } = options;
 
   // Step 1: Seed
@@ -178,19 +180,37 @@ export function autoGrow(
     if (!isGeneralPosition(allPos)) continue;
 
     // Adhere
-    const cell = adhereCell(state, face, newPos);
+    const cell = adhereCell(state, face, newPos, maxCompDeg);
     if (!cell) continue;
 
-    // Optionally fuse a shared edge
+    // Enforce maxCompDeg: fuse (remove) excess struts at nodes that exceed the limit
+    if (maxCompDeg < Infinity) {
+      let changed = true;
+      while (changed) {
+        changed = false;
+        for (const node of state.graph.nodes) {
+          const struts = state.graph.edges.filter(e =>
+            e.type === 'strut' && (e.n[0] === node.id || e.n[1] === node.id)
+          );
+          while (struts.length > maxCompDeg) {
+            // Remove the strut with smallest absolute force density (least important)
+            struts.sort((a, b) => Math.abs(a.forceDensity) - Math.abs(b.forceDensity));
+            fuseOneEdge(state, struts[0].id);
+            struts.shift();
+            changed = true;
+          }
+        }
+      }
+    }
+
+    // Additional random fusion for variety
     if (Math.random() < fuseProbability) {
-      // Find a shared edge between this cell and an existing cell
       const sharedSet = new Set(face);
-      const sharedEdges = state.graph.edges.filter(e =>
-        sharedSet.has(e.n[0]) && sharedSet.has(e.n[1])
+      const sharedCables = state.graph.edges.filter(e =>
+        e.type === 'cable' && sharedSet.has(e.n[0]) && sharedSet.has(e.n[1])
       );
-      if (sharedEdges.length > 0) {
-        const toFuse = sharedEdges[Math.floor(Math.random() * sharedEdges.length)];
-        fuseOneEdge(state, toFuse.id);
+      if (sharedCables.length > 0) {
+        fuseOneEdge(state, sharedCables[Math.floor(Math.random() * sharedCables.length)].id);
       }
     }
   }

@@ -57,6 +57,8 @@
   width: 14px; height: 14px; border-radius: 50%; background: #4a6fa5; cursor: pointer;
 }
 
+.param-hint { font-size: 10px; color: #999; margin-top: 2px; }
+
 .generate-btn {
   width: 100%; padding: 8px 0; margin-bottom: 6px;
   border: none; border-radius: 6px; background: #4a6fa5; color: #fff;

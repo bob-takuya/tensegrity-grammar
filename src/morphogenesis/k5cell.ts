@@ -156,20 +156,21 @@ export function createK5Cell(
 /**
  * Create a K₅ cell that shares existing nodes.
  *
- * @param graph       The structure graph
- * @param sharedIds   IDs of existing nodes to reuse (3 or 4)
- * @param newPoints   Positions for new nodes (2 or 1)
- * @param cellId      ID for the new cell
+ * @param graph          The structure graph
+ * @param sharedIds      IDs of existing nodes to reuse (3 or 4)
+ * @param newPoints      Positions for new nodes (2 or 1)
+ * @param cellId         ID for the new cell
+ * @param maxCompDeg     Max compression edges per node (1 = Class-1)
  */
 export function createK5CellWithSharedNodes(
   graph: StructureGraph,
   sharedIds: number[],
   newPoints: Vec3[],
-  cellId: number
+  cellId: number,
+  maxCompDeg: number = Infinity
 ): K5Cell | null {
   if (sharedIds.length + newPoints.length !== 5) return null;
 
-  // Gather all 5 positions
   const allPositions: Vec3[] = [];
   const allNodeIds: number[] = [];
 
@@ -192,7 +193,47 @@ export function createK5CellWithSharedNodes(
   if (!stress) return null;
 
   const pairs = k5EdgePairs();
-  const types = assignTypes(stress);
+
+  // Try both sign orientations (+stress and -stress) and pick the one
+  // that best satisfies the maxCompDeg constraint at shared nodes.
+  const candidates = [stress, stress.map(v => -v)];
+  let bestStress = stress;
+  let bestViolations = Infinity;
+
+  for (const candidate of candidates) {
+    const types = assignTypes(candidate);
+    let violations = 0;
+
+    // Count how many struts each shared node would have with this sign choice
+    for (const sid of sharedIds) {
+      // Existing strut count
+      let strutCount = graph.edges.filter(e =>
+        e.type === 'strut' && (e.n[0] === sid || e.n[1] === sid)
+      ).length;
+
+      // New struts from this cell that touch this shared node
+      for (let idx = 0; idx < 10; idx++) {
+        const [li, lj] = pairs[idx];
+        const ni = allNodeIds[li], nj = allNodeIds[lj];
+        if (ni !== sid && nj !== sid) continue;
+        // Skip if edge already exists (it won't add a new strut)
+        const existing = graph.edges.find(e =>
+          (e.n[0] === ni && e.n[1] === nj) || (e.n[0] === nj && e.n[1] === ni)
+        );
+        if (existing) continue;
+        if (types[idx] === 'strut') strutCount++;
+      }
+
+      if (strutCount > maxCompDeg) violations += strutCount - maxCompDeg;
+    }
+
+    if (violations < bestViolations) {
+      bestViolations = violations;
+      bestStress = candidate;
+    }
+  }
+
+  const types = assignTypes(bestStress);
 
   // Create edges (skip if edge already exists between shared nodes)
   const edgeIds: number[] = [];
@@ -213,7 +254,7 @@ export function createK5CellWithSharedNodes(
         id,
         n: [ni, nj],
         type: types[idx],
-        forceDensity: stress[idx],
+        forceDensity: bestStress[idx],
       });
       edgeIds.push(id);
     }
@@ -223,8 +264,8 @@ export function createK5CellWithSharedNodes(
     id: cellId,
     nodeIds: allNodeIds,
     edgeIds,
-    selfStress: stress,
-    signPattern: classifySignPattern(stress),
+    selfStress: bestStress,
+    signPattern: classifySignPattern(bestStress),
   };
 }
 

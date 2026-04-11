@@ -24,19 +24,19 @@ import { createK5CellWithSharedNodes, k5EdgePairs, computeK5SelfStress } from '.
 export function adhereCell(
   state: MorphogenesisState,
   sharedIds: number[],
-  newPositions: Vec3[]
+  newPositions: Vec3[],
+  maxCompDeg: number = Infinity
 ): K5Cell | null {
   if (sharedIds.length + newPositions.length !== 5) return null;
   if (sharedIds.length < 3 || sharedIds.length > 4) return null;
 
-  // Verify shared nodes exist
   for (const sid of sharedIds) {
     if (!state.graph.nodes.find(n => n.id === sid)) return null;
   }
 
   const cellId = state.nextCellId++;
   const cell = createK5CellWithSharedNodes(
-    state.graph, sharedIds, newPositions, cellId
+    state.graph, sharedIds, newPositions, cellId, maxCompDeg
   );
   if (!cell) return null;
 

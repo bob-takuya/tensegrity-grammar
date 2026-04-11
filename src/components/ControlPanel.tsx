@@ -6,6 +6,7 @@ export function ControlPanel() {
   const [numCells, setNumCells] = useState(5);
   const [spread, setSpread] = useState(0.4);
   const [fuseProbability, setFuseProbability] = useState(0.2);
+  const [maxCompDeg, setMaxCompDeg] = useState(1); // 1 = Class-1
 
   const { morpho } = state;
   const nNodes = morpho.graph.nodes.length;
@@ -14,6 +15,9 @@ export function ControlPanel() {
   const nStruts = morpho.graph.edges.filter(e => e.type === 'strut').length;
   const nCables = morpho.graph.edges.filter(e => e.type === 'cable').length;
   const stressDim = morpho.stressBasis.length;
+  const actualMaxComp = nNodes > 0 ? Math.max(...morpho.graph.nodes.map(n =>
+    morpho.graph.edges.filter(e => e.type === 'strut' && (e.n[0] === n.id || e.n[1] === n.id)).length
+  )) : 0;
 
   return (
     <div className="control-panel">
@@ -44,8 +48,19 @@ export function ControlPanel() {
             onChange={e => setFuseProbability(parseFloat(e.target.value))} />
         </div>
 
+        <div className="param-group">
+          <label>Max struts/node<span className="param-value">{maxCompDeg === 99 ? '∞' : maxCompDeg}</span></label>
+          <input type="range" min={1} max={6} step={1} value={Math.min(maxCompDeg, 6)}
+            onChange={e => setMaxCompDeg(parseInt(e.target.value))} />
+          <div className="param-hint">
+            {maxCompDeg === 1 ? 'Class-1 (struts isolated)' :
+             maxCompDeg === 2 ? 'Class-2 (pairs allowed)' :
+             `Class-${maxCompDeg}`}
+          </div>
+        </div>
+
         <button className="generate-btn"
-          onClick={() => dispatch({ type: 'GENERATE', numCells, spread, fuseProbability })}>
+          onClick={() => dispatch({ type: 'GENERATE', numCells, spread, fuseProbability, maxCompDeg })}>
           Generate
         </button>
 
@@ -64,7 +79,8 @@ export function ControlPanel() {
             <div className="stat"><span className="stat-label">Nodes</span><span className="stat-value">{nNodes}</span></div>
             <div className="stat"><span className="stat-label">Struts</span><span className="stat-value strut-color">{nStruts}</span></div>
             <div className="stat"><span className="stat-label">Cables</span><span className="stat-value cable-color">{nCables}</span></div>
-            <div className="stat stat-wide"><span className="stat-label">Self-stress states</span><span className="stat-value">{stressDim}</span></div>
+            <div className="stat"><span className="stat-label">Stress dim</span><span className="stat-value">{stressDim}</span></div>
+            <div className="stat"><span className="stat-label">Class</span><span className="stat-value">{actualMaxComp}</span></div>
           </div>
 
           <div className="tensegrity-status valid" style={{ marginTop: 8 }}>
