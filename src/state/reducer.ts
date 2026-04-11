@@ -13,6 +13,13 @@ import { constructForceDiagram, computeForcePolygons } from '../engine/forceDiag
 import { presetRules } from '../grammar/presets';
 import { createHistoryTree, addHistoryNode, navigateHistory } from '../grammar/history';
 import { RuleMatch } from '../grammar/types';
+import {
+  ForceGrammarState,
+  initForceGrammar,
+  computeFeasibilityDomain,
+  resolveForceAddNode,
+  resolveForceConnect,
+} from '../grammar/forceGrammar';
 
 const MAX_UNDO = 50;
 
@@ -79,6 +86,8 @@ export function createInitialState(diagram?: DiagramData): AppState {
     ruleParams: {},
     highlightedMatchIndex: null,
     historyTree: createHistoryTree(d),
+    // Force grammar
+    forceGrammar: { active: false, interimForces: [], selectedForceId: null, feasibilityDomain: null, isComplete: false },
   };
   return recompute(state);
 }
@@ -389,6 +398,45 @@ export function appReducer(state: AppState, action: AppAction): AppState {
         highlightedMatchIndex: null,
         selectedIds: [],
       });
+    }
+
+    // ─── Force-Based Grammar Actions ─────────────────────────────
+
+    case 'START_FORCE_GRAMMAR': {
+      const fg = initForceGrammar(state.diagram);
+      return { ...state, forceGrammar: fg };
+    }
+
+    case 'STOP_FORCE_GRAMMAR': {
+      return {
+        ...state,
+        forceGrammar: { active: false, interimForces: [], selectedForceId: null, feasibilityDomain: null, isComplete: false },
+      };
+    }
+
+    case 'SELECT_INTERIM_FORCE': {
+      if (!action.forceId) {
+        return { ...state, forceGrammar: { ...state.forceGrammar, selectedForceId: null, feasibilityDomain: null } };
+      }
+      const force = state.forceGrammar.interimForces.find((f) => f.id === action.forceId);
+      if (!force) return state;
+      const domain = computeFeasibilityDomain(force, state.diagram);
+      return {
+        ...state,
+        forceGrammar: { ...state.forceGrammar, selectedForceId: action.forceId, feasibilityDomain: domain },
+      };
+    }
+
+    case 'RESOLVE_FORCE_ADD_NODE': {
+      const s = pushUndo(state);
+      const result = resolveForceAddNode(s.diagram, s.forceGrammar, action.forceId, action.x, action.y);
+      return recompute({ ...s, diagram: result.diagram, forceGrammar: result.forceGrammar, selectedIds: [] });
+    }
+
+    case 'RESOLVE_FORCE_CONNECT': {
+      const s = pushUndo(state);
+      const result = resolveForceConnect(s.diagram, s.forceGrammar, action.forceId, action.targetNodeId);
+      return recompute({ ...s, diagram: result.diagram, forceGrammar: result.forceGrammar, selectedIds: [] });
     }
 
     default:

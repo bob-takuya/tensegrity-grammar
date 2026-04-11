@@ -124,6 +124,75 @@ export function GrammarPanel() {
           </button>
         </div>
       </div>
+
+      {/* ─── Force-Based Grammar (Mirtsopoulos & Fivet) ────────── */}
+      <div className="force-grammar-section">
+        <h4>Force-Based Grammar</h4>
+        <p className="hint-text">
+          Build structures where equilibrium is guaranteed by construction.
+          Interim forces are routed through members to supports.
+        </p>
+        {!state.forceGrammar.active ? (
+          <button
+            className="explore-btn force-grammar-start"
+            onClick={() => dispatch({ type: 'START_FORCE_GRAMMAR' })}
+          >
+            Start Force Grammar
+          </button>
+        ) : (
+          <>
+            <button
+              className="explore-btn"
+              onClick={() => dispatch({ type: 'STOP_FORCE_GRAMMAR' })}
+            >
+              Stop
+            </button>
+
+            {state.forceGrammar.isComplete ? (
+              <div className="fg-complete">
+                Structure complete — all forces resolved.
+              </div>
+            ) : (
+              <div className="fg-forces">
+                <div className="fg-instructions">
+                  1. Select an interim force below<br/>
+                  2. Click on the canvas to place a new node<br/>
+                  &nbsp;&nbsp;&nbsp;(on the line of action = optimal)<br/>
+                  3. Or click an existing node to connect
+                </div>
+                {state.forceGrammar.interimForces.map((f) => {
+                  const fMag = Math.sqrt(f.fx * f.fx + f.fy * f.fy);
+                  const isSelected = state.forceGrammar.selectedForceId === f.id;
+                  const node = state.diagram.nodes.find((n) => n.id === f.nodeId);
+                  return (
+                    <div
+                      key={f.id}
+                      className={`fg-force-item ${isSelected ? 'selected' : ''}`}
+                      onClick={() =>
+                        dispatch({
+                          type: 'SELECT_INTERIM_FORCE',
+                          forceId: isSelected ? null : f.id,
+                        })
+                      }
+                    >
+                      <span className="fg-force-node">
+                        ({node?.x.toFixed(1)}, {node?.y.toFixed(1)})
+                      </span>
+                      <span className="fg-force-vec">
+                        ({f.fx.toFixed(2)}, {f.fy.toFixed(2)})
+                      </span>
+                      <span className="fg-force-mag">{fMag.toFixed(2)}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </>
+        )}
+        <div className="fg-ref">
+          Ref: Mirtsopoulos &amp; Fivet (archiDOCT 2020)
+        </div>
+      </div>
     </div>
   );
 }

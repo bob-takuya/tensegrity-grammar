@@ -776,3 +776,90 @@
   opacity: 0.4;
   cursor: default;
 }
+
+/* ─── Force-Based Grammar ─────────────────────────────────────── */
+.force-grammar-section {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid #eee;
+}
+
+.force-grammar-start {
+  width: 100%;
+  margin-top: 6px;
+  background: #fff3e0 !important;
+  border-color: #ff9800 !important;
+  color: #e65100 !important;
+  font-weight: 600;
+}
+
+.fg-complete {
+  margin-top: 8px;
+  padding: 8px;
+  background: #e8f5e9;
+  border-radius: 6px;
+  font-size: 11px;
+  color: #2e7d32;
+  font-weight: 600;
+  text-align: center;
+}
+
+.fg-forces {
+  margin-top: 6px;
+}
+
+.fg-instructions {
+  font-size: 10px;
+  color: #888;
+  line-height: 1.5;
+  margin-bottom: 6px;
+  padding: 6px;
+  background: #fafafa;
+  border-radius: 4px;
+}
+
+.fg-force-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 4px 6px;
+  margin-bottom: 2px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 10px;
+  font-family: monospace;
+  border: 1px solid transparent;
+  transition: all 0.1s;
+}
+
+.fg-force-item:hover {
+  background: #fff3e0;
+  border-color: #ffe0b2;
+}
+
+.fg-force-item.selected {
+  background: #fff3e0;
+  border-color: #ff9800;
+}
+
+.fg-force-node {
+  color: #555;
+}
+
+.fg-force-vec {
+  color: #e65100;
+  flex: 1;
+  text-align: center;
+}
+
+.fg-force-mag {
+  color: #888;
+  font-weight: 600;
+}
+
+.fg-ref {
+  margin-top: 8px;
+  font-size: 9px;
+  color: #bbb;
+  font-style: italic;
+}

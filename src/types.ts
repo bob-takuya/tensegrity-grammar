@@ -119,6 +119,7 @@ export interface CableInfo {
 // ─── App State ───────────────────────────────────────────────────
 
 import type { RuleMatch, HistoryTree } from './grammar/types';
+import type { ForceGrammarState } from './grammar/forceGrammar';
 
 export interface AppState {
   diagram: DiagramData;
@@ -137,6 +138,8 @@ export interface AppState {
   ruleParams: Record<string, number>;
   highlightedMatchIndex: number | null;
   historyTree: HistoryTree | null;
+  // Force-based grammar (Mirtsopoulos & Fivet)
+  forceGrammar: ForceGrammarState;
 }
 
 // ─── Actions ─────────────────────────────────────────────────────
@@ -166,4 +169,10 @@ export type AppAction =
   | { type: 'HIGHLIGHT_MATCH'; index: number | null }
   | { type: 'APPLY_RULE'; matchIndex: number }
   | { type: 'NAVIGATE_HISTORY'; historyId: string }
-  | { type: 'AUTO_EXPLORE'; steps: number };
+  | { type: 'AUTO_EXPLORE'; steps: number }
+  // Force-based grammar actions
+  | { type: 'START_FORCE_GRAMMAR' }
+  | { type: 'STOP_FORCE_GRAMMAR' }
+  | { type: 'SELECT_INTERIM_FORCE'; forceId: string | null }
+  | { type: 'RESOLVE_FORCE_ADD_NODE'; forceId: string; x: number; y: number }
+  | { type: 'RESOLVE_FORCE_CONNECT'; forceId: string; targetNodeId: string };

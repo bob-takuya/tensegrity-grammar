@@ -35,7 +35,7 @@ export function FormCanvas() {
   const [dragMoved, setDragMoved] = useState(false);
   const [size, setSize] = useState({ w: 600, h: 500 });
 
-  const { diagram, mode, selectedIds, edgeStartNode, equilibrium, ruleMatches, highlightedMatchIndex } = state;
+  const { diagram, mode, selectedIds, edgeStartNode, equilibrium, ruleMatches, highlightedMatchIndex, forceGrammar } = state;
 
   // Resize observer
   useEffect(() => {
@@ -108,6 +108,27 @@ export function FormCanvas() {
 
       switch (mode) {
         case 'select':
+          // Force grammar mode: clicking places a node to resolve the selected interim force
+          if (forceGrammar.active && forceGrammar.selectedForceId && !node) {
+            const [wx, wy] = screenToWorld(sx, sy, vt);
+            const snapped = snapToGrid({ x: wx, y: wy }, GRID_SIZE);
+            dispatch({
+              type: 'RESOLVE_FORCE_ADD_NODE',
+              forceId: forceGrammar.selectedForceId,
+              x: snapped.x,
+              y: snapped.y,
+            });
+            break;
+          }
+          // Force grammar: clicking an existing node connects to resolve
+          if (forceGrammar.active && forceGrammar.selectedForceId && node) {
+            dispatch({
+              type: 'RESOLVE_FORCE_CONNECT',
+              forceId: forceGrammar.selectedForceId,
+              targetNodeId: node.id,
+            });
+            break;
+          }
           if (node) {
             dispatch({ type: 'PUSH_UNDO' });
             dispatch({ type: 'SELECT', ids: [node.id] });
@@ -469,6 +490,101 @@ export function FormCanvas() {
       }
     }
 
+    // ─── Interim forces (force-based grammar) ─────────────────────
+    if (forceGrammar.active && forceGrammar.interimForces.length > 0) {
+      for (const iForce of forceGrammar.interimForces) {
+        const node = nodeMap.get(iForce.nodeId);
+        if (!node) continue;
+        const [sx, sy] = worldToScreen(node.x, node.y, vt);
+        const isSelected = forceGrammar.selectedForceId === iForce.id;
+        const fMag = Math.sqrt(iForce.fx * iForce.fx + iForce.fy * iForce.fy);
+        if (fMag < 0.01) continue;
+
+        // Draw the interim force arrow (orange/yellow)
+        const arrowLen = fMag * FORCE_ARROW_SCALE * 1.2;
+        const dx = (iForce.fx / fMag) * arrowLen;
+        const dy = -(iForce.fy / fMag) * arrowLen; // screen Y inverted
+        const endX = sx + dx;
+        const endY = sy + dy;
+
+        ctx.strokeStyle = isSelected ? '#ff6f00' : '#ffa000';
+        ctx.fillStyle = isSelected ? '#ff6f00' : '#ffa000';
+        ctx.lineWidth = isSelected ? 3.5 : 2.5;
+        ctx.beginPath();
+        ctx.moveTo(sx, sy);
+        ctx.lineTo(endX, endY);
+        ctx.stroke();
+
+        // Arrowhead
+        const ux = dx / arrowLen;
+        const uy = dy / arrowLen;
+        const hl = 10;
+        ctx.beginPath();
+        ctx.moveTo(endX, endY);
+        ctx.lineTo(endX - hl * ux + hl * 0.4 * uy, endY - hl * uy - hl * 0.4 * ux);
+        ctx.lineTo(endX - hl * ux - hl * 0.4 * uy, endY - hl * uy + hl * 0.4 * ux);
+        ctx.closePath();
+        ctx.fill();
+
+        // Label
+        ctx.font = 'bold 10px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText(`IF ${fMag.toFixed(2)}`, endX, endY - 8);
+
+        // Clickable indicator
+        if (isSelected) {
+          ctx.beginPath();
+          ctx.arc(sx, sy, NODE_RADIUS + 8, 0, Math.PI * 2);
+          ctx.strokeStyle = '#ff6f00';
+          ctx.lineWidth = 2;
+          ctx.setLineDash([3, 3]);
+          ctx.stroke();
+          ctx.setLineDash([]);
+        }
+      }
+
+      // Draw feasibility domain (line of action) for selected force
+      if (forceGrammar.feasibilityDomain?.type === 'line' && forceGrammar.feasibilityDomain.origin && forceGrammar.feasibilityDomain.direction) {
+        const { origin, direction } = forceGrammar.feasibilityDomain;
+        // Draw a long dashed line through the origin in the force direction
+        const ext = 20; // world units extent
+        const [sx1, sy1] = worldToScreen(origin.x - direction.x * ext, origin.y - direction.y * ext, vt);
+        const [sx2, sy2] = worldToScreen(origin.x + direction.x * ext, origin.y + direction.y * ext, vt);
+
+        ctx.strokeStyle = 'rgba(255, 111, 0, 0.25)';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([8, 6]);
+        ctx.beginPath();
+        ctx.moveTo(sx1, sy1);
+        ctx.lineTo(sx2, sy2);
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        // Label
+        const [lx, ly] = worldToScreen(origin.x + direction.x * 3, origin.y + direction.y * 3, vt);
+        ctx.font = '9px sans-serif';
+        ctx.fillStyle = 'rgba(255, 111, 0, 0.6)';
+        ctx.textAlign = 'left';
+        ctx.fillText('Line of Action (optimal placement)', lx + 5, ly - 5);
+      }
+
+      // Completion status
+      if (forceGrammar.isComplete) {
+        ctx.font = 'bold 12px sans-serif';
+        ctx.fillStyle = '#2e7d32';
+        ctx.textAlign = 'center';
+        ctx.fillText('✓ All interim forces resolved — equilibrium guaranteed', size.w / 2, 35);
+      } else {
+        ctx.font = '11px sans-serif';
+        ctx.fillStyle = '#ff6f00';
+        ctx.textAlign = 'center';
+        ctx.fillText(
+          `Force Grammar: ${forceGrammar.interimForces.length} interim force(s) remaining`,
+          size.w / 2, 35
+        );
+      }
+    }
+
     // Status indicator
     if (equilibrium) {
       const statusText =
@@ -490,7 +606,7 @@ export function FormCanvas() {
     ctx.fillStyle = '#888';
     ctx.textAlign = 'left';
     ctx.fillText(`Form Diagram — ${mode}`, 10, 18);
-  }, [diagram, vt, selectedIds, mode, edgeStartNode, equilibrium, ruleMatches, highlightedMatchIndex, size]);
+  }, [diagram, vt, selectedIds, mode, edgeStartNode, equilibrium, ruleMatches, highlightedMatchIndex, forceGrammar, size]);
 
   return (
     <div ref={containerRef} className="canvas-container">
