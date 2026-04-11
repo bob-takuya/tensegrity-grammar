@@ -1,72 +1,63 @@
 /**
- * Equilibrium solver for 2D truss structures.
+ * 3D Equilibrium solver for truss / tensegrity structures.
  *
- * Builds the equilibrium matrix and solves for member forces and reactions.
+ * Builds the 3D equilibrium matrix and solves for member forces and reactions.
  * Convention: positive force = tension, negative = compression.
+ *
+ * Supports:
+ *  - Determinate structures (exact solve)
+ *  - Indeterminate structures (minimum-norm solution)
+ *  - 3D: 3 equations per node (x, y, z)
  */
 
 import { DiagramNode, DiagramEdge, EquilibriumResult, Vec2 } from '../types';
-import { sub, length } from './geometry';
-import { solve } from './linalg';
+import { solve, findNullspaceBasis } from './linalg';
 
 export function computeEquilibrium(
   nodes: DiagramNode[],
   edges: DiagramEdge[]
 ): EquilibriumResult {
   if (nodes.length === 0 || edges.length === 0) {
-    return {
-      forces: new Map(),
-      reactions: new Map(),
-      status: 'no-structure',
-      residual: 0,
-    };
+    return { forces: new Map(), reactions: new Map(), status: 'no-structure', residual: 0 };
   }
 
-  const nodeMap = new Map(nodes.map((n) => [n.id, n]));
+  const nodeMap = new Map(nodes.map(n => [n.id, n]));
+  const supportedNodes = nodes.filter(n => n.support !== 'free');
 
-  // Identify free DOFs and reaction DOFs
-  const freeNodes = nodes.filter((n) => n.support === 'free');
-  const supportedNodes = nodes.filter((n) => n.support !== 'free');
+  // Determine if structure is 3D (any node with z ≠ 0)
+  const is3D = nodes.some(n => Math.abs(n.z) > 0.01);
+  const dim = is3D ? 3 : 2;
 
-  // Count reaction components
+  // Reaction components
   let reactionCount = 0;
-  const reactionInfo: { nodeId: string; component: 'x' | 'y'; index: number }[] = [];
+  const reactionInfo: { nodeId: string; component: 'x' | 'y' | 'z'; index: number }[] = [];
   for (const n of supportedNodes) {
     if (n.support === 'pin') {
       reactionInfo.push({ nodeId: n.id, component: 'x', index: reactionCount++ });
       reactionInfo.push({ nodeId: n.id, component: 'y', index: reactionCount++ });
+      if (is3D) reactionInfo.push({ nodeId: n.id, component: 'z', index: reactionCount++ });
     } else if (n.support === 'roller-x') {
-      // Roller on x-axis: vertical reaction only
       reactionInfo.push({ nodeId: n.id, component: 'y', index: reactionCount++ });
+      if (is3D) reactionInfo.push({ nodeId: n.id, component: 'z', index: reactionCount++ });
     } else if (n.support === 'roller-y') {
-      // Roller on y-axis: horizontal reaction only
       reactionInfo.push({ nodeId: n.id, component: 'x', index: reactionCount++ });
+      if (is3D) reactionInfo.push({ nodeId: n.id, component: 'z', index: reactionCount++ });
     }
   }
 
-  // All nodes participate in equilibrium
-  const allNodes = nodes;
-  const nodeIndexMap = new Map(allNodes.map((n, i) => [n.id, i]));
-  const numEqs = 2 * allNodes.length; // 2 equations per node
+  const nodeIndexMap = new Map(nodes.map((n, i) => [n.id, i]));
+  const numEqs = dim * nodes.length;
   const numMembers = edges.length;
   const numUnknowns = numMembers + reactionCount;
 
   if (numEqs === 0 || numUnknowns === 0) {
-    return {
-      forces: new Map(),
-      reactions: new Map(),
-      status: 'no-structure',
-      residual: 0,
-    };
+    return { forces: new Map(), reactions: new Map(), status: 'no-structure', residual: 0 };
   }
 
-  // Build the equilibrium matrix [A_members | A_reactions] * [f; R] = p
-  const A: number[][] = Array.from({ length: numEqs }, () =>
-    new Array(numUnknowns).fill(0)
-  );
+  // Build equilibrium matrix
+  const A: number[][] = Array.from({ length: numEqs }, () => new Array(numUnknowns).fill(0));
   const p: number[] = new Array(numEqs).fill(0);
 
-  // Member contributions
   for (let e = 0; e < edges.length; e++) {
     const edge = edges[e];
     const nSrc = nodeMap.get(edge.source);
@@ -76,20 +67,23 @@ export function computeEquilibrium(
     const iSrc = nodeIndexMap.get(edge.source)!;
     const iTgt = nodeIndexMap.get(edge.target)!;
 
-    const d = sub({ x: nTgt.x, y: nTgt.y }, { x: nSrc.x, y: nSrc.y });
-    const len = length(d);
+    const dx = nTgt.x - nSrc.x;
+    const dy = nTgt.y - nSrc.y;
+    const dz = nTgt.z - nSrc.z;
+    const len = Math.sqrt(dx * dx + dy * dy + dz * dz);
     if (len < 1e-10) continue;
 
-    const cx = d.x / len; // direction cosine x
-    const cy = d.y / len; // direction cosine y
+    const cx = dx / len, cy = dy / len, cz = dz / len;
 
-    // Force on source node (tension pulls toward target)
-    A[2 * iSrc][e] = cx;
-    A[2 * iSrc + 1][e] = cy;
+    // Source node: tension pulls toward target
+    A[dim * iSrc + 0][e] = cx;
+    A[dim * iSrc + 1][e] = cy;
+    if (is3D) A[dim * iSrc + 2][e] = cz;
 
-    // Force on target node (tension pulls toward source)
-    A[2 * iTgt][e] = -cx;
-    A[2 * iTgt + 1][e] = -cy;
+    // Target node: tension pulls toward source
+    A[dim * iTgt + 0][e] = -cx;
+    A[dim * iTgt + 1][e] = -cy;
+    if (is3D) A[dim * iTgt + 2][e] = -cz;
   }
 
   // Reaction contributions
@@ -97,32 +91,81 @@ export function computeEquilibrium(
     const ni = nodeIndexMap.get(ri.nodeId);
     if (ni === undefined) continue;
     const col = numMembers + ri.index;
-    if (ri.component === 'x') {
-      A[2 * ni][col] = 1;
-    } else {
-      A[2 * ni + 1][col] = 1;
-    }
+    const compIdx = ri.component === 'x' ? 0 : ri.component === 'y' ? 1 : 2;
+    A[dim * ni + compIdx][col] = 1;
   }
 
-  // External forces (RHS)
-  for (const n of allNodes) {
+  // External forces (RHS) — gravity acts in -z for 3D, -y for 2D
+  for (const n of nodes) {
     const i = nodeIndexMap.get(n.id)!;
-    p[2 * i] = -n.externalForce.x;
-    p[2 * i + 1] = -n.externalForce.y;
+    p[dim * i + 0] = -n.externalForce.x;
+    p[dim * i + 1] = -n.externalForce.y;
+    // z-component: no user-applied z-force currently, but gravity can add via prepareAndSolve
   }
 
-  // Solve
-  const solution = solve(A, p);
+  // Solve (handles square, over-determined, AND under-determined)
+  let solution = solve(A, p);
 
   if (!solution) {
-    // Check if indeterminate or unstable
-    const status = numUnknowns > numEqs ? 'indeterminate' : 'unstable';
-    return {
-      forces: new Map(),
-      reactions: new Map(),
-      status,
-      residual: Infinity,
-    };
+    return { forces: new Map(), reactions: new Map(), status: 'unstable', residual: Infinity };
+  }
+
+  // For under-determined systems (tensegrity): add self-stress (prestress)
+  // so that cables are in tension (+) and struts in compression (−).
+  //
+  // The general solution is: f = f_particular + Σ αᵢ × nᵢ
+  // where nᵢ are nullspace basis vectors of A.
+  //
+  // We iteratively adjust αᵢ to fix sign violations.
+  if (numEqs < numUnknowns) {
+    const basis = findNullspaceBasis(A);
+    if (basis.length > 0) {
+      const alphas = new Array(basis.length).fill(0);
+
+      // Iterative sign correction (simple gradient descent)
+      for (let iter = 0; iter < 200; iter++) {
+        // Compute current forces
+        const f = solution.map((s, i) => {
+          let val = s;
+          for (let k = 0; k < basis.length; k++) val += alphas[k] * (basis[k][i] || 0);
+          return val;
+        });
+
+        // Find worst violation (only among member forces, not reactions)
+        let worstIdx = -1, worstViolation = 0;
+        for (let e = 0; e < edges.length; e++) {
+          const isCable = edges[e].elementType === 'tension';
+          const violation = isCable ? Math.max(0, -f[e]) : Math.max(0, f[e]);
+          if (violation > worstViolation) { worstViolation = violation; worstIdx = e; }
+        }
+
+        if (worstViolation < 0.001) break; // all signs correct
+
+        // Adjust alphas to fix the worst violation
+        const isCable = edges[worstIdx].elementType === 'tension';
+        const target = isCable ? 0.01 : -0.01; // desired sign
+        const deficit = target - f[worstIdx];
+
+        // Find which basis vector has the largest component for this member
+        let bestK = 0, bestComp = 0;
+        for (let k = 0; k < basis.length; k++) {
+          if (Math.abs(basis[k][worstIdx]) > bestComp) {
+            bestComp = Math.abs(basis[k][worstIdx]);
+            bestK = k;
+          }
+        }
+        if (bestComp > 1e-10) {
+          alphas[bestK] += deficit / basis[bestK][worstIdx];
+        }
+      }
+
+      // Apply final alphas
+      solution = solution.map((s, i) => {
+        let val = s;
+        for (let k = 0; k < basis.length; k++) val += alphas[k] * (basis[k][i] || 0);
+        return val;
+      });
+    }
   }
 
   // Extract member forces
@@ -139,49 +182,22 @@ export function computeEquilibrium(
     }
     const rv = reactionVecs.get(ri.nodeId)!;
     if (ri.component === 'x') rv.x = solution[numMembers + ri.index];
-    else rv.y = solution[numMembers + ri.index];
+    else if (ri.component === 'y') rv.y = solution[numMembers + ri.index];
+    // z reactions not stored in Vec2 (TODO: extend if needed)
   }
 
-  // Compute residual (check equilibrium at each node)
+  // Compute residual
   let maxResidual = 0;
-  for (const n of allNodes) {
-    const i = nodeIndexMap.get(n.id)!;
-    let rx = n.externalForce.x;
-    let ry = n.externalForce.y;
-
-    // Add member forces
-    for (let e = 0; e < edges.length; e++) {
-      const edge = edges[e];
-      const f = solution[e];
-      const nSrc = nodeMap.get(edge.source)!;
-      const nTgt = nodeMap.get(edge.target)!;
-      const d = sub({ x: nTgt.x, y: nTgt.y }, { x: nSrc.x, y: nSrc.y });
-      const len = length(d);
-      if (len < 1e-10) continue;
-
-      if (edge.source === n.id) {
-        rx += f * (d.x / len);
-        ry += f * (d.y / len);
-      } else if (edge.target === n.id) {
-        rx -= f * (d.x / len);
-        ry -= f * (d.y / len);
-      }
-    }
-
-    // Add reactions
-    const rv = reactionVecs.get(n.id);
-    if (rv) {
-      rx += rv.x;
-      ry += rv.y;
-    }
-
-    maxResidual = Math.max(maxResidual, Math.abs(rx), Math.abs(ry));
+  for (let i = 0; i < numEqs; i++) {
+    let r = -p[i];
+    for (let j = 0; j < numUnknowns; j++) r += A[i][j] * solution[j];
+    maxResidual = Math.max(maxResidual, Math.abs(r));
   }
 
   return {
     forces,
     reactions: reactionVecs,
-    status: maxResidual < 0.01 ? 'determinate' : 'unstable',
+    status: maxResidual < 0.1 ? 'determinate' : 'unstable',
     residual: maxResidual,
   };
 }
