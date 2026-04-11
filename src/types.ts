@@ -16,5 +16,7 @@ export type AppAction =
   | { type: 'CLEAR' }
   | { type: 'SELECT_NODES'; ids: number[] }
   | { type: 'SELECT_EDGES'; ids: number[] }
+  | { type: 'FUSE_EDGE'; edgeId: number }
+  | { type: 'FUSE_TWO_EDGES'; edgeId1: number; edgeId2: number }
   | { type: 'UNDO' }
   | { type: 'REDO' };

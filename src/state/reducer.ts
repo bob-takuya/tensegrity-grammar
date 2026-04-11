@@ -1,5 +1,6 @@
 import { AppState, AppAction } from '../types';
 import { createEmptyState, autoGrow } from '../morphogenesis/engine';
+import { fuseOneEdge, executeTwoEdgeFusion } from '../morphogenesis/fusion';
 
 export function createInitialState(): AppState {
   return {
@@ -29,10 +30,22 @@ export function appReducer(state: AppState, action: AppAction): AppState {
     case 'SELECT_EDGES':
       return { ...state, selectedEdgeIds: action.ids, selectedNodeIds: [] };
 
+    case 'FUSE_EDGE': {
+      // Clone morpho state for immutability
+      const morpho = JSON.parse(JSON.stringify(state.morpho));
+      fuseOneEdge(morpho, action.edgeId);
+      return { ...state, morpho, selectedEdgeIds: [] };
+    }
+
+    case 'FUSE_TWO_EDGES': {
+      const morpho = JSON.parse(JSON.stringify(state.morpho));
+      executeTwoEdgeFusion(morpho, action.edgeId1, action.edgeId2);
+      return { ...state, morpho, selectedEdgeIds: [] };
+    }
+
     case 'UNDO':
     case 'REDO':
-      // TODO: implement undo/redo with morpho.history
-      return state;
+      return state; // TODO
 
     default:
       return state;

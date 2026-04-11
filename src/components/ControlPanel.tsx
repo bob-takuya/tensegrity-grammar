@@ -21,8 +21,8 @@ export function ControlPanel() {
 
       <p className="hint-text">
         K₅ cellular morphogenesis (Aloui et al. 2019).
-        Each cell is a complete graph on 5 nodes with
-        analytically guaranteed self-stress.
+        Each cell = complete graph on 5 nodes with
+        guaranteed self-stress.
       </p>
 
       <div className="control-section">
@@ -39,7 +39,7 @@ export function ControlPanel() {
         </div>
 
         <div className="param-group">
-          <label>Fusion<span className="param-value">{(fuseProbability * 100).toFixed(0)}%</span></label>
+          <label>Fusion rate<span className="param-value">{(fuseProbability * 100).toFixed(0)}%</span></label>
           <input type="range" min={0} max={0.5} step={0.05} value={fuseProbability}
             onChange={e => setFuseProbability(parseFloat(e.target.value))} />
         </div>
@@ -49,10 +49,11 @@ export function ControlPanel() {
           Generate
         </button>
 
-        <button className="clear-btn"
-          onClick={() => dispatch({ type: 'CLEAR' })}>
-          Clear
-        </button>
+        {nCells > 0 && (
+          <button className="clear-btn" onClick={() => dispatch({ type: 'CLEAR' })}>
+            Clear
+          </button>
+        )}
       </div>
 
       {nCells > 0 && (
@@ -63,12 +64,12 @@ export function ControlPanel() {
             <div className="stat"><span className="stat-label">Nodes</span><span className="stat-value">{nNodes}</span></div>
             <div className="stat"><span className="stat-label">Struts</span><span className="stat-value strut-color">{nStruts}</span></div>
             <div className="stat"><span className="stat-label">Cables</span><span className="stat-value cable-color">{nCables}</span></div>
-            <div className="stat"><span className="stat-label">Self-stress dim</span><span className="stat-value">{stressDim}</span></div>
+            <div className="stat stat-wide"><span className="stat-label">Self-stress states</span><span className="stat-value">{stressDim}</span></div>
           </div>
 
           <div className="tensegrity-status valid" style={{ marginTop: 8 }}>
             <span className="status-icon">✓</span>
-            <span>Self-stressed tensegrity ({stressDim} stress state{stressDim !== 1 ? 's' : ''})</span>
+            <span>{stressDim} self-stress state{stressDim !== 1 ? 's' : ''}</span>
           </div>
         </div>
       )}
@@ -76,15 +77,33 @@ export function ControlPanel() {
       <div className="info-section">
         <h4>Operations</h4>
         <div className="fg-rules-info">
-          <div className="fg-rule"><b>SEED</b> — K₅ cell (5 nodes, 10 edges)</div>
-          <div className="fg-rule"><b>ADHESION</b> — attach new K₅ sharing 3 nodes</div>
-          <div className="fg-rule"><b>FUSION</b> — remove shared edge (β-adjustment)</div>
+          <div className="fg-rule"><b>SEED</b> — K₅ cell (5 nodes, 10 edges, 4 struts + 6 cables)</div>
+          <div className="fg-rule"><b>ADHESION</b> — attach K₅ cell sharing 3 nodes</div>
+          <div className="fg-rule"><b>1-EDGE FUSION</b> — remove edge (β-adjustment, always works)</div>
+          <div className="fg-rule"><b>2-EDGE FUSION</b> — plane or quadric constraint</div>
         </div>
       </div>
 
-      <div className="fg-ref">
-        Aloui, Orden, Rhode-Barbarigos (2019)
-      </div>
+      {nCells > 0 && state.selectedEdgeIds.length > 0 && (
+        <div className="selection-section">
+          <h4>Selected</h4>
+          <p className="hint-text">{state.selectedEdgeIds.length} edge(s) selected</p>
+          {state.selectedEdgeIds.length === 1 && (
+            <button className="fuse-btn"
+              onClick={() => dispatch({ type: 'FUSE_EDGE', edgeId: state.selectedEdgeIds[0] })}>
+              Fuse (remove) selected edge
+            </button>
+          )}
+          {state.selectedEdgeIds.length === 2 && (
+            <button className="fuse-btn"
+              onClick={() => dispatch({ type: 'FUSE_TWO_EDGES', edgeId1: state.selectedEdgeIds[0], edgeId2: state.selectedEdgeIds[1] })}>
+              Fuse 2 edges (constraint solve)
+            </button>
+          )}
+        </div>
+      )}
+
+      <div className="fg-ref">Aloui, Orden, Rhode-Barbarigos (2019)</div>
     </div>
   );
 }

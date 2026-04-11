@@ -4,7 +4,7 @@ import { useAppState } from '../state/context';
 import { MorphogenesisState, MNode, MEdge } from '../morphogenesis/types';
 
 export function Viewer3D() {
-  const { state } = useAppState();
+  const { state, dispatch } = useAppState();
   const containerRef = useRef<HTMLDivElement>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const sceneRef = useRef<THREE.Scene | null>(null);
@@ -160,10 +160,13 @@ export function Viewer3D() {
   }, [state.morpho, state.selectedNodeIds, state.selectedEdgeIds]);
 
   // Mouse interaction
+  const dragStartRef = useRef<[number, number]>([0, 0]);
+
   const handleMouseDown = (e: React.MouseEvent) => {
     if (e.button === 0) orbitRef.current.isDragging = true;
     else if (e.button === 2 || e.button === 1) orbitRef.current.isPanning = true;
     orbitRef.current.lastX = e.clientX; orbitRef.current.lastY = e.clientY;
+    dragStartRef.current = [e.clientX, e.clientY];
   };
   const handleMouseMove = (e: React.MouseEvent) => {
     const o = orbitRef.current;
@@ -180,7 +183,40 @@ export function Viewer3D() {
       }
     }
   };
-  const handleMouseUp = () => { orbitRef.current.isDragging = false; orbitRef.current.isPanning = false; };
+  const handleMouseUp = (e: React.MouseEvent) => {
+    const wasDrag = Math.abs(e.clientX - dragStartRef.current[0]) + Math.abs(e.clientY - dragStartRef.current[1]) > 5;
+    orbitRef.current.isDragging = false;
+    orbitRef.current.isPanning = false;
+
+    // Click (not drag) → raycast to select edge
+    if (!wasDrag && e.button === 0 && sceneRef.current && cameraRef.current && containerRef.current) {
+      const rect = containerRef.current.getBoundingClientRect();
+      const mouse = new THREE.Vector2(
+        ((e.clientX - rect.left) / rect.width) * 2 - 1,
+        -((e.clientY - rect.top) / rect.height) * 2 + 1
+      );
+      const raycaster = new THREE.Raycaster();
+      raycaster.params.Line = { threshold: 0.1 };
+      raycaster.setFromCamera(mouse, cameraRef.current);
+
+      const hits = raycaster.intersectObjects(sceneRef.current.children, false);
+      const edgeHit = hits.find(h => h.object.userData.edgeId !== undefined);
+      if (edgeHit) {
+        const eid = edgeHit.object.userData.edgeId as number;
+        const prev = state.selectedEdgeIds;
+        if (e.shiftKey) {
+          // Shift+click: toggle in multi-selection (up to 2)
+          const has = prev.includes(eid);
+          const next = has ? prev.filter(id => id !== eid) : [...prev, eid].slice(-2);
+          dispatch({ type: 'SELECT_EDGES', ids: next });
+        } else {
+          dispatch({ type: 'SELECT_EDGES', ids: [eid] });
+        }
+      } else {
+        dispatch({ type: 'SELECT_EDGES', ids: [] });
+      }
+    }
+  };
   const handleWheel = (e: React.WheelEvent) => {
     e.preventDefault();
     orbitRef.current.distance *= e.deltaY > 0 ? 1.1 : 0.9;
