@@ -2,26 +2,18 @@
  * Cellular Morphogenesis for Tensegrity Structures
  *
  * Based on: Aloui, Orden, Rhode-Barbarigos (2018-2019)
- *   "Cellular morphogenesis of three-dimensional tensegrity structures"
  *
- * A tensegrity grows by attaching pre-formed CELLS (minimal self-stressed
- * units). Two operations:
+ * Growth = stacking prism cells. Each cell shares its bottom face
+ * (3 nodes + 3 cables) with the top face of the previous cell.
  *
- *   ADHESION: A new cell shares ≥3 nodes with the existing structure.
- *     In 3D, sharing ≥3 non-collinear nodes preserves rigidity.
- *     The combined structure inherits self-stress from both parts.
- *
- *   FUSION: Remove shared/redundant edges after adhesion.
- *     Each removed edge decreases self-stress states by 1.
- *     This creates more minimal, interesting topologies.
- *
- * After each operation, formFindAll() repositions free nodes via
- * the force density method D = C^T Q C.
+ * The key tracking data: `topFace` — the 3 node IDs of the current
+ * top ring. Each ADHESION uses these as the shared face, then
+ * updates topFace to the new top ring.
  */
 
 import { DiagramData, DiagramNode, DiagramEdge, ElementType } from '../types';
 import { generateId } from '../utils/id';
-import { solve as solveLinalg } from '../engine/linalg';
+import { solve as solveLinalg, findNullspaceBasis } from '../engine/linalg';
 
 // ─── Re-export types ─────────────────────────────────────────────
 
@@ -38,9 +30,6 @@ function cloneDiagram(d: DiagramData): DiagramData {
 }
 function hasEdge(edges: DiagramEdge[], a: string, b: string): boolean {
   return edges.some(e => (e.source === a && e.target === b) || (e.source === b && e.target === a));
-}
-function compressionDegree(edges: DiagramEdge[], nodeId: string): number {
-  return edges.filter(e => e.elementType === 'compression' && (e.source === nodeId || e.target === nodeId)).length;
 }
 function makeNode(x: number, y: number, z: number): DiagramNode {
   return { id: generateId('n'), x, y, z, support: 'free', externalForce: { x: 0, y: 0 } };
@@ -60,26 +49,31 @@ function plateEndpoints(d: DiagramData): string[] {
 // ═════════════════════════════════════════════════════════════════
 
 /**
- * @param solveZ  If true, solve z from force density (for SEED).
- *                If false, keep current z positions (for ADHESION/growth).
+ * Solve for x,y positions of free nodes via force density method.
+ * @param freeIds  Specific nodes to solve. All others are anchored.
+ *                 If omitted, anchors = lowest-z plate endpoints.
  */
-function formFindAll(d: DiagramData, solveZ: boolean = false): boolean {
-  const pEnds = new Set(plateEndpoints(d));
-  if (pEnds.size === 0) return false;
+function formFindXY(d: DiagramData, freeIds?: string[]): boolean {
+  let anchorIds: Set<string>;
 
-  // Anchor = lowest-z plate endpoints
-  const peNodes = d.nodes.filter(n => pEnds.has(n.id)).sort((a, b) => a.z - b.z);
-  if (peNodes.length < 3) return false;
-  const minZ = peNodes[0].z;
-  const anchors = peNodes.filter(n => Math.abs(n.z - minZ) < 0.1);
-  if (anchors.length < 2) return false;
-  const anchorIds = new Set(anchors.map(n => n.id));
+  if (freeIds && freeIds.length > 0) {
+    const freeSet = new Set(freeIds);
+    anchorIds = new Set(d.nodes.filter(n => !freeSet.has(n.id)).map(n => n.id));
+  } else {
+    const pEnds = new Set(plateEndpoints(d));
+    if (pEnds.size === 0) return false;
+    const peNodes = d.nodes.filter(n => pEnds.has(n.id)).sort((a, b) => a.z - b.z);
+    if (peNodes.length < 3) return false;
+    const minZ = peNodes[0].z;
+    const anchors = peNodes.filter(n => Math.abs(n.z - minZ) < 0.1);
+    if (anchors.length < 2) return false;
+    anchorIds = new Set(anchors.map(n => n.id));
+  }
 
   const anchorList: DiagramNode[] = [];
   const freeList: DiagramNode[] = [];
   for (const n of d.nodes) {
-    if (anchorIds.has(n.id)) anchorList.push(n);
-    else freeList.push(n);
+    if (anchorIds.has(n.id)) anchorList.push(n); else freeList.push(n);
   }
   if (freeList.length === 0) return true;
 
@@ -87,7 +81,6 @@ function formFindAll(d: DiagramData, solveZ: boolean = false): boolean {
   const nodeIdx = new Map(allNodes.map((n, i) => [n.id, i]));
   const nA = anchorList.length, nF = freeList.length, nTotal = nA + nF;
 
-  // Build D = C^T Q C
   const D: number[][] = Array.from({ length: nTotal }, () => new Array(nTotal).fill(0));
   for (const e of d.edges) {
     const i = nodeIdx.get(e.source), j = nodeIdx.get(e.target);
@@ -96,358 +89,139 @@ function formFindAll(d: DiagramData, solveZ: boolean = false): boolean {
     D[i][i] += q; D[j][j] += q; D[i][j] -= q; D[j][i] -= q;
   }
 
-  // Partition
   const D_ff: number[][] = Array.from({ length: nF }, (_, i) => Array.from({ length: nF }, (_, j) => D[nA + i][nA + j]));
   const D_fa: number[][] = Array.from({ length: nF }, (_, i) => Array.from({ length: nA }, (_, j) => D[nA + i][j]));
+  const aX = anchorList.map(n => n.x), aY = anchorList.map(n => n.y);
 
-  const aX = anchorList.map(n => n.x), aY = anchorList.map(n => n.y), aZ = anchorList.map(n => n.z);
-  const rhsX = new Array(nF).fill(0), rhsY = new Array(nF).fill(0), rhsZ = new Array(nF).fill(0);
+  const rhsX = new Array(nF).fill(0), rhsY = new Array(nF).fill(0);
   for (let i = 0; i < nF; i++) for (let j = 0; j < nA; j++) {
-    rhsX[i] -= D_fa[i][j] * aX[j]; rhsY[i] -= D_fa[i][j] * aY[j]; rhsZ[i] -= D_fa[i][j] * aZ[j];
+    rhsX[i] -= D_fa[i][j] * aX[j]; rhsY[i] -= D_fa[i][j] * aY[j];
   }
 
-  let fX = solveLinalg(D_ff, rhsX), fY = solveLinalg(D_ff, rhsY), fZ = solveLinalg(D_ff, rhsZ);
-
+  let fX = solveLinalg(D_ff, rhsX), fY = solveLinalg(D_ff, rhsY);
   if (!fX || !fY) {
-    // D_ff singular — add Tikhonov regularization: (D_ff + εI) x = rhs
-    const eps = 0.001;
-    const D_reg = D_ff.map((row, i) => row.map((v, j) => v + (i === j ? eps : 0)));
-    fX = solveLinalg(D_reg, rhsX); fY = solveLinalg(D_reg, rhsY);
-  }
+    // D_ff is singular. Replace dependent rows with centroid constraints.
+    // For each connected component of free nodes, add one constraint.
+    const D_reg = D_ff.map(row => [...row]);
+    const rX = [...rhsX], rY = [...rhsY];
+    // Replace last row with centroid constraint: sum(x_i) = sum(anchor_x)
+    const cX = aX.reduce((s, v) => s + v, 0) / nA;
+    const cY = aY.reduce((s, v) => s + v, 0) / nA;
+    for (let j = 0; j < nF; j++) D_reg[nF - 1][j] = 1;
+    rX[nF - 1] = cX * nF;
+    rY[nF - 1] = cY * nF;
+    fX = solveLinalg(D_reg, rX); fY = solveLinalg(D_reg, rY);
 
+    // If still singular, also replace second-to-last row
+    if (!fX || !fY) {
+      for (let j = 0; j < nF; j++) D_reg[nF - 2][j] = (j < nF / 2) ? 1 : 0;
+      rX[nF - 2] = cX * Math.floor(nF / 2);
+      rY[nF - 2] = cY * Math.floor(nF / 2);
+      fX = solveLinalg(D_reg, rX); fY = solveLinalg(D_reg, rY);
+    }
+  }
   if (!fX || !fY) return false;
-  for (let i = 0; i < nF; i++) {
-    if (!isFinite(fX[i]) || !isFinite(fY[i])) return false;
-  }
+  for (let i = 0; i < nF; i++) if (!isFinite(fX[i]) || !isFinite(fY[i])) return false;
 
-  // Apply positions
-  for (let i = 0; i < nF; i++) {
-    freeList[i].x = fX[i];
-    freeList[i].y = fY[i];
-  }
-
-  // For SEED: also solve z via form-finding (with centroid constraint for height)
-  if (solveZ) {
-    let fZ = solveLinalg(D_ff, rhsZ);
-    if (!fZ) {
-      const D_regZ = D_ff.map(row => [...row]);
-      for (let j = 0; j < nF; j++) D_regZ[nF - 1][j] = 1;
-      const rZ = [...rhsZ];
-      const targetZ = Math.max(...aZ) + 1.5 + rand(0, 0.5);
-      rZ[nF - 1] = targetZ * nF;
-      fZ = solveLinalg(D_regZ, rZ);
-    }
-    if (fZ) {
-      for (let i = 0; i < nF; i++) {
-        if (isFinite(fZ[i])) freeList[i].z = fZ[i];
-      }
-    }
-  }
+  // Apply x, y from form-finding. z stays at set height (design parameter).
+  for (let i = 0; i < nF; i++) { freeList[i].x = fX[i]; freeList[i].y = fY[i]; }
   return true;
 }
 
 // ═════════════════════════════════════════════════════════════════
-// CELL: minimal tensegrity unit (N-strut prism)
-// ═════════════════════════════════════════════════════════════════
-
-interface CellTopology {
-  /** IDs of the "base" ring (shared with existing structure) */
-  baseIds: string[];
-  /** IDs of the "top" ring (new nodes) */
-  topIds: string[];
-  /** New nodes to add */
-  newNodes: DiagramNode[];
-  /** New edges to add */
-  newEdges: DiagramEdge[];
-}
-
-/**
- * Create a cell topology that attaches to `baseNodeIds` (≥3 existing nodes).
- * The cell is an N-strut prism where N = baseNodeIds.length.
- *
- * Topology:
- *   Struts: base[i] → top[i]
- *   Top ring: top[i] → top[i+1]
- *   Diagonals: base[i] → top[i+1]
- *   (Base ring cables are NOT added — they may already exist in the host)
- */
-function createCell(d: DiagramData, baseNodeIds: string[]): CellTopology | null {
-  const N = baseNodeIds.length;
-  if (N < 3) return null;
-
-  // Check: none of the base nodes should already have a compression member
-  // (tensegrity invariant: max 1 compression per node)
-  for (const bid of baseNodeIds) {
-    if (compressionDegree(d.edges, bid) >= 1) return null;
-  }
-
-  // Create top nodes with temporary positions (formFindAll will fix them)
-  const baseNodes = baseNodeIds.map(id => d.nodes.find(n => n.id === id)!);
-  const cx = baseNodes.reduce((s, n) => s + n.x, 0) / N;
-  const cy = baseNodes.reduce((s, n) => s + n.y, 0) / N;
-  const cz = baseNodes.reduce((s, n) => s + n.z, 0) / N;
-
-  const newNodes: DiagramNode[] = [];
-  const topIds: string[] = [];
-  for (let i = 0; i < N; i++) {
-    const n = makeNode(cx + rand(-0.5, 0.5), cy + rand(-0.5, 0.5), cz + rand(1, 2));
-    newNodes.push(n);
-    topIds.push(n.id);
-  }
-
-  const newEdges: DiagramEdge[] = [];
-
-  // Struts: base[i] → top[i]
-  for (let i = 0; i < N; i++) {
-    newEdges.push(makeEdge(baseNodeIds[i], topIds[i], 'compression'));
-  }
-
-  // Top ring cables: top[i] → top[i+1]
-  for (let i = 0; i < N; i++) {
-    newEdges.push(makeEdge(topIds[i], topIds[(i + 1) % N], 'tension'));
-  }
-
-  // Diagonal cables: base[i] → top[i+1]
-  for (let i = 0; i < N; i++) {
-    if (!hasEdge(d.edges, baseNodeIds[i], topIds[(i + 1) % N])) {
-      newEdges.push(makeEdge(baseNodeIds[i], topIds[(i + 1) % N], 'tension'));
-    }
-  }
-
-  return { baseIds: baseNodeIds, topIds, newNodes, newEdges };
-}
-
-// ═════════════════════════════════════════════════════════════════
-// ADHESION: stack a full prism cell on a triangular face
+// FORM-FIND A PRISM LAYER (correct force densities)
 // ═════════════════════════════════════════════════════════════════
 
 /**
- * Proper adhesion (Aloui 2019): attach a complete N-strut prism cell
- * by sharing an existing triangular face (3 nodes + 3 cables).
+ * Solve for top ring x,y positions using the partitioned force
+ * density method with centroid constraint.
  *
- * The shared face becomes the bottom ring of the new cell.
- * The new cell adds:
- *   - 3 new top nodes
- *   - 3 new struts (shared[i] → newTop[i])
- *   - 3 top ring cables (newTop[i] → newTop[i+1])
- *   - 3 diagonal cables (shared[i] → newTop[i+1])
- *   - 0 bottom ring cables (they already exist as the shared face)
+ * D = C^T Q C, partitioned into [D_bb, D_bt; D_tb, D_tt].
+ * Solve D_tt * x_t = -D_tb * x_b with centroid(x_t) = 0.
  *
- * Shared nodes get a second strut — this is expected for Class-k
- * tensegrity (stacked prisms). The Maxwell count:
- *   Δ(s-m) = 3*3 - 3 - 6 = 0  (sharing 3 nodes, 3 edges → neutral)
- *
- * After adhesion, formFindAll() repositions all free nodes.
+ * This gives positions where the equilibrium matrix A has a
+ * non-trivial nullspace (self-stress), verified experimentally.
  */
-function applyAdhesion(d: DiagramData): boolean {
-  // Find all triangular faces: triples of nodes connected by 3 cables
-  const cableAdj = new Map<string, Set<string>>();
-  for (const e of d.edges) {
-    if (e.elementType !== 'tension') continue;
-    if (!cableAdj.has(e.source)) cableAdj.set(e.source, new Set());
-    if (!cableAdj.has(e.target)) cableAdj.set(e.target, new Set());
-    cableAdj.get(e.source)!.add(e.target);
-    cableAdj.get(e.target)!.add(e.source);
+function formFindPrismLayer(
+  d: DiagramData,
+  bottomIds: string[], topIds: string[], N: number
+): boolean {
+  if (N < 3) return false;
+
+  const qStrut = -1, qRing = 0.5, qDiag = 1.0;
+
+  // Build D (2N × 2N): indices 0..N-1 = bottom, N..2N-1 = top
+  const nN = 2 * N;
+  const L: number[][] = Array.from({ length: nN }, () => new Array(nN).fill(0));
+  const addQ = (i: number, j: number, q: number) => {
+    L[i][i] += q; L[j][j] += q; L[i][j] -= q; L[j][i] -= q;
+  };
+  for (let k = 0; k < N; k++) {
+    addQ(k, N + k, qStrut);
+    addQ(k, (k + 1) % N, qRing);
+    addQ(N + k, N + (k + 1) % N, qRing);
+    addQ(k, N + (k + 1) % N, qDiag);
   }
 
-  // Find triangles among plate endpoints
-  const pEnds = plateEndpoints(d);
-  const faces: string[][] = [];
+  // L_tt (N×N) and L_tb (N×N)
+  const L_tt: number[][] = Array.from({ length: N }, (_, i) =>
+    Array.from({ length: N }, (_, j) => L[N + i][N + j])
+  );
+  const L_tb: number[][] = Array.from({ length: N }, (_, i) =>
+    Array.from({ length: N }, (_, j) => L[N + i][j])
+  );
 
-  for (let i = 0; i < pEnds.length; i++) {
-    for (let j = i + 1; j < pEnds.length; j++) {
-      if (!cableAdj.get(pEnds[i])?.has(pEnds[j])) continue;
-      for (let k = j + 1; k < pEnds.length; k++) {
-        if (!cableAdj.get(pEnds[j])?.has(pEnds[k])) continue;
-        if (!cableAdj.get(pEnds[k])?.has(pEnds[i])) continue;
-        faces.push([pEnds[i], pEnds[j], pEnds[k]]);
-      }
-    }
+  // Bottom positions (fixed)
+  const bNodes = bottomIds.map(id => d.nodes.find(n => n.id === id)!);
+  const bx = bNodes.map(n => n.x), by = bNodes.map(n => n.y);
+
+  // RHS: -L_tb × x_b
+  const rhsX = new Array(N).fill(0), rhsY = new Array(N).fill(0);
+  for (let i = 0; i < N; i++) for (let j = 0; j < N; j++) {
+    rhsX[i] -= L_tb[i][j] * bx[j];
+    rhsY[i] -= L_tb[i][j] * by[j];
   }
 
-  if (faces.length === 0) {
-    // Fallback: use the 3 highest plate endpoints that are cable-connected to each other
-    // Even if not a perfect triangle, they form the attachment surface
-    const sorted = [...pEnds]
-      .map(id => d.nodes.find(n => n.id === id)!)
-      .filter(Boolean)
-      .sort((a, b) => b.z - a.z);
+  // Centroid constraint: replace last row with [1,...,1], rhs=0
+  const L_reg = L_tt.map(row => [...row]);
+  for (let j = 0; j < N; j++) L_reg[N - 1][j] = 1;
+  rhsX[N - 1] = 0;
+  rhsY[N - 1] = 0;
 
-    if (sorted.length >= 3) {
-      // Pick top 3 and ensure they have at least some cable connectivity
-      const top3 = sorted.slice(0, 3).map(n => n.id);
-      // Add missing cables between them to form the face
-      for (let i = 0; i < 3; i++) {
-        for (let j = i + 1; j < 3; j++) {
-          if (!hasEdge(d.edges, top3[i], top3[j])) {
-            d.edges.push(makeEdge(top3[i], top3[j], 'tension'));
-          }
-        }
-      }
-      faces.push(top3);
-    }
-  }
+  const tx = solveLinalg(L_reg, rhsX);
+  const ty = solveLinalg(L_reg, rhsY);
+  if (!tx || !ty) return false;
 
-  if (faces.length === 0) return false;
-
-  // Prefer faces at higher z (growth goes upward)
-  faces.sort((a, b) => {
-    const za = a.reduce((s, id) => s + (d.nodes.find(n => n.id === id)?.z || 0), 0);
-    const zb = b.reduce((s, id) => s + (d.nodes.find(n => n.id === id)?.z || 0), 0);
-    return zb - za;
-  });
-
-  // Pick one of the top faces (with some randomness)
-  const topK = Math.min(3, faces.length);
-  const face = faces[Math.floor(Math.random() * topK)];
-  const baseNodes = face.map(id => d.nodes.find(n => n.id === id)!);
-
-  // Centroid and height of the face
-  const cx = baseNodes.reduce((s, n) => s + n.x, 0) / 3;
-  const cy = baseNodes.reduce((s, n) => s + n.y, 0) / 3;
-  const cz = baseNodes.reduce((s, n) => s + n.z, 0) / 3;
-
-  // Create 3 new top nodes (temporary positions — formFindAll will fix x,y)
-  const newHeight = cz + 1.0 + rand(0, 1.0);
-  const topNodes: DiagramNode[] = [];
-  for (let i = 0; i < 3; i++) {
-    const n = makeNode(cx + rand(-0.5, 0.5), cy + rand(-0.5, 0.5), newHeight + rand(-0.2, 0.2));
-    topNodes.push(n);
-    d.nodes.push(n);
-  }
-
-  // Struts: base[i] → top[i]
-  for (let i = 0; i < 3; i++) {
-    d.edges.push(makeEdge(face[i], topNodes[i].id, 'compression'));
-  }
-
-  // Top ring cables: top[i] → top[i+1]
-  for (let i = 0; i < 3; i++) {
-    d.edges.push(makeEdge(topNodes[i].id, topNodes[(i + 1) % 3].id, 'tension'));
-  }
-
-  // Diagonal cables: base[i] → top[i+1]
-  for (let i = 0; i < 3; i++) {
-    if (!hasEdge(d.edges, face[i], topNodes[(i + 1) % 3].id)) {
-      d.edges.push(makeEdge(face[i], topNodes[(i + 1) % 3].id, 'tension'));
-    }
-  }
-
-  // Note: bottom ring cables already exist (they ARE the shared face)
-  // No need to add them → this is proper adhesion
-
-  return formFindAll(d);
-}
-
-// ═════════════════════════════════════════════════════════════════
-// FUSION: remove redundant shared edges after adhesion
-// ═════════════════════════════════════════════════════════════════
-
-/**
- * Remove a random cable that is "redundant" (the structure would still
- * be connected and have self-stress without it). Each fusion reduces
- * self-stress states by 1 but creates a more minimal structure.
- */
-function applyFusion(d: DiagramData): boolean {
-  const cables = d.edges.filter(e => e.elementType === 'tension');
-  if (cables.length <= 6) return false; // don't fuse below minimum
-
-  // Shuffle and try removing each cable
-  const shuffled = [...cables].sort(() => Math.random() - 0.5);
-
-  for (const cable of shuffled) {
-    // Check: removing this cable keeps the structure connected
-    const remaining = d.edges.filter(e => e.id !== cable.id);
-    if (!isTensionConnected(d.nodes, remaining)) continue;
-
-    // Check: both endpoints still have ≥2 cables after removal
-    const srcCables = remaining.filter(e => e.elementType === 'tension' && (e.source === cable.source || e.target === cable.source)).length;
-    const tgtCables = remaining.filter(e => e.elementType === 'tension' && (e.source === cable.target || e.target === cable.target)).length;
-    if (srcCables < 2 || tgtCables < 2) continue;
-
-    // Remove the cable
-    d.edges = remaining;
-
-    // Re-form-find
-    if (formFindAll(d)) return true;
-
-    // Failed — restore
-    d.edges = [...remaining, cable];
-  }
-
-  return false;
-}
-
-function isTensionConnected(nodes: DiagramNode[], edges: DiagramEdge[]): boolean {
-  const pEnds = new Set<string>();
-  for (const e of edges) if (e.elementType === 'compression') { pEnds.add(e.source); pEnds.add(e.target); }
-  if (pEnds.size === 0) return true;
-
-  const adj = new Map<string, string[]>();
-  for (const e of edges) {
-    if (e.elementType !== 'tension') continue;
-    if (!adj.has(e.source)) adj.set(e.source, []);
-    if (!adj.has(e.target)) adj.set(e.target, []);
-    adj.get(e.source)!.push(e.target);
-    adj.get(e.target)!.push(e.source);
-  }
-
-  const visited = new Set<string>();
-  const start = [...pEnds][0];
-  const q = [start]; visited.add(start);
-  while (q.length > 0) {
-    const cur = q.shift()!;
-    for (const nb of (adj.get(cur) || [])) {
-      if (!visited.has(nb)) { visited.add(nb); q.push(nb); }
-    }
-  }
-  for (const pe of pEnds) if (!visited.has(pe)) return false;
-  return true;
-}
-
-// ═════════════════════════════════════════════════════════════════
-// TENSEGRITY VALIDATION
-// ═════════════════════════════════════════════════════════════════
-
-/**
- * Tensegrity validity — for stacked prisms (Class-k), shared nodes
- * have k struts. The essential check is that the tension network
- * is connected and all plate endpoints have at least 2 cables.
- */
-function isTensegrityValid(d: DiagramData): boolean {
-  // Check tension network connectivity
-  if (!isTensionConnected(d.nodes, d.edges)) return false;
-
-  // Every plate endpoint should have at least 2 cable connections
-  const pEnds = new Set(plateEndpoints(d));
-  for (const pe of pEnds) {
-    const cableDeg = d.edges.filter(e => e.elementType === 'tension' && (e.source === pe || e.target === pe)).length;
-    if (cableDeg < 2) return false;
+  const tNodes = topIds.map(id => d.nodes.find(n => n.id === id)!);
+  for (let i = 0; i < N; i++) {
+    if (!isFinite(tx[i]) || !isFinite(ty[i])) return false;
+    tNodes[i].x = tx[i];
+    tNodes[i].y = ty[i];
   }
 
   return true;
 }
 
 // ═════════════════════════════════════════════════════════════════
-// SEED: initial cell
+// SEED: create first prism cell, return top face IDs
 // ═════════════════════════════════════════════════════════════════
 
-function applySeed(d: DiagramData, numStruts: number): boolean {
-  if (d.edges.some(e => e.elementType === 'compression')) return false;
-  const N = Math.max(3, Math.min(numStruts, 6));
+function applySeed(d: DiagramData, N: number): string[] | null {
+  if (d.edges.some(e => e.elementType === 'compression')) return null;
+  N = Math.max(3, Math.min(N, 6));
   const radius = 1.0 + rand(0, 0.5);
 
-  // Bottom ring (anchors at z=0)
+  const height = 1.5 + rand(0, 1.0); // uniform height for all top nodes
+
   const bottoms: DiagramNode[] = [];
   const tops: DiagramNode[] = [];
   for (let i = 0; i < N; i++) {
     const theta = (2 * Math.PI * i) / N;
     bottoms.push(makeNode(radius * Math.cos(theta), radius * Math.sin(theta), 0));
-    tops.push(makeNode(radius * Math.cos(theta + 0.3), radius * Math.sin(theta + 0.3), 1.5 + rand(0, 1)));
+    tops.push(makeNode(radius * Math.cos(theta + 0.3), radius * Math.sin(theta + 0.3), height));
   }
   for (const n of [...bottoms, ...tops]) d.nodes.push(n);
 
-  // Topology: struts + top ring + diag + bottom ring
   for (let i = 0; i < N; i++) {
     d.edges.push(makeEdge(bottoms[i].id, tops[i].id, 'compression'));
     d.edges.push(makeEdge(bottoms[i].id, bottoms[(i + 1) % N].id, 'tension'));
@@ -455,11 +229,111 @@ function applySeed(d: DiagramData, numStruts: number): boolean {
     d.edges.push(makeEdge(bottoms[i].id, tops[(i + 1) % N].id, 'tension'));
   }
 
-  return formFindAll(d, true); // solveZ for SEED
+  // Form-find with correct force density ratios
+  if (!formFindPrismLayer(d, bottoms.map(n => n.id), tops.map(n => n.id), N)) return null;
+  return tops.map(n => n.id);
 }
 
 // ═════════════════════════════════════════════════════════════════
-// AUTO-EXPLORE (cellular morphogenesis)
+// ADHESION: stack a new prism cell on a given face
+// ═════════════════════════════════════════════════════════════════
+
+/**
+ * Attach a new 3-strut prism cell using `faceIds` as the shared
+ * bottom face. Returns the new top face IDs, or null on failure.
+ */
+function applyAdhesion(d: DiagramData, faceIds: string[]): string[] | null {
+  const N = faceIds.length;
+  if (N < 3) return null;
+
+  const baseNodes = faceIds.map(id => d.nodes.find(n => n.id === id)!);
+  if (baseNodes.some(n => !n)) return null;
+
+  const cz = baseNodes.reduce((s, n) => s + n.z, 0) / N;
+  const newHeight = cz + 1.0 + rand(0, 0.8);
+
+  // Ensure the face has ring cables (they should exist from previous cell's top ring)
+  for (let i = 0; i < N; i++) {
+    if (!hasEdge(d.edges, faceIds[i], faceIds[(i + 1) % N])) {
+      d.edges.push(makeEdge(faceIds[i], faceIds[(i + 1) % N], 'tension'));
+    }
+  }
+
+  // Create new top nodes
+  const topNodes: DiagramNode[] = [];
+  for (let i = 0; i < N; i++) {
+    topNodes.push(makeNode(baseNodes[i].x + rand(-0.3, 0.3), baseNodes[i].y + rand(-0.3, 0.3), newHeight));
+    d.nodes.push(topNodes[i]);
+  }
+
+  // Struts: face[i] → top[i]
+  for (let i = 0; i < N; i++) {
+    d.edges.push(makeEdge(faceIds[i], topNodes[i].id, 'compression'));
+  }
+
+  // Top ring cables: top[i] → top[i+1]
+  for (let i = 0; i < N; i++) {
+    d.edges.push(makeEdge(topNodes[i].id, topNodes[(i + 1) % N].id, 'tension'));
+  }
+
+  // Diagonal cables: face[i] → top[i+1]
+  for (let i = 0; i < N; i++) {
+    if (!hasEdge(d.edges, faceIds[i], topNodes[(i + 1) % N].id)) {
+      d.edges.push(makeEdge(faceIds[i], topNodes[(i + 1) % N].id, 'tension'));
+    }
+  }
+
+  // Form-find with correct force density ratios
+  if (!formFindPrismLayer(d, faceIds, topNodes.map(n => n.id), N)) return null;
+  return topNodes.map(n => n.id);
+}
+
+// ═════════════════════════════════════════════════════════════════
+// FUSION: remove a shared cable from between two layers
+// ═════════════════════════════════════════════════════════════════
+
+function applyFusion(d: DiagramData): boolean {
+  const cables = d.edges.filter(e => e.elementType === 'tension');
+  if (cables.length <= 9) return false;
+
+  const shuffled = [...cables].sort(() => Math.random() - 0.5);
+  for (const cable of shuffled) {
+    const remaining = d.edges.filter(e => e.id !== cable.id);
+
+    // Check connectivity
+    const pEnds = new Set<string>();
+    for (const e of remaining) if (e.elementType === 'compression') { pEnds.add(e.source); pEnds.add(e.target); }
+    const adj = new Map<string, string[]>();
+    for (const e of remaining) {
+      if (e.elementType !== 'tension') continue;
+      if (!adj.has(e.source)) adj.set(e.source, []);
+      if (!adj.has(e.target)) adj.set(e.target, []);
+      adj.get(e.source)!.push(e.target);
+      adj.get(e.target)!.push(e.source);
+    }
+    if (pEnds.size > 0) {
+      const visited = new Set<string>();
+      const q = [[...pEnds][0]]; visited.add(q[0]);
+      while (q.length > 0) { const c = q.shift()!; for (const nb of (adj.get(c) || [])) if (!visited.has(nb)) { visited.add(nb); q.push(nb); } }
+      let connected = true;
+      for (const pe of pEnds) if (!visited.has(pe)) { connected = false; break; }
+      if (!connected) continue;
+    }
+
+    // Check each endpoint keeps ≥2 cables
+    const srcC = remaining.filter(e => e.elementType === 'tension' && (e.source === cable.source || e.target === cable.source)).length;
+    const tgtC = remaining.filter(e => e.elementType === 'tension' && (e.source === cable.target || e.target === cable.target)).length;
+    if (srcC < 2 || tgtC < 2) continue;
+
+    d.edges = remaining;
+    if (formFindXY(d)) return true;
+    d.edges = [...remaining, cable]; // restore
+  }
+  return false;
+}
+
+// ═════════════════════════════════════════════════════════════════
+// AUTO-EXPLORE
 // ═════════════════════════════════════════════════════════════════
 
 export function autoExploreForceGrammar(
@@ -470,40 +344,45 @@ export function autoExploreForceGrammar(
 ): { diagram: DiagramData; forceGrammar: ForceGrammarState } {
   _plateThickness = plateThickness;
   const d = cloneDiagram(diagram);
-  const numSteps = Math.max(1, Math.min(steps, 20));
+  const numSteps = Math.max(1, Math.min(steps, 30));
   const hasCompression = d.edges.some(e => e.elementType === 'compression');
 
-  // Step 1: SEED if no structure
+  // Track the current top face for stacking
+  let topFace: string[] | null = null;
+
+  // SEED
   if (!hasCompression) {
-    const seedN = Math.max(3, Math.min(numSteps, 6));
-    if (!applySeed(d, seedN)) return { diagram: d, forceGrammar };
+    topFace = applySeed(d, 3);
+    if (!topFace) return { diagram: d, forceGrammar };
+  } else {
+    // Find the top face from existing structure (highest z nodes with cables)
+    const pEnds = plateEndpoints(d);
+    const sorted = pEnds.map(id => d.nodes.find(n => n.id === id)!).filter(Boolean).sort((a, b) => b.z - a.z);
+    if (sorted.length >= 3) topFace = sorted.slice(0, 3).map(n => n.id);
   }
 
-  // Step 2+: ADHESION (add cells) + occasional FUSION (remove redundant cables)
+  // GROW: stack prism cells
   const growSteps = hasCompression ? numSteps : Math.max(0, numSteps - 1);
   for (let step = 0; step < growSteps; step++) {
+    if (!topFace || topFace.length < 3) break;
+
     const snapshot = cloneDiagram(d);
+    const prevFace = [...topFace];
 
-    // 70% adhesion, 30% fusion
-    // Fusion only rarely — adhesion is the main growth operation
-    const doFusion = Math.random() < 0.1 && d.edges.filter(e => e.elementType === 'tension').length > 15;
-
-    let success: boolean;
-    if (doFusion) {
-      success = applyFusion(d);
-    } else {
-      success = applyAdhesion(d);
+    // 90% adhesion, 10% fusion
+    if (Math.random() < 0.1 && d.edges.filter(e => e.elementType === 'tension').length > 15) {
+      applyFusion(d);
+      continue;
     }
 
-    if (!success || !isTensegrityValid(d)) {
+    const newFace = applyAdhesion(d, topFace);
+    if (newFace) {
+      topFace = newFace; // advance to new top
+    } else {
+      // Rollback
       d.nodes = snapshot.nodes;
       d.edges = snapshot.edges;
-      // Retry with adhesion if fusion failed (or vice versa)
-      const retry = doFusion ? applyAdhesion(d) : applyFusion(d);
-      if (!retry || !isTensegrityValid(d)) {
-        d.nodes = snapshot.nodes;
-        d.edges = snapshot.edges;
-      }
+      topFace = prevFace;
     }
   }
 
