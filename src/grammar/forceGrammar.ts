@@ -84,11 +84,14 @@ function makeNode(x: number, y: number, z: number): DiagramNode {
   return { id: generateId('n'), x, y, z, support: 'free', externalForce: { x: 0, y: 0 } };
 }
 
+/** Module-level plate thickness used during a single auto-explore run */
+let _plateThickness = 3;
+
 function makeEdge(src: string, tgt: string, type: ElementType): DiagramEdge {
   return {
     id: generateId('e'), source: src, target: tgt, elementType: type,
     plateWidth: 0.25 + Math.random() * 0.3,
-    plateThickness: 2.5 + Math.random() * 1.5,
+    plateThickness: _plateThickness,
     plateAngle: Math.random() * 360,
   };
 }
@@ -301,8 +304,10 @@ function isTensegrityValid(d: DiagramData): boolean {
 export function autoExploreForceGrammar(
   diagram: DiagramData,
   forceGrammar: ForceGrammarState,
-  steps: number
+  steps: number,
+  plateThickness: number = 3
 ): { diagram: DiagramData; forceGrammar: ForceGrammarState } {
+  _plateThickness = plateThickness;
   const d = cloneDiagram(diagram);
   const numSteps = Math.max(1, Math.min(steps, 20));
 

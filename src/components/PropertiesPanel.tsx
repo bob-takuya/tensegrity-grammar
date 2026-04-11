@@ -248,22 +248,6 @@ export function PropertiesPanel() {
                 }
               />
             </div>
-            <div className="prop-group">
-              <label>Plate Thickness (mm)</label>
-              <input
-                type="number"
-                step="0.5"
-                min="0.5"
-                value={selectedEdge.plateThickness}
-                onChange={(e) =>
-                  dispatch({
-                    type: 'SET_PLATE_THICKNESS',
-                    id: selectedEdge.id,
-                    thickness: Math.max(0.5, parseFloat(e.target.value) || 3),
-                  })
-                }
-              />
-            </div>
           </>
         )}
         {f !== undefined && (

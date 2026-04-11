@@ -138,6 +138,22 @@ export function GrammarPanel() {
           <div className="fg-rule"><b>BRANCH</b> — attach plate branching from a node</div>
         </div>
 
+        <div className="prop-group" style={{ margin: '6px 0' }}>
+          <label>Plate Thickness (mm)</label>
+          <input
+            type="number"
+            step="0.5"
+            min="0.5"
+            value={state.globalPlateThickness}
+            onChange={(e) =>
+              dispatch({
+                type: 'SET_GLOBAL_PLATE_THICKNESS',
+                thickness: Math.max(0.5, parseFloat(e.target.value) || 3),
+              })
+            }
+          />
+        </div>
+
         <div className="fg-auto-explore">
           <div className="explore-row">
             <input

@@ -89,6 +89,7 @@ export function createInitialState(diagram?: DiagramData): AppState {
     historyTree: createHistoryTree(d),
     // Force grammar
     forceGrammar: { active: false, interimForces: [], selectedForceId: null, feasibilityDomain: null, isComplete: false },
+    globalPlateThickness: 3,
   };
   return recompute(state);
 }
@@ -138,7 +139,7 @@ export function appReducer(state: AppState, action: AppAction): AppState {
         target: action.target,
         elementType: 'compression',
         plateWidth: 0.3,
-        plateThickness: 3,
+        plateThickness: state.globalPlateThickness,
         plateAngle: 0,
       };
       const diagram = {
@@ -454,10 +455,20 @@ export function appReducer(state: AppState, action: AppAction): AppState {
     }
 
     case 'FORCE_GRAMMAR_AUTO_EXPLORE': {
-      if (!state.forceGrammar.active) return state;
       const s = pushUndo(state);
-      const result = autoExploreForceGrammar(s.diagram, s.forceGrammar, action.steps);
+      const result = autoExploreForceGrammar(s.diagram, s.forceGrammar, action.steps, s.globalPlateThickness);
       return recompute({ ...s, diagram: result.diagram, forceGrammar: result.forceGrammar, selectedIds: [] });
+    }
+
+    case 'SET_GLOBAL_PLATE_THICKNESS': {
+      // Update all existing compression edges + store global setting
+      const diagram = {
+        ...state.diagram,
+        edges: state.diagram.edges.map(e =>
+          e.elementType === 'compression' ? { ...e, plateThickness: action.thickness } : e
+        ),
+      };
+      return recompute({ ...state, diagram, globalPlateThickness: action.thickness });
     }
 
     default:

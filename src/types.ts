@@ -148,6 +148,8 @@ export interface AppState {
   historyTree: HistoryTree | null;
   // Force-based grammar (Mirtsopoulos & Fivet)
   forceGrammar: ForceGrammarState;
+  // Global settings
+  globalPlateThickness: number; // mm — shared by all plates
 }
 
 // ─── Actions ─────────────────────────────────────────────────────
@@ -185,4 +187,5 @@ export type AppAction =
   | { type: 'SELECT_INTERIM_FORCE'; forceId: string | null }
   | { type: 'RESOLVE_FORCE_ADD_NODE'; forceId: string; x: number; y: number }
   | { type: 'RESOLVE_FORCE_CONNECT'; forceId: string; targetNodeId: string }
-  | { type: 'FORCE_GRAMMAR_AUTO_EXPLORE'; steps: number };
+  | { type: 'FORCE_GRAMMAR_AUTO_EXPLORE'; steps: number }
+  | { type: 'SET_GLOBAL_PLATE_THICKNESS'; thickness: number };
