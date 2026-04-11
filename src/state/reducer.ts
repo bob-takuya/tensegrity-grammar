@@ -19,6 +19,7 @@ import {
   computeFeasibilityDomain,
   resolveForceAddNode,
   resolveForceConnect,
+  autoExploreForceGrammar,
 } from '../grammar/forceGrammar';
 
 const MAX_UNDO = 50;
@@ -436,6 +437,13 @@ export function appReducer(state: AppState, action: AppAction): AppState {
     case 'RESOLVE_FORCE_CONNECT': {
       const s = pushUndo(state);
       const result = resolveForceConnect(s.diagram, s.forceGrammar, action.forceId, action.targetNodeId);
+      return recompute({ ...s, diagram: result.diagram, forceGrammar: result.forceGrammar, selectedIds: [] });
+    }
+
+    case 'FORCE_GRAMMAR_AUTO_EXPLORE': {
+      if (!state.forceGrammar.active) return state;
+      const s = pushUndo(state);
+      const result = autoExploreForceGrammar(s.diagram, s.forceGrammar, action.steps);
       return recompute({ ...s, diagram: result.diagram, forceGrammar: result.forceGrammar, selectedIds: [] });
     }
 

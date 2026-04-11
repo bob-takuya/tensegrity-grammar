@@ -528,6 +528,35 @@
   margin-top: 6px;
 }
 
+.explore-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+.step-input {
+  width: 52px;
+  padding: 4px 6px;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  font-size: 12px;
+  font-family: monospace;
+  text-align: center;
+  background: #fafafa;
+}
+
+.step-input:focus {
+  outline: none;
+  border-color: #4a6fa5;
+  background: #fff;
+}
+
+.step-label {
+  font-size: 11px;
+  color: #888;
+}
+
 .explore-btn {
   flex: 1;
   padding: 5px 0;
@@ -543,6 +572,12 @@
   background: #e3f2fd;
   border-color: #4a6fa5;
   color: #1565c0;
+}
+
+.explore-go {
+  flex: none;
+  padding: 4px 14px;
+  font-weight: 600;
 }
 
 /* ─── History Panel ───────────────────────────────────────────── */
@@ -791,6 +826,16 @@
   border-color: #ff9800 !important;
   color: #e65100 !important;
   font-weight: 600;
+}
+
+.fg-controls {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 6px;
+}
+
+.fg-auto-explore {
+  margin-bottom: 8px;
 }
 
 .fg-complete {

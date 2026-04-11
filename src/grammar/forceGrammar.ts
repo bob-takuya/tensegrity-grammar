@@ -428,3 +428,108 @@ function lineLineIntersection(
     y: p1.y + t * d1.y,
   };
 }
+
+// ─── Auto-Explore ────────────────────────────────────────────────
+
+/**
+ * Stochastic auto-explore for force-based grammar.
+ *
+ * Strategy per step:
+ *  1. Pick a random interim force
+ *  2. Decide: place a new node on/near line of action, OR connect to
+ *     an existing support/node
+ *  3. Apply the resolution
+ *
+ * Placement heuristics:
+ *  - With probability ~40%, try to connect directly to a support node
+ *    (convergence — reduces interim force count)
+ *  - With probability ~30%, place a new node on the line of action at
+ *    a random distance (stagnation — transfers force along a path)
+ *  - With probability ~30%, place a new node off the line of action
+ *    (divergence — splits force into axial + perpendicular)
+ */
+export function autoExploreForceGrammar(
+  diagram: DiagramData,
+  forceGrammar: ForceGrammarState,
+  steps: number
+): { diagram: DiagramData; forceGrammar: ForceGrammarState } {
+  let currentDiagram = diagram;
+  let currentFG = forceGrammar;
+
+  const maxSteps = Math.min(steps, 50);
+
+  for (let step = 0; step < maxSteps; step++) {
+    // Filter active interim forces
+    const activeForces = currentFG.interimForces.filter(
+      (f) => Math.abs(f.fx) > 0.01 || Math.abs(f.fy) > 0.01
+    );
+    if (activeForces.length === 0) break;
+
+    // Pick a random interim force
+    const force = activeForces[Math.floor(Math.random() * activeForces.length)];
+    const sourceNode = currentDiagram.nodes.find((n) => n.id === force.nodeId);
+    if (!sourceNode) continue;
+
+    const roll = Math.random();
+
+    // Strategy 1: Try to connect to a support node (convergence)
+    if (roll < 0.4) {
+      const supports = currentDiagram.nodes.filter(
+        (n) => n.support !== 'free' && n.id !== force.nodeId
+      );
+      if (supports.length > 0) {
+        // Pick the closest support
+        const target = supports.reduce((best, s) => {
+          const dBest = Math.hypot(best.x - sourceNode.x, best.y - sourceNode.y);
+          const dS = Math.hypot(s.x - sourceNode.x, s.y - sourceNode.y);
+          return dS < dBest ? s : best;
+        });
+        // Check no duplicate edge
+        const exists = currentDiagram.edges.some(
+          (e) =>
+            (e.source === force.nodeId && e.target === target.id) ||
+            (e.source === target.id && e.target === force.nodeId)
+        );
+        if (!exists) {
+          const result = resolveForceConnect(currentDiagram, currentFG, force.id, target.id);
+          currentDiagram = result.diagram;
+          currentFG = result.forceGrammar;
+          continue;
+        }
+      }
+    }
+
+    // Strategy 2: Place on line of action (stagnation)
+    if (roll < 0.7) {
+      const fMag = Math.sqrt(force.fx * force.fx + force.fy * force.fy);
+      if (fMag < 0.01) continue;
+      const dir = { x: force.fx / fMag, y: force.fy / fMag };
+      // Random distance along line of action (1 to 3 world units)
+      const dist = 1 + Math.random() * 2;
+      const nx = sourceNode.x + dir.x * dist;
+      const ny = sourceNode.y + dir.y * dist;
+      const result = resolveForceAddNode(currentDiagram, currentFG, force.id, nx, ny);
+      currentDiagram = result.diagram;
+      currentFG = result.forceGrammar;
+      continue;
+    }
+
+    // Strategy 3: Place off line of action (divergence)
+    {
+      const fMag = Math.sqrt(force.fx * force.fx + force.fy * force.fy);
+      if (fMag < 0.01) continue;
+      const dir = { x: force.fx / fMag, y: force.fy / fMag };
+      const perpDir = { x: -dir.y, y: dir.x };
+      const dist = 1 + Math.random() * 2;
+      const offset = (Math.random() - 0.5) * 2;
+      const nx = sourceNode.x + dir.x * dist + perpDir.x * offset;
+      const ny = sourceNode.y + dir.y * dist + perpDir.y * offset;
+      const result = resolveForceAddNode(currentDiagram, currentFG, force.id, nx, ny);
+      currentDiagram = result.diagram;
+      currentFG = result.forceGrammar;
+    }
+  }
+
+  return { diagram: currentDiagram, forceGrammar: currentFG };
+}
+

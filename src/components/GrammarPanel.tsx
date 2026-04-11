@@ -1,10 +1,12 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { useAppState } from '../state/context';
 import { presetRules } from '../grammar/presets';
 
 export function GrammarPanel() {
   const { state, dispatch } = useAppState();
   const { selectedRuleId, ruleMatches, ruleParams, highlightedMatchIndex } = state;
+  const [geoSteps, setGeoSteps] = useState(3);
+  const [fgSteps, setFgSteps] = useState(5);
 
   const selectedRule = selectedRuleId
     ? presetRules.find((r) => r.id === selectedRuleId)
@@ -97,30 +99,27 @@ export function GrammarPanel() {
         </div>
       )}
 
-      {/* Auto-explore */}
+      {/* Geometric auto-explore */}
       <div className="auto-explore">
-        <h4>Auto Explore</h4>
+        <h4>Geometric Auto Explore</h4>
         <p className="hint-text">
-          Stochastically apply random rules to explore design space.
+          Stochastically apply random geometric rules.
         </p>
-        <div className="explore-buttons">
+        <div className="explore-row">
+          <input
+            type="number"
+            className="step-input"
+            min={1}
+            max={50}
+            value={geoSteps}
+            onChange={(e) => setGeoSteps(Math.max(1, Math.min(50, parseInt(e.target.value) || 1)))}
+          />
+          <span className="step-label">steps</span>
           <button
-            className="explore-btn"
-            onClick={() => dispatch({ type: 'AUTO_EXPLORE', steps: 1 })}
+            className="explore-btn explore-go"
+            onClick={() => dispatch({ type: 'AUTO_EXPLORE', steps: geoSteps })}
           >
-            +1 step
-          </button>
-          <button
-            className="explore-btn"
-            onClick={() => dispatch({ type: 'AUTO_EXPLORE', steps: 3 })}
-          >
-            +3 steps
-          </button>
-          <button
-            className="explore-btn"
-            onClick={() => dispatch({ type: 'AUTO_EXPLORE', steps: 5 })}
-          >
-            +5 steps
+            Run
           </button>
         </div>
       </div>
@@ -141,12 +140,37 @@ export function GrammarPanel() {
           </button>
         ) : (
           <>
-            <button
-              className="explore-btn"
-              onClick={() => dispatch({ type: 'STOP_FORCE_GRAMMAR' })}
-            >
-              Stop
-            </button>
+            <div className="fg-controls">
+              <button
+                className="explore-btn"
+                onClick={() => dispatch({ type: 'STOP_FORCE_GRAMMAR' })}
+              >
+                Stop
+              </button>
+            </div>
+
+            {/* Force-based auto-explore */}
+            {!state.forceGrammar.isComplete && (
+              <div className="fg-auto-explore">
+                <div className="explore-row">
+                  <input
+                    type="number"
+                    className="step-input"
+                    min={1}
+                    max={50}
+                    value={fgSteps}
+                    onChange={(e) => setFgSteps(Math.max(1, Math.min(50, parseInt(e.target.value) || 1)))}
+                  />
+                  <span className="step-label">steps</span>
+                  <button
+                    className="explore-btn explore-go"
+                    onClick={() => dispatch({ type: 'FORCE_GRAMMAR_AUTO_EXPLORE', steps: fgSteps })}
+                  >
+                    Auto Resolve
+                  </button>
+                </div>
+              </div>
+            )}
 
             {state.forceGrammar.isComplete ? (
               <div className="fg-complete">

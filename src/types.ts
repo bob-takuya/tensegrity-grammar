@@ -175,4 +175,5 @@ export type AppAction =
   | { type: 'STOP_FORCE_GRAMMAR' }
   | { type: 'SELECT_INTERIM_FORCE'; forceId: string | null }
   | { type: 'RESOLVE_FORCE_ADD_NODE'; forceId: string; x: number; y: number }
-  | { type: 'RESOLVE_FORCE_CONNECT'; forceId: string; targetNodeId: string };
+  | { type: 'RESOLVE_FORCE_CONNECT'; forceId: string; targetNodeId: string }
+  | { type: 'FORCE_GRAMMAR_AUTO_EXPLORE'; steps: number };
