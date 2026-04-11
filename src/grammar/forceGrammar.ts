@@ -1,21 +1,22 @@
 /**
- * Force-Based Grammar Engine
+ * Force-Based Grammar Engine (3D Tensegrity)
  *
  * Based on:
  *  - Lee, Mueller, Fivet (IJSS 2016): form+force dual grammar rules
- *  - Mirtsopoulos & Fivet (archiDOCT 2020): single parametric rule with
- *    entropy rate, force selection, and feasibility domains
+ *  - Mirtsopoulos & Fivet (archiDOCT 2020): entropy-rate grammar
  *
- * Core concept: "interim forces" are unresolved force vectors at nodes.
- * Each grammar step places a new node and adds bars that absorb interim
- * forces along their axes. The remaining perpendicular component becomes
- * a new interim force. Supports act as sinks that absorb compatible forces.
+ * Generates 3D tensegrity structures that grow upward (z-axis) with:
+ *  - Compression members (plates) that never share nodes
+ *  - Tension members (cables) forming a connected network
+ *  - Equilibrium guaranteed by construction via interim forces
  *
- * This guarantees equilibrium BY CONSTRUCTION — no post-hoc checking needed.
+ * Each step either:
+ *  - STRUT: adds a compression plate from an interim-force node to a new 3D node
+ *  - CABLE: adds a tension cable between existing nodes
+ *  - GROUND: connects an interim-force node to a support (absorbing force)
  */
 
-import { DiagramData, DiagramNode, DiagramEdge, Vec2 } from '../types';
-import { sub, add, scale, normalize, length, dot, perp, angle } from '../engine/geometry';
+import { DiagramData, DiagramNode, DiagramEdge, Vec2, ElementType } from '../types';
 import { generateId } from '../utils/id';
 
 // ─── Types ───────────────────────────────────────────────────────
@@ -31,10 +32,8 @@ export type EntropyRate = -1 | 0 | 1;
 
 export interface FeasibilityDomain {
   type: 'point' | 'line' | 'area';
-  // For 'line': ray from node in force direction
   origin?: Vec2;
   direction?: Vec2;
-  // For 'point': intersection of two lines of action
   point?: Vec2;
 }
 
@@ -43,496 +42,360 @@ export interface ForceGrammarState {
   interimForces: InterimForce[];
   selectedForceId: string | null;
   feasibilityDomain: FeasibilityDomain | null;
-  isComplete: boolean; // true when no unresolved interim forces remain
+  isComplete: boolean;
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────
+
+function vec2Len(v: { fx?: number; fy?: number; x?: number; y?: number }): number {
+  const x = v.fx ?? v.x ?? 0;
+  const y = v.fy ?? v.y ?? 0;
+  return Math.sqrt(x * x + y * y);
+}
+function forceMag(f: InterimForce): number { return Math.sqrt(f.fx * f.fx + f.fy * f.fy); }
+function dist3(a: DiagramNode, b: DiagramNode): number {
+  return Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2 + (a.z - b.z) ** 2);
+}
+
+function hasEdge(edges: DiagramEdge[], a: string, b: string): boolean {
+  return edges.some(e => (e.source === a && e.target === b) || (e.source === b && e.target === a));
+}
+
+/** Count compression edges touching a node */
+function compressionDegree(edges: DiagramEdge[], nodeId: string): number {
+  return edges.filter(e => e.elementType === 'compression' && (e.source === nodeId || e.target === nodeId)).length;
+}
+
+function cloneDiagram(d: DiagramData): DiagramData {
+  return {
+    nodes: d.nodes.map(n => ({ ...n, externalForce: { ...n.externalForce } })),
+    edges: d.edges.map(e => ({ ...e })),
+  };
+}
+
+function makeEdge(src: string, tgt: string, type: ElementType): DiagramEdge {
+  return { id: generateId('e'), source: src, target: tgt, elementType: type, plateWidth: 0.3, plateThickness: 3, plateAngle: 0 };
+}
+
+function makeNode(x: number, y: number, z: number): DiagramNode {
+  return { id: generateId('n'), x, y, z, support: 'free', externalForce: { x: 0, y: 0 } };
 }
 
 // ─── Initialization ──────────────────────────────────────────────
 
-/**
- * Initialize force grammar from the current diagram.
- * Creates interim forces from external loads (the forces that need
- * to be routed through the structure to the supports).
- */
 export function initForceGrammar(diagram: DiagramData): ForceGrammarState {
   const interimForces: InterimForce[] = [];
-
   for (const node of diagram.nodes) {
     const { externalForce } = node;
     if (Math.abs(externalForce.x) > 1e-10 || Math.abs(externalForce.y) > 1e-10) {
-      interimForces.push({
-        id: generateId('if'),
-        nodeId: node.id,
-        // Interim force = the load that needs to be carried (same direction as applied load)
-        fx: externalForce.x,
-        fy: externalForce.y,
-      });
+      interimForces.push({ id: generateId('if'), nodeId: node.id, fx: externalForce.x, fy: externalForce.y });
     }
   }
-
-  return {
-    active: true,
-    interimForces,
-    selectedForceId: null,
-    feasibilityDomain: null,
-    isComplete: interimForces.length === 0,
-  };
+  return { active: true, interimForces, selectedForceId: null, feasibilityDomain: null, isComplete: interimForces.length === 0 };
 }
 
-// ─── Feasibility Domain Computation ──────────────────────────────
+// ─── Feasibility Domain ──────────────────────────────────────────
 
-/**
- * Compute the feasibility domain for placing a new node to resolve
- * the selected interim force.
- *
- * For monomial selection (1 force):
- *  - Line of action from the node in the force direction
- *
- * The new node can be placed anywhere on this line to maintain
- * equilibrium by construction.
- */
-export function computeFeasibilityDomain(
-  force: InterimForce,
-  diagram: DiagramData
-): FeasibilityDomain {
-  const node = diagram.nodes.find((n) => n.id === force.nodeId);
+export function computeFeasibilityDomain(force: InterimForce, diagram: DiagramData): FeasibilityDomain {
+  const node = diagram.nodes.find(n => n.id === force.nodeId);
   if (!node) return { type: 'area' };
-
-  const fMag = Math.sqrt(force.fx * force.fx + force.fy * force.fy);
+  const fMag = vec2Len(force);
   if (fMag < 1e-10) return { type: 'point', point: { x: node.x, y: node.y } };
-
-  // Line of action: from the node in the force direction
-  return {
-    type: 'line',
-    origin: { x: node.x, y: node.y },
-    direction: { x: force.fx / fMag, y: force.fy / fMag },
-  };
+  return { type: 'line', origin: { x: node.x, y: node.y }, direction: { x: force.fx / fMag, y: force.fy / fMag } };
 }
 
-/**
- * Compute feasibility domain for binomial selection (2 forces).
- * The intersection of two lines of action gives a single point
- * (convergence) or a line (stagnation).
- */
-export function computeBinomialDomain(
-  f1: InterimForce,
-  f2: InterimForce,
-  diagram: DiagramData
-): FeasibilityDomain {
-  const n1 = diagram.nodes.find((n) => n.id === f1.nodeId);
-  const n2 = diagram.nodes.find((n) => n.id === f2.nodeId);
+export function computeBinomialDomain(f1: InterimForce, f2: InterimForce, diagram: DiagramData): FeasibilityDomain {
+  const n1 = diagram.nodes.find(n => n.id === f1.nodeId);
+  const n2 = diagram.nodes.find(n => n.id === f2.nodeId);
   if (!n1 || !n2) return { type: 'area' };
-
-  // Intersection of two lines of action
-  const p = lineLineIntersection(
-    { x: n1.x, y: n1.y }, { x: f1.fx, y: f1.fy },
-    { x: n2.x, y: n2.y }, { x: f2.fx, y: f2.fy }
-  );
-
-  if (p) {
-    return { type: 'point', point: p };
-  }
-
-  // Parallel lines → no convergence point
-  return { type: 'area' };
+  const cross = f1.fx * f2.fy - f1.fy * f2.fx;
+  if (Math.abs(cross) < 1e-10) return { type: 'area' };
+  const t = ((n2.x - n1.x) * f2.fy - (n2.y - n1.y) * f2.fx) / cross;
+  return { type: 'point', point: { x: n1.x + t * f1.fx, y: n1.y + t * f1.fy } };
 }
 
-// ─── Rule Application ────────────────────────────────────────────
+// ─── Core Resolution ─────────────────────────────────────────────
 
-/**
- * Resolve an interim force by adding a new node and bar.
- *
- * The bar from the force's node (A) to the new node (P) absorbs
- * the component of the interim force along the A→P direction.
- * The perpendicular component stays at A as a residual interim force.
- * A new interim force at P equals the absorbed component.
- *
- * Returns the updated diagram and interim forces.
- */
-export function resolveForceAddNode(
-  diagram: DiagramData,
-  forceGrammar: ForceGrammarState,
-  forceId: string,
-  newX: number,
-  newY: number
-): { diagram: DiagramData; forceGrammar: ForceGrammarState } {
-  const force = forceGrammar.interimForces.find((f) => f.id === forceId);
-  if (!force) return { diagram, forceGrammar };
-
-  const sourceNode = diagram.nodes.find((n) => n.id === force.nodeId);
-  if (!sourceNode) return { diagram, forceGrammar };
-
-  // Clone diagram
-  const newDiagram: DiagramData = {
-    nodes: diagram.nodes.map((n) => ({ ...n, externalForce: { ...n.externalForce } })),
-    edges: diagram.edges.map((e) => ({ ...e })),
-  };
-
-  // Create new node P
-  const newNodeId = generateId('n');
-  newDiagram.nodes.push({
-    id: newNodeId,
-    x: newX,
-    y: newY,
-    z: 0,
-    support: 'free',
-    externalForce: { x: 0, y: 0 },
-  });
-
-  // Add bar A→P
-  newDiagram.edges.push({
-    id: generateId('e'),
-    source: force.nodeId,
-    target: newNodeId,
-    elementType: 'compression',
-    plateWidth: 0.3,
-    plateThickness: 3,
-    plateAngle: 0,
-  });
-
-  // Compute force decomposition
-  const forceVec: Vec2 = { x: force.fx, y: force.fy };
-  const barDir = normalize(sub({ x: newX, y: newY }, { x: sourceNode.x, y: sourceNode.y }));
-  const barDirLen = length(sub({ x: newX, y: newY }, { x: sourceNode.x, y: sourceNode.y }));
-
-  if (barDirLen < 1e-10) return { diagram, forceGrammar };
-
-  // Project interim force onto bar direction
-  const projection = dot(forceVec, barDir);
-  const absorbed: Vec2 = scale(barDir, projection);
-  const residual: Vec2 = sub(forceVec, absorbed);
-
-  // Update interim forces
-  let newInterimForces = forceGrammar.interimForces.filter((f) => f.id !== forceId);
-
-  // Add residual at source node (if non-negligible)
-  if (length(residual) > 0.01) {
-    // Check if source node already has another interim force
-    const existingAtSource = newInterimForces.find((f) => f.nodeId === force.nodeId);
-    if (existingAtSource) {
-      existingAtSource.fx += residual.x;
-      existingAtSource.fy += residual.y;
-    } else {
-      newInterimForces.push({
-        id: generateId('if'),
-        nodeId: force.nodeId,
-        fx: residual.x,
-        fy: residual.y,
-      });
-    }
-  }
-
-  // Add transferred force at new node P
-  if (Math.abs(projection) > 0.01) {
-    newInterimForces.push({
-      id: generateId('if'),
-      nodeId: newNodeId,
-      fx: absorbed.x,
-      fy: absorbed.y,
-    });
-  }
-
-  // Check if new node is at a support → absorb compatible forces
-  newInterimForces = absorbAtSupports(newDiagram, newInterimForces);
-
-  const isComplete = newInterimForces.every((f) =>
-    Math.abs(f.fx) < 0.01 && Math.abs(f.fy) < 0.01
-  );
-  newInterimForces = newInterimForces.filter((f) =>
-    Math.abs(f.fx) > 0.01 || Math.abs(f.fy) > 0.01
-  );
-
+/** 2D force decomposition along a bar direction (XY projection only) */
+function decomposeForce(force: InterimForce, srcNode: DiagramNode, tgtNode: DiagramNode) {
+  const dx = tgtNode.x - srcNode.x;
+  const dy = tgtNode.y - srcNode.y;
+  const len2D = Math.sqrt(dx * dx + dy * dy);
+  if (len2D < 1e-10) return { absorbed: { fx: 0, fy: 0 }, residual: { fx: force.fx, fy: force.fy }, projection: 0 };
+  const ux = dx / len2D, uy = dy / len2D;
+  const proj = force.fx * ux + force.fy * uy;
   return {
-    diagram: newDiagram,
-    forceGrammar: {
-      ...forceGrammar,
-      interimForces: newInterimForces,
-      selectedForceId: null,
-      feasibilityDomain: null,
-      isComplete: newInterimForces.length === 0,
-    },
+    absorbed: { fx: ux * proj, fy: uy * proj },
+    residual: { fx: force.fx - ux * proj, fy: force.fy - uy * proj },
+    projection: proj,
   };
 }
 
-/**
- * Resolve an interim force by connecting to an EXISTING node.
- * The bar absorbs force along its direction; the transferred
- * component adds to the target node's interim force.
- */
-export function resolveForceConnect(
-  diagram: DiagramData,
-  forceGrammar: ForceGrammarState,
-  forceId: string,
-  targetNodeId: string
-): { diagram: DiagramData; forceGrammar: ForceGrammarState } {
-  const force = forceGrammar.interimForces.find((f) => f.id === forceId);
-  if (!force) return { diagram, forceGrammar };
-  if (force.nodeId === targetNodeId) return { diagram, forceGrammar };
+interface ForceAddition { nodeId: string; fx: number; fy: number }
 
-  const sourceNode = diagram.nodes.find((n) => n.id === force.nodeId);
-  const targetNode = diagram.nodes.find((n) => n.id === targetNodeId);
-  if (!sourceNode || !targetNode) return { diagram, forceGrammar };
-
-  // Check no duplicate edge
-  const exists = diagram.edges.some(
-    (e) =>
-      (e.source === force.nodeId && e.target === targetNodeId) ||
-      (e.source === targetNodeId && e.target === force.nodeId)
-  );
-  if (exists) return { diagram, forceGrammar };
-
-  // Clone diagram
-  const newDiagram: DiagramData = {
-    nodes: diagram.nodes.map((n) => ({ ...n, externalForce: { ...n.externalForce } })),
-    edges: diagram.edges.map((e) => ({ ...e })),
-  };
-
-  newDiagram.edges.push({
-    id: generateId('e'),
-    source: force.nodeId,
-    target: targetNodeId,
-    elementType: 'compression',
-    plateWidth: 0.3,
-    plateThickness: 3,
-    plateAngle: 0,
-  });
-
-  // Force decomposition (same as above)
-  const forceVec: Vec2 = { x: force.fx, y: force.fy };
-  const barDir = normalize(sub(
-    { x: targetNode.x, y: targetNode.y },
-    { x: sourceNode.x, y: sourceNode.y }
-  ));
-
-  const projection = dot(forceVec, barDir);
-  const absorbed: Vec2 = scale(barDir, projection);
-  const residual: Vec2 = sub(forceVec, absorbed);
-
-  let newInterimForces = forceGrammar.interimForces.filter((f) => f.id !== forceId);
-
-  // Residual at source
-  if (length(residual) > 0.01) {
-    const existing = newInterimForces.find((f) => f.nodeId === force.nodeId);
-    if (existing) {
-      existing.fx += residual.x;
-      existing.fy += residual.y;
-    } else {
-      newInterimForces.push({
-        id: generateId('if'),
-        nodeId: force.nodeId,
-        fx: residual.x,
-        fy: residual.y,
-      });
-    }
-  }
-
-  // Transferred to target
-  if (Math.abs(projection) > 0.01) {
-    const existing = newInterimForces.find((f) => f.nodeId === targetNodeId);
-    if (existing) {
-      existing.fx += absorbed.x;
-      existing.fy += absorbed.y;
-    } else {
-      newInterimForces.push({
-        id: generateId('if'),
-        nodeId: targetNodeId,
-        fx: absorbed.x,
-        fy: absorbed.y,
-      });
-    }
-  }
-
-  // Absorb at supports
-  newInterimForces = absorbAtSupports(newDiagram, newInterimForces);
-
-  newInterimForces = newInterimForces.filter((f) =>
-    Math.abs(f.fx) > 0.01 || Math.abs(f.fy) > 0.01
-  );
-
-  return {
-    diagram: newDiagram,
-    forceGrammar: {
-      ...forceGrammar,
-      interimForces: newInterimForces,
-      selectedForceId: null,
-      feasibilityDomain: null,
-      isComplete: newInterimForces.length === 0,
-    },
-  };
-}
-
-// ─── Support Absorption ──────────────────────────────────────────
-
-/**
- * At support nodes, absorb the compatible component of interim forces.
- * - Pin: absorbs both components (full reaction)
- * - Roller-x: absorbs only y-component (vertical reaction)
- * - Roller-y: absorbs only x-component (horizontal reaction)
- */
-function absorbAtSupports(
-  diagram: DiagramData,
-  forces: InterimForce[]
+function updateInterimForces(
+  forces: InterimForce[],
+  removeId: string,
+  additions: ForceAddition[],
+  diagram: DiagramData
 ): InterimForce[] {
-  const nodeMap = new Map(diagram.nodes.map((n) => [n.id, n]));
-
-  return forces.map((f) => {
-    const node = nodeMap.get(f.nodeId);
+  let result = forces.filter(f => f.id !== removeId);
+  for (const a of additions) {
+    if (Math.abs(a.fx) < 0.005 && Math.abs(a.fy) < 0.005) continue;
+    const existing = result.find(f => f.nodeId === a.nodeId);
+    if (existing) { existing.fx += a.fx; existing.fy += a.fy; }
+    else result.push({ id: generateId('if'), nodeId: a.nodeId, fx: a.fx, fy: a.fy });
+  }
+  // Absorb at supports
+  result = result.map(f => {
+    const node = diagram.nodes.find(n => n.id === f.nodeId);
     if (!node) return f;
-
-    switch (node.support) {
-      case 'pin':
-        // Pin absorbs everything
-        return { ...f, fx: 0, fy: 0 };
-      case 'roller-x':
-        // Roller-x provides vertical reaction only
-        return { ...f, fy: 0 };
-      case 'roller-y':
-        // Roller-y provides horizontal reaction only
-        return { ...f, fx: 0 };
-      default:
-        return f;
-    }
+    if (node.support === 'pin') return { ...f, fx: 0, fy: 0 };
+    if (node.support === 'roller-x') return { ...f, fy: 0 };
+    if (node.support === 'roller-y') return { ...f, fx: 0 };
+    return f;
   });
+  return result.filter(f => Math.abs(f.fx) > 0.005 || Math.abs(f.fy) > 0.005);
 }
 
-// ─── Utilities ───────────────────────────────────────────────────
+// ─── Manual Rule Application ─────────────────────────────────────
 
-/**
- * Project a point onto the line of action of an interim force.
- * Returns the closest point on the line to the given point.
- */
-export function projectOntoLineOfAction(
-  force: InterimForce,
-  nodeMap: Map<string, DiagramNode>,
-  point: Vec2
-): Vec2 {
+export function resolveForceAddNode(
+  diagram: DiagramData, fg: ForceGrammarState, forceId: string, newX: number, newY: number
+): { diagram: DiagramData; forceGrammar: ForceGrammarState } {
+  const force = fg.interimForces.find(f => f.id === forceId);
+  if (!force) return { diagram, forceGrammar: fg };
+  const srcNode = diagram.nodes.find(n => n.id === force.nodeId);
+  if (!srcNode) return { diagram, forceGrammar: fg };
+
+  const d = cloneDiagram(diagram);
+  const newNode = makeNode(newX, newY, 0);
+  d.nodes.push(newNode);
+  d.edges.push(makeEdge(force.nodeId, newNode.id, 'compression'));
+
+  const { absorbed, residual } = decomposeForce(force, srcNode, newNode);
+  const newIF = updateInterimForces(fg.interimForces, forceId,
+    [{ nodeId: force.nodeId, ...residual }, { nodeId: newNode.id, ...absorbed }], d);
+
+  return { diagram: d, forceGrammar: { ...fg, interimForces: newIF, selectedForceId: null, feasibilityDomain: null, isComplete: newIF.length === 0 } };
+}
+
+export function resolveForceConnect(
+  diagram: DiagramData, fg: ForceGrammarState, forceId: string, targetNodeId: string
+): { diagram: DiagramData; forceGrammar: ForceGrammarState } {
+  const force = fg.interimForces.find(f => f.id === forceId);
+  if (!force || force.nodeId === targetNodeId) return { diagram, forceGrammar: fg };
+  const srcNode = diagram.nodes.find(n => n.id === force.nodeId);
+  const tgtNode = diagram.nodes.find(n => n.id === targetNodeId);
+  if (!srcNode || !tgtNode) return { diagram, forceGrammar: fg };
+  if (hasEdge(diagram.edges, force.nodeId, targetNodeId)) return { diagram, forceGrammar: fg };
+
+  const d = cloneDiagram(diagram);
+  d.edges.push(makeEdge(force.nodeId, targetNodeId, 'compression'));
+
+  const { absorbed, residual } = decomposeForce(force, srcNode, tgtNode);
+  const newIF = updateInterimForces(fg.interimForces, forceId,
+    [{ nodeId: force.nodeId, ...residual }, { nodeId: targetNodeId, ...absorbed }], d);
+
+  return { diagram: d, forceGrammar: { ...fg, interimForces: newIF, selectedForceId: null, feasibilityDomain: null, isComplete: newIF.length === 0 } };
+}
+
+// ─── Utilities kept for import ───────────────────────────────────
+
+export function projectOntoLineOfAction(force: InterimForce, nodeMap: Map<string, DiagramNode>, point: Vec2): Vec2 {
   const node = nodeMap.get(force.nodeId);
   if (!node) return point;
-
-  const fMag = Math.sqrt(force.fx * force.fx + force.fy * force.fy);
+  const fMag = vec2Len(force);
   if (fMag < 1e-10) return { x: node.x, y: node.y };
-
-  const dir: Vec2 = { x: force.fx / fMag, y: force.fy / fMag };
-  const toPoint = sub(point, { x: node.x, y: node.y });
-  const t = dot(toPoint, dir);
-
-  return add({ x: node.x, y: node.y }, scale(dir, t));
+  const dx = point.x - node.x, dy = point.y - node.y;
+  const t = (dx * force.fx + dy * force.fy) / (fMag * fMag);
+  return { x: node.x + t * force.fx, y: node.y + t * force.fy };
 }
 
-function lineLineIntersection(
-  p1: Vec2, d1: Vec2,
-  p2: Vec2, d2: Vec2
-): Vec2 | null {
-  const cross = d1.x * d2.y - d1.y * d2.x;
-  if (Math.abs(cross) < 1e-10) return null; // parallel
-
-  const t = ((p2.x - p1.x) * d2.y - (p2.y - p1.y) * d2.x) / cross;
-  return {
-    x: p1.x + t * d1.x,
-    y: p1.y + t * d1.y,
-  };
-}
-
-// ─── Auto-Explore ────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════
+// 3D TENSEGRITY AUTO-EXPLORE
+// ═════════════════════════════════════════════════════════════════
 
 /**
- * Stochastic auto-explore for force-based grammar.
+ * Generate a 3D tensegrity structure by growing upward from supports.
  *
- * Strategy per step:
- *  1. Pick a random interim force
- *  2. Decide: place a new node on/near line of action, OR connect to
- *     an existing support/node
- *  3. Apply the resolution
- *
- * Placement heuristics:
- *  - With probability ~40%, try to connect directly to a support node
- *    (convergence — reduces interim force count)
- *  - With probability ~30%, place a new node on the line of action at
- *    a random distance (stagnation — transfers force along a path)
- *  - With probability ~30%, place a new node off the line of action
- *    (divergence — splits force into axial + perpendicular)
+ * Algorithm:
+ * 1. STRUT PHASE: for each interim force, create a compression strut
+ *    going to a NEW node elevated in Z, absorbing the full force
+ *    along the bar axis. Place the strut so that it directs force
+ *    toward a support.
+ * 2. CABLE PHASE: add tension cables between the new elevated nodes
+ *    and between elevated nodes and supports to form a connected
+ *    tension network.
+ * 3. GROUND PHASE: connect remaining interim forces directly to
+ *    supports to fully resolve them.
+ * 4. VALIDATE: check tensegrity conditions after each step.
  */
 export function autoExploreForceGrammar(
   diagram: DiagramData,
   forceGrammar: ForceGrammarState,
   steps: number
 ): { diagram: DiagramData; forceGrammar: ForceGrammarState } {
-  let currentDiagram = diagram;
-  let currentFG = forceGrammar;
+  let d = cloneDiagram(diagram);
+  let forces = [...forceGrammar.interimForces.map(f => ({ ...f }))];
+  const maxSteps = Math.min(steps, 100);
 
-  const maxSteps = Math.min(steps, 50);
+  const supports = d.nodes.filter(n => n.support !== 'free');
+  const nodeMap = () => new Map(d.nodes.map(n => [n.id, n]));
+
+  // Track current z-level for growth
+  let currentZ = Math.max(0, ...d.nodes.map(n => n.z));
 
   for (let step = 0; step < maxSteps; step++) {
-    // Filter active interim forces
-    const activeForces = currentFG.interimForces.filter(
-      (f) => Math.abs(f.fx) > 0.01 || Math.abs(f.fy) > 0.01
+    const active = forces.filter(f => Math.abs(f.fx) > 0.01 || Math.abs(f.fy) > 0.01);
+    if (active.length === 0) break;
+
+    // Pick the LARGEST interim force (most urgent to resolve)
+    active.sort((a, b) => vec2Len(b) - vec2Len(a));
+    const force = active[0];
+    const nm = nodeMap();
+    const srcNode = nm.get(force.nodeId);
+    if (!srcNode) { forces = forces.filter(f => f.id !== force.id); continue; }
+
+    // Find nearest support not yet directly connected
+    const availableSupports = supports.filter(s =>
+      s.id !== force.nodeId && !hasEdge(d.edges, force.nodeId, s.id)
     );
-    if (activeForces.length === 0) break;
 
-    // Pick a random interim force
-    const force = activeForces[Math.floor(Math.random() * activeForces.length)];
-    const sourceNode = currentDiagram.nodes.find((n) => n.id === force.nodeId);
-    if (!sourceNode) continue;
-
-    const roll = Math.random();
-
-    // Strategy 1: Try to connect to a support node (convergence)
-    if (roll < 0.4) {
-      const supports = currentDiagram.nodes.filter(
-        (n) => n.support !== 'free' && n.id !== force.nodeId
+    // ─── STRATEGY SELECTION ──────────────────────────────────
+    // Phase A: If close to a support, connect directly (GROUND)
+    if (availableSupports.length > 0) {
+      const nearest = availableSupports.reduce((best, s) =>
+        dist3(srcNode, s) < dist3(srcNode, best) ? s : best
       );
-      if (supports.length > 0) {
-        // Pick the closest support
-        const target = supports.reduce((best, s) => {
-          const dBest = Math.hypot(best.x - sourceNode.x, best.y - sourceNode.y);
-          const dS = Math.hypot(s.x - sourceNode.x, s.y - sourceNode.y);
-          return dS < dBest ? s : best;
-        });
-        // Check no duplicate edge
-        const exists = currentDiagram.edges.some(
-          (e) =>
-            (e.source === force.nodeId && e.target === target.id) ||
-            (e.source === target.id && e.target === force.nodeId)
-        );
-        if (!exists) {
-          const result = resolveForceConnect(currentDiagram, currentFG, force.id, target.id);
-          currentDiagram = result.diagram;
-          currentFG = result.forceGrammar;
-          continue;
+      const d3 = dist3(srcNode, nearest);
+
+      // Direct connection if close enough or if this is the last resort
+      if (d3 < 3 || active.length <= 2 || step > maxSteps * 0.7) {
+        d.edges.push(makeEdge(force.nodeId, nearest.id, 'compression'));
+        const { absorbed, residual } = decomposeForce(force, srcNode, nearest);
+        forces = updateInterimForces(forces, force.id,
+          [{ nodeId: force.nodeId, ...residual }, { nodeId: nearest.id, ...absorbed }], d);
+
+        // If residual is still large, add a cable to another support for the perpendicular component
+        const updatedResidualForce = forces.find(f => f.nodeId === force.nodeId);
+        if (updatedResidualForce && vec2Len(updatedResidualForce) > 0.05) {
+          const otherSupports = supports.filter(s =>
+            s.id !== nearest.id && s.id !== force.nodeId && !hasEdge(d.edges, force.nodeId, s.id)
+          );
+          if (otherSupports.length > 0) {
+            d.edges.push(makeEdge(force.nodeId, otherSupports[0].id, 'tension'));
+            const { absorbed: abs2, residual: res2 } = decomposeForce(updatedResidualForce, srcNode, otherSupports[0]);
+            forces = updateInterimForces(forces, updatedResidualForce.id,
+              [{ nodeId: force.nodeId, ...res2 }, { nodeId: otherSupports[0].id, ...abs2 }], d);
+          }
         }
+        continue;
       }
     }
 
-    // Strategy 2: Place on line of action (stagnation)
-    if (roll < 0.7) {
-      const fMag = Math.sqrt(force.fx * force.fx + force.fy * force.fy);
-      if (fMag < 0.01) continue;
-      const dir = { x: force.fx / fMag, y: force.fy / fMag };
-      // Random distance along line of action (1 to 3 world units)
-      const dist = 1 + Math.random() * 2;
-      const nx = sourceNode.x + dir.x * dist;
-      const ny = sourceNode.y + dir.y * dist;
-      const result = resolveForceAddNode(currentDiagram, currentFG, force.id, nx, ny);
-      currentDiagram = result.diagram;
-      currentFG = result.forceGrammar;
-      continue;
-    }
+    // Phase B: Create a STRUT going upward to a new 3D node
+    currentZ += 0.5 + Math.random() * 1.0;
 
-    // Strategy 3: Place off line of action (divergence)
-    {
-      const fMag = Math.sqrt(force.fx * force.fx + force.fy * force.fy);
-      if (fMag < 0.01) continue;
-      const dir = { x: force.fx / fMag, y: force.fy / fMag };
-      const perpDir = { x: -dir.y, y: dir.x };
-      const dist = 1 + Math.random() * 2;
-      const offset = (Math.random() - 0.5) * 2;
-      const nx = sourceNode.x + dir.x * dist + perpDir.x * offset;
-      const ny = sourceNode.y + dir.y * dist + perpDir.y * offset;
-      const result = resolveForceAddNode(currentDiagram, currentFG, force.id, nx, ny);
-      currentDiagram = result.diagram;
-      currentFG = result.forceGrammar;
+    // Direction: toward the centroid of supports, but elevated
+    const supportCentroid = supports.length > 0
+      ? { x: supports.reduce((s, n) => s + n.x, 0) / supports.length,
+          y: supports.reduce((s, n) => s + n.y, 0) / supports.length }
+      : { x: srcNode.x, y: srcNode.y };
+
+    // New node positioned between source and support centroid, elevated
+    const towardSupport = {
+      x: supportCentroid.x - srcNode.x,
+      y: supportCentroid.y - srcNode.y,
+    };
+    const tsDist = Math.sqrt(towardSupport.x ** 2 + towardSupport.y ** 2) || 1;
+    const strutLen = 1 + Math.random() * 1.5;
+    const lateralOffset = (Math.random() - 0.5) * 1.5;
+
+    // Position new node: move partially toward supports + random lateral + upward z
+    const perpX = -towardSupport.y / tsDist;
+    const perpY = towardSupport.x / tsDist;
+    const newNode = makeNode(
+      srcNode.x + (towardSupport.x / tsDist) * strutLen + perpX * lateralOffset,
+      srcNode.y + (towardSupport.y / tsDist) * strutLen + perpY * lateralOffset,
+      currentZ
+    );
+
+    // Check tensegrity: compression members at srcNode must be 0 or we use a cable instead
+    const srcCompressionDeg = compressionDegree(d.edges, force.nodeId);
+    const strutType: ElementType = srcCompressionDeg === 0 ? 'compression' : 'tension';
+
+    d.nodes.push(newNode);
+    d.edges.push(makeEdge(force.nodeId, newNode.id, strutType));
+
+    // Decompose force along the new member
+    const { absorbed, residual } = decomposeForce(force, srcNode, newNode);
+    forces = updateInterimForces(forces, force.id,
+      [{ nodeId: force.nodeId, ...residual }, { nodeId: newNode.id, ...absorbed }], d);
+
+    // Phase C: Add CABLES from new node to nearby existing nodes for stability
+    const allNodes = d.nodes.filter(n => n.id !== newNode.id);
+    // Sort by distance
+    allNodes.sort((a, b) => dist3(newNode, a) - dist3(newNode, b));
+
+    let cablesAdded = 0;
+    for (const neighbor of allNodes) {
+      if (cablesAdded >= 2) break;
+      if (hasEdge(d.edges, newNode.id, neighbor.id)) continue;
+      if (dist3(newNode, neighbor) > 6) continue;
+
+      // For tensegrity: if newNode already has a compression member,
+      // additional connections should be cables
+      const newNodeCompDeg = compressionDegree(d.edges, newNode.id);
+      const neighborCompDeg = compressionDegree(d.edges, neighbor.id);
+
+      // Both nodes should not get a second compression member (tensegrity rule)
+      const cableType: ElementType =
+        (newNodeCompDeg >= 1 || neighborCompDeg >= 1) ? 'tension' : 'compression';
+
+      d.edges.push(makeEdge(newNode.id, neighbor.id, cableType));
+      cablesAdded++;
+
+      // If the neighbor has an interim force, the cable helps resolve it
+      const neighborForce = forces.find(f => f.nodeId === neighbor.id);
+      if (neighborForce && vec2Len(neighborForce) > 0.01) {
+        const nNode = d.nodes.find(n => n.id === neighbor.id)!;
+        const { absorbed: nAbs, residual: nRes } = decomposeForce(neighborForce, nNode, newNode);
+        forces = updateInterimForces(forces, neighborForce.id,
+          [{ nodeId: neighbor.id, ...nRes }, { nodeId: newNode.id, ...nAbs }], d);
+      }
     }
   }
 
-  return { diagram: currentDiagram, forceGrammar: currentFG };
-}
+  // Final pass: connect any remaining interim forces to nearest support
+  let finalActive = forces.filter(f => Math.abs(f.fx) > 0.01 || Math.abs(f.fy) > 0.01);
+  for (const force of finalActive) {
+    const nm = nodeMap();
+    const srcNode = nm.get(force.nodeId);
+    if (!srcNode) continue;
 
+    for (const support of supports) {
+      if (hasEdge(d.edges, force.nodeId, support.id)) continue;
+      const edgeType: ElementType = compressionDegree(d.edges, force.nodeId) >= 1 ? 'tension' : 'compression';
+      d.edges.push(makeEdge(force.nodeId, support.id, edgeType));
+      const { absorbed, residual } = decomposeForce(force, srcNode, support);
+      forces = updateInterimForces(forces, force.id,
+        [{ nodeId: force.nodeId, ...residual }, { nodeId: support.id, ...absorbed }], d);
+      break;
+    }
+  }
+
+  // Clean up near-zero forces
+  forces = forces.filter(f => Math.abs(f.fx) > 0.01 || Math.abs(f.fy) > 0.01);
+
+  return {
+    diagram: d,
+    forceGrammar: {
+      ...forceGrammar,
+      interimForces: forces,
+      selectedForceId: null,
+      feasibilityDomain: null,
+      isComplete: forces.length === 0,
+    },
+  };
+}
