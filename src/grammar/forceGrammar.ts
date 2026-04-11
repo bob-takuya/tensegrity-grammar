@@ -100,27 +100,117 @@ function rand(min: number, max: number): number {
   return min + Math.random() * (max - min);
 }
 
+// ─── Connectivity ────────────────────────────────────────────────
+
+/** Get all nodes reachable from `start` via tension (cable) edges */
+function tensionReachable(d: DiagramData, start: string): Set<string> {
+  const adj = new Map<string, string[]>();
+  for (const e of d.edges) {
+    if (e.elementType !== 'tension') continue;
+    if (!adj.has(e.source)) adj.set(e.source, []);
+    if (!adj.has(e.target)) adj.set(e.target, []);
+    adj.get(e.source)!.push(e.target);
+    adj.get(e.target)!.push(e.source);
+  }
+  const visited = new Set<string>();
+  const q = [start];
+  visited.add(start);
+  while (q.length > 0) {
+    const cur = q.shift()!;
+    for (const nb of (adj.get(cur) || [])) {
+      if (!visited.has(nb)) { visited.add(nb); q.push(nb); }
+    }
+  }
+  return visited;
+}
+
+/** Repair disconnected tension network by adding cables between components */
+function repairConnectivity(d: DiagramData): void {
+  const allCableNodes = new Set<string>();
+  for (const e of d.edges) {
+    if (e.elementType === 'tension') { allCableNodes.add(e.source); allCableNodes.add(e.target); }
+  }
+  // Also include plate endpoints (they must be reachable)
+  for (const e of d.edges) {
+    if (e.elementType === 'compression') { allCableNodes.add(e.source); allCableNodes.add(e.target); }
+  }
+  // Include supports
+  for (const n of d.nodes) {
+    if (n.support !== 'free') allCableNodes.add(n.id);
+  }
+  if (allCableNodes.size === 0) return;
+
+  // Find components and bridge them
+  const assigned = new Set<string>();
+  const components: Set<string>[] = [];
+  for (const nid of allCableNodes) {
+    if (assigned.has(nid)) continue;
+    const comp = tensionReachable(d, nid);
+    // Only include nodes that are in our target set
+    const filtered = new Set([...comp].filter(id => allCableNodes.has(id)));
+    for (const id of filtered) assigned.add(id);
+    if (filtered.size > 0) components.push(filtered);
+  }
+  // Add isolated nodes as singleton components
+  for (const nid of allCableNodes) {
+    if (!assigned.has(nid)) {
+      components.push(new Set([nid]));
+      assigned.add(nid);
+    }
+  }
+
+  // Bridge components: connect nearest pair between each pair
+  while (components.length > 1) {
+    let bestDist = Infinity;
+    let bestA = '', bestB = '';
+    let bestCompJ = 1;
+    const nodesArr = d.nodes;
+    const nodeMap = new Map(nodesArr.map(n => [n.id, n]));
+
+    for (let j = 1; j < components.length; j++) {
+      for (const aidRaw of components[0]) {
+        const aid = aidRaw;
+        const an = nodeMap.get(aid);
+        if (!an) continue;
+        for (const bid of components[j]) {
+          const bn = nodeMap.get(bid);
+          if (!bn) continue;
+          if (hasEdge(d.edges, aid, bid)) continue;
+          const dd = dist3(an, bn);
+          if (dd < bestDist) { bestDist = dd; bestA = aid; bestB = bid; bestCompJ = j; }
+        }
+      }
+    }
+
+    if (bestA && bestB) {
+      d.edges.push(makeEdge(bestA, bestB, 'tension'));
+      // Merge components
+      for (const id of components[bestCompJ]) components[0].add(id);
+      components.splice(bestCompJ, 1);
+    } else {
+      break; // can't bridge
+    }
+  }
+}
+
 // ─── L-System Rules ──────────────────────────────────────────────
 
 /**
- * SEED: Create the first plate suspended from ground supports by cables.
- * Picks 2-3 support nodes and suspends a plate above them.
+ * SEED: First plate suspended from supports.
+ * Both endpoints cabled to ALL supports for a solid foundation.
  */
 function applySeed(d: DiagramData): boolean {
   const supports = d.nodes.filter(n => n.support !== 'free');
   if (supports.length < 2) return false;
-  // Don't seed if there are already compression members
   if (d.edges.some(e => e.elementType === 'compression')) return false;
 
-  // Centroid of supports
   const cx = supports.reduce((s, n) => s + n.x, 0) / supports.length;
   const cy = supports.reduce((s, n) => s + n.y, 0) / supports.length;
 
-  // Create a plate above the centroid, tilted randomly
   const z = 1.5 + rand(0, 1);
   const plateLen = 1 + rand(0, 1.5);
   const angle = rand(0, Math.PI * 2);
-  const tilt = rand(0.2, 0.8); // z-axis tilt
+  const tilt = rand(0.2, 0.8);
 
   const p1 = makeNode(
     cx + Math.cos(angle) * plateLen * 0.5,
@@ -136,13 +226,11 @@ function applySeed(d: DiagramData): boolean {
   d.nodes.push(p1, p2);
   d.edges.push(makeEdge(p1.id, p2.id, 'compression'));
 
-  // Cable each plate endpoint to 1-2 nearest supports
+  // Cable BOTH endpoints to ALL supports → fully connected foundation
   for (const pNode of [p1, p2]) {
-    const sorted = [...supports].sort((a, b) => dist3(pNode, a) - dist3(pNode, b));
-    const numCables = Math.min(sorted.length, 1 + Math.floor(Math.random() * 2));
-    for (let i = 0; i < numCables; i++) {
-      if (!hasEdge(d.edges, pNode.id, sorted[i].id)) {
-        d.edges.push(makeEdge(pNode.id, sorted[i].id, 'tension'));
+    for (const sup of supports) {
+      if (!hasEdge(d.edges, pNode.id, sup.id)) {
+        d.edges.push(makeEdge(pNode.id, sup.id, 'tension'));
       }
     }
   }
@@ -151,129 +239,107 @@ function applySeed(d: DiagramData): boolean {
 }
 
 /**
- * SPROUT: Pick a cable and insert a new plate along it.
- *   A --cable-- B  →  A --cable-- P1 ==plate== P2 --cable-- B
- *
- * The plate "sprouts" off the cable path, elevated in 3D.
- * The original cable is removed. Two new cables connect the plate
- * endpoints back to A and B. The plate is elevated relative to the
- * cable midpoint and rotated randomly.
+ * SPROUT: Insert plate along an existing cable.
+ * The original cable A-B is removed. New cables: A→P1, P2→B.
+ * Additionally P1 and P2 each get one more cable to a nearby node
+ * to maintain connectivity.
  */
 function applySprout(d: DiagramData): boolean {
   const cables = d.edges.filter(e => e.elementType === 'tension');
   if (cables.length === 0) return false;
 
-  // Pick a random cable
   const cable = cables[Math.floor(Math.random() * cables.length)];
   const a = d.nodes.find(n => n.id === cable.source)!;
   const b = d.nodes.find(n => n.id === cable.target)!;
   if (!a || !b) return false;
 
-  // Midpoint of cable
-  const mx = (a.x + b.x) / 2;
-  const my = (a.y + b.y) / 2;
-  const mz = (a.z + b.z) / 2;
-
-  // Plate elevated above the cable midpoint
-  const elevation = rand(0.5, 2.0);
+  const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2, mz = (a.z + b.z) / 2;
+  const elevation = rand(0.3, 1.5);
   const plateLen = rand(0.5, 1.5);
   const angle = rand(0, Math.PI * 2);
   const tilt = rand(-0.4, 0.4);
+  const latAngle = rand(0, Math.PI * 2);
+  const latDist = rand(0.1, 0.8);
 
-  // Random lateral offset so plates don't stack directly
-  const lateralAngle = rand(0, Math.PI * 2);
-  const lateralDist = rand(0.2, 1.0);
-
-  const cx = mx + Math.cos(lateralAngle) * lateralDist;
-  const cy = my + Math.sin(lateralAngle) * lateralDist;
+  const cx = mx + Math.cos(latAngle) * latDist;
+  const cy = my + Math.sin(latAngle) * latDist;
   const cz = mz + elevation;
 
-  const p1 = makeNode(
-    cx + Math.cos(angle) * plateLen * 0.5,
-    cy + Math.sin(angle) * plateLen * 0.5,
-    cz + tilt
-  );
-  const p2 = makeNode(
-    cx - Math.cos(angle) * plateLen * 0.5,
-    cy - Math.sin(angle) * plateLen * 0.5,
-    cz - tilt
-  );
-
-  // Check: P1 and P2 must not already have compression members (they're new, so OK)
-  // Check: A and B must not get a compression member (they keep their cables)
+  const p1 = makeNode(cx + Math.cos(angle) * plateLen * 0.5, cy + Math.sin(angle) * plateLen * 0.5, cz + tilt);
+  const p2 = makeNode(cx - Math.cos(angle) * plateLen * 0.5, cy - Math.sin(angle) * plateLen * 0.5, cz - tilt);
 
   d.nodes.push(p1, p2);
-
-  // Add the compression plate
   d.edges.push(makeEdge(p1.id, p2.id, 'compression'));
 
   // Remove original cable
   d.edges = d.edges.filter(e => e.id !== cable.id);
 
-  // Add cables: A → P1, P2 → B
+  // Primary cables: A→P1, P2→B (replace the removed cable)
   d.edges.push(makeEdge(a.id, p1.id, 'tension'));
   d.edges.push(makeEdge(p2.id, b.id, 'tension'));
+
+  // Secondary cable: P1 or P2 to another existing node for redundancy
+  const existing = d.nodes.filter(n => n.id !== p1.id && n.id !== p2.id);
+  existing.sort((x, y) => dist3(p1, x) - dist3(p1, y));
+  for (const cand of existing) {
+    if (cand.id === a.id || cand.id === b.id) continue;
+    if (!hasEdge(d.edges, p2.id, cand.id)) {
+      d.edges.push(makeEdge(p2.id, cand.id, 'tension'));
+      break;
+    }
+  }
 
   return true;
 }
 
 /**
- * BRANCH: Pick a node and attach a new plate branching away.
- *   N  →  N --cable-- P1 ==plate== P2 --cable-- (other node)
- *
- * The plate branches outward and upward from node N, and its far
- * end (P2) is cabled back to a different existing node for stability.
+ * BRANCH: Attach a new plate branching from an existing node.
+ * P1 cables to srcNode. P2 cables to TWO different existing nodes.
  */
 function applyBranch(d: DiagramData): boolean {
-  // Pick a node that does NOT already have max cables
   const candidates = d.nodes.filter(n => {
-    const totalDeg = d.edges.filter(e => e.source === n.id || e.target === n.id).length;
-    return totalDeg < 5; // avoid over-connecting
+    const deg = d.edges.filter(e => e.source === n.id || e.target === n.id).length;
+    return deg >= 1 && deg < 6;
   });
   if (candidates.length === 0) return false;
 
   const srcNode = candidates[Math.floor(Math.random() * candidates.length)];
 
-  // Branch direction: random, trending upward
   const angle = rand(0, Math.PI * 2);
-  const upward = rand(0.5, 2.0);
+  const upward = rand(0.5, 1.5);
   const outward = rand(0.5, 1.5);
   const plateLen = rand(0.5, 1.5);
   const plateAngle = rand(0, Math.PI * 2);
 
-  const branchDir = {
-    x: Math.cos(angle) * outward,
-    y: Math.sin(angle) * outward,
-    z: upward,
-  };
-
   const p1 = makeNode(
-    srcNode.x + branchDir.x * 0.3,
-    srcNode.y + branchDir.y * 0.3,
-    srcNode.z + branchDir.z * 0.3
+    srcNode.x + Math.cos(angle) * outward * 0.3,
+    srcNode.y + Math.sin(angle) * outward * 0.3,
+    srcNode.z + upward * 0.3
   );
   const p2 = makeNode(
-    srcNode.x + branchDir.x + Math.cos(plateAngle) * plateLen * 0.5,
-    srcNode.y + branchDir.y + Math.sin(plateAngle) * plateLen * 0.5,
-    srcNode.z + branchDir.z + rand(-0.3, 0.3)
+    srcNode.x + Math.cos(angle) * outward + Math.cos(plateAngle) * plateLen * 0.5,
+    srcNode.y + Math.sin(angle) * outward + Math.sin(plateAngle) * plateLen * 0.5,
+    srcNode.z + upward + rand(-0.3, 0.3)
   );
 
   d.nodes.push(p1, p2);
   d.edges.push(makeEdge(p1.id, p2.id, 'compression'));
 
-  // Cable from srcNode to P1
+  // Cable: srcNode → P1
   d.edges.push(makeEdge(srcNode.id, p1.id, 'tension'));
 
-  // Cable from P2 to a nearby existing node (not srcNode, not p1)
-  const others = d.nodes.filter(n =>
-    n.id !== srcNode.id && n.id !== p1.id && n.id !== p2.id &&
-    !hasEdge(d.edges, p2.id, n.id)
-  );
-  if (others.length > 0) {
-    // Pick one of the 3 nearest
-    others.sort((a, b) => dist3(p2, a) - dist3(p2, b));
-    const pick = others[Math.min(Math.floor(Math.random() * 3), others.length - 1)];
-    d.edges.push(makeEdge(p2.id, pick.id, 'tension'));
+  // Cable: P2 → two nearest existing nodes (not srcNode, not P1)
+  const others = d.nodes
+    .filter(n => n.id !== srcNode.id && n.id !== p1.id && n.id !== p2.id)
+    .sort((a, b) => dist3(p2, a) - dist3(p2, b));
+
+  let cabled = 0;
+  for (const other of others) {
+    if (cabled >= 2) break;
+    if (!hasEdge(d.edges, p2.id, other.id)) {
+      d.edges.push(makeEdge(p2.id, other.id, 'tension'));
+      cabled++;
+    }
   }
 
   return true;
@@ -282,7 +348,6 @@ function applyBranch(d: DiagramData): boolean {
 // ─── Tensegrity Validation ───────────────────────────────────────
 
 function isTensegrityValid(d: DiagramData): boolean {
-  // Rule 1: No node touches more than 1 compression member
   for (const node of d.nodes) {
     if (compressionDegree(d.edges, node.id) > 1) return false;
   }
@@ -333,22 +398,22 @@ export function autoExploreForceGrammar(
 
     // Validate tensegrity after each step
     if (success && !isTensegrityValid(d)) {
-      // Rollback
       d.nodes = snapshot.nodes;
       d.edges = snapshot.edges;
-      // Try the other rule
-      if (Math.random() < 0.5) {
-        applySprout(d);
-      } else {
-        applyBranch(d);
-      }
-      // If still invalid, rollback again
+      // Retry with the other rule
+      if (Math.random() < 0.5) applySprout(d); else applyBranch(d);
       if (!isTensegrityValid(d)) {
         d.nodes = snapshot.nodes;
         d.edges = snapshot.edges;
       }
     }
+
+    // Repair connectivity after each step
+    if (success) repairConnectivity(d);
   }
+
+  // Final connectivity repair
+  repairConnectivity(d);
 
   // Clear interim forces — L-system doesn't use them
   return {
