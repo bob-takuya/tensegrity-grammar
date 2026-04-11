@@ -38,18 +38,12 @@ export function validateTensegrity(diagram: DiagramData): TensegrityResult {
     issues.push('No tension members (cables) defined');
   }
 
-  // Check 1: No two compression members share a node
-  const compressionNodeCount = new Map<string, number>();
+  // Info: count max compression degree per node (Class-k)
+  let maxCompDeg = 0;
   for (const e of compressionEdges) {
-    compressionNodeCount.set(e.source, (compressionNodeCount.get(e.source) || 0) + 1);
-    compressionNodeCount.set(e.target, (compressionNodeCount.get(e.target) || 0) + 1);
-  }
-  for (const [nodeId, count] of compressionNodeCount) {
-    if (count > 1) {
-      const node = nodeMap.get(nodeId);
-      const pos = node ? `(${node.x},${node.y})` : nodeId;
-      issues.push(`Node ${pos} connects ${count} compression members — plates must not touch`);
-    }
+    const srcCount = compressionEdges.filter(ee => ee.source === e.source || ee.target === e.source).length;
+    const tgtCount = compressionEdges.filter(ee => ee.source === e.target || ee.target === e.target).length;
+    maxCompDeg = Math.max(maxCompDeg, srcCount, tgtCount);
   }
 
   // Check 2: Tension network connectivity
@@ -147,7 +141,7 @@ export function validateTensegrity(diagram: DiagramData): TensegrityResult {
   });
 
   return {
-    isValid: issues.length === 0 && compressionEdges.length > 0 && tensionEdges.length > 0,
+    isValid: issues.length === 0 && compressionEdges.length >= 3 && tensionEdges.length > 0,
     compressionCount: compressionEdges.length,
     tensionCount: tensionEdges.length,
     issues,

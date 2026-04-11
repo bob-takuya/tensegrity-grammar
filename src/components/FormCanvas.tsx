@@ -594,19 +594,43 @@ export function FormCanvas() {
     }
 
     // Status indicator
-    if (equilibrium) {
-      const statusText =
-        equilibrium.status === 'determinate'
-          ? `Equilibrium ✓  (residual: ${equilibrium.residual.toExponential(1)})`
-          : equilibrium.status === 'unstable'
-          ? 'Unstable / Unbalanced ✗'
-          : equilibrium.status === 'indeterminate'
-          ? 'Statically Indeterminate'
-          : '';
-      ctx.font = '12px monospace';
-      ctx.fillStyle = equilibrium.status === 'determinate' ? '#2e7d32' : '#c62828';
-      ctx.textAlign = 'left';
-      ctx.fillText(statusText, 10, size.h - 10);
+    {
+      const hasPlates = diagram.edges.some(e => e.elementType === 'compression');
+      const hasCables = diagram.edges.some(e => e.elementType === 'tension');
+      const isSelfStressed = hasPlates && hasCables && (!equilibrium || equilibrium.status !== 'determinate');
+      let statusText: string;
+      let statusColor: string;
+
+      if (isSelfStressed) {
+        const plates = diagram.edges.filter(e => e.elementType === 'compression').length;
+        const cables = diagram.edges.filter(e => e.elementType === 'tension').length;
+        statusText = `Self-stressed tensegrity (${plates} plates, ${cables} cables)`;
+        statusColor = '#1565c0';
+      } else if (equilibrium) {
+        if (equilibrium.status === 'determinate') {
+          statusText = `Equilibrium ✓  (residual: ${equilibrium.residual.toExponential(1)})`;
+          statusColor = '#2e7d32';
+        } else if (equilibrium.status === 'unstable') {
+          statusText = 'Unstable / Unbalanced ✗';
+          statusColor = '#c62828';
+        } else if (equilibrium.status === 'indeterminate') {
+          statusText = 'Statically Indeterminate';
+          statusColor = '#e65100';
+        } else {
+          statusText = '';
+          statusColor = '#888';
+        }
+      } else {
+        statusText = '';
+        statusColor = '#888';
+      }
+
+      if (statusText) {
+        ctx.font = '12px monospace';
+        ctx.fillStyle = statusColor;
+        ctx.textAlign = 'left';
+        ctx.fillText(statusText, 10, size.h - 10);
+      }
     }
 
     // Mode indicator
