@@ -109,14 +109,10 @@ function formFindAll(d: DiagramData, solveZ: boolean = false): boolean {
   let fX = solveLinalg(D_ff, rhsX), fY = solveLinalg(D_ff, rhsY), fZ = solveLinalg(D_ff, rhsZ);
 
   if (!fX || !fY) {
-    // Singular → centroid constraint for x, y
-    const D_reg = D_ff.map(row => [...row]);
-    for (let j = 0; j < nF; j++) D_reg[nF - 1][j] = 1;
-    const cX = aX.reduce((s, v) => s + v, 0) / nA;
-    const cY = aY.reduce((s, v) => s + v, 0) / nA;
-    const rX = [...rhsX], rY = [...rhsY];
-    rX[nF - 1] = cX * nF; rY[nF - 1] = cY * nF;
-    fX = solveLinalg(D_reg, rX); fY = solveLinalg(D_reg, rY);
+    // D_ff singular — add Tikhonov regularization: (D_ff + εI) x = rhs
+    const eps = 0.001;
+    const D_reg = D_ff.map((row, i) => row.map((v, j) => v + (i === j ? eps : 0)));
+    fX = solveLinalg(D_reg, rhsX); fY = solveLinalg(D_reg, rhsY);
   }
 
   if (!fX || !fY) return false;
@@ -222,54 +218,124 @@ function createCell(d: DiagramData, baseNodeIds: string[]): CellTopology | null 
 }
 
 // ═════════════════════════════════════════════════════════════════
-// ADHESION: attach a single-strut cell via cables only
+// ADHESION: stack a full prism cell on a triangular face
 // ═════════════════════════════════════════════════════════════════
 
 /**
- * Growth cell: 1 new compression strut (2 new nodes), connected to
- * ≥3 existing nodes via cables only.
+ * Proper adhesion (Aloui 2019): attach a complete N-strut prism cell
+ * by sharing an existing triangular face (3 nodes + 3 cables).
  *
- * This preserves the tensegrity invariant: existing nodes only gain
- * cable connections (tension), never a second compression member.
+ * The shared face becomes the bottom ring of the new cell.
+ * The new cell adds:
+ *   - 3 new top nodes
+ *   - 3 new struts (shared[i] → newTop[i])
+ *   - 3 top ring cables (newTop[i] → newTop[i+1])
+ *   - 3 diagonal cables (shared[i] → newTop[i+1])
+ *   - 0 bottom ring cables (they already exist as the shared face)
  *
- * The new strut endpoints are positioned by formFindAll().
+ * Shared nodes get a second strut — this is expected for Class-k
+ * tensegrity (stacked prisms). The Maxwell count:
+ *   Δ(s-m) = 3*3 - 3 - 6 = 0  (sharing 3 nodes, 3 edges → neutral)
+ *
+ * After adhesion, formFindAll() repositions all free nodes.
  */
 function applyAdhesion(d: DiagramData): boolean {
+  // Find all triangular faces: triples of nodes connected by 3 cables
+  const cableAdj = new Map<string, Set<string>>();
+  for (const e of d.edges) {
+    if (e.elementType !== 'tension') continue;
+    if (!cableAdj.has(e.source)) cableAdj.set(e.source, new Set());
+    if (!cableAdj.has(e.target)) cableAdj.set(e.target, new Set());
+    cableAdj.get(e.source)!.add(e.target);
+    cableAdj.get(e.target)!.add(e.source);
+  }
+
+  // Find triangles among plate endpoints
   const pEnds = plateEndpoints(d);
-  if (pEnds.length < 3) return false;
+  const faces: string[][] = [];
 
-  // Pick 3 existing plate endpoints as attachment points
-  // Prefer nodes at higher z (growth goes upward) and spread apart
-  const peNodes = pEnds.map(id => d.nodes.find(n => n.id === id)!).filter(Boolean);
-  if (peNodes.length < 3) return false;
+  for (let i = 0; i < pEnds.length; i++) {
+    for (let j = i + 1; j < pEnds.length; j++) {
+      if (!cableAdj.get(pEnds[i])?.has(pEnds[j])) continue;
+      for (let k = j + 1; k < pEnds.length; k++) {
+        if (!cableAdj.get(pEnds[j])?.has(pEnds[k])) continue;
+        if (!cableAdj.get(pEnds[k])?.has(pEnds[i])) continue;
+        faces.push([pEnds[i], pEnds[j], pEnds[k]]);
+      }
+    }
+  }
 
-  // Shuffle and pick 3 that are reasonably spread
-  const shuffled = [...peNodes].sort(() => Math.random() - 0.5);
-  const attachIds = shuffled.slice(0, 3).map(n => n.id);
-  const attachNodes = attachIds.map(id => d.nodes.find(n => n.id === id)!);
+  if (faces.length === 0) {
+    // Fallback: use the 3 highest plate endpoints that are cable-connected to each other
+    // Even if not a perfect triangle, they form the attachment surface
+    const sorted = [...pEnds]
+      .map(id => d.nodes.find(n => n.id === id)!)
+      .filter(Boolean)
+      .sort((a, b) => b.z - a.z);
 
-  // Centroid of attachment points
-  const cx = attachNodes.reduce((s, n) => s + n.x, 0) / 3;
-  const cy = attachNodes.reduce((s, n) => s + n.y, 0) / 3;
-  const cz = attachNodes.reduce((s, n) => s + n.z, 0) / 3;
+    if (sorted.length >= 3) {
+      // Pick top 3 and ensure they have at least some cable connectivity
+      const top3 = sorted.slice(0, 3).map(n => n.id);
+      // Add missing cables between them to form the face
+      for (let i = 0; i < 3; i++) {
+        for (let j = i + 1; j < 3; j++) {
+          if (!hasEdge(d.edges, top3[i], top3[j])) {
+            d.edges.push(makeEdge(top3[i], top3[j], 'tension'));
+          }
+        }
+      }
+      faces.push(top3);
+    }
+  }
 
-  // Create 2 new nodes (strut endpoints) with temporary positions
-  // Place them above the attachment centroid
-  const p1 = makeNode(cx + rand(-0.5, 0.5), cy + rand(-0.5, 0.5), cz + rand(0.8, 1.5));
-  const p2 = makeNode(cx + rand(-0.5, 0.5), cy + rand(-0.5, 0.5), cz + rand(0.8, 1.5));
+  if (faces.length === 0) return false;
 
-  d.nodes.push(p1, p2);
+  // Prefer faces at higher z (growth goes upward)
+  faces.sort((a, b) => {
+    const za = a.reduce((s, id) => s + (d.nodes.find(n => n.id === id)?.z || 0), 0);
+    const zb = b.reduce((s, id) => s + (d.nodes.find(n => n.id === id)?.z || 0), 0);
+    return zb - za;
+  });
 
-  // New strut
-  d.edges.push(makeEdge(p1.id, p2.id, 'compression'));
+  // Pick one of the top faces (with some randomness)
+  const topK = Math.min(3, faces.length);
+  const face = faces[Math.floor(Math.random() * topK)];
+  const baseNodes = face.map(id => d.nodes.find(n => n.id === id)!);
 
-  // Cables from P1 to 2 attachment nodes, P2 to the other 1 + 1 shared
-  if (!hasEdge(d.edges, p1.id, attachIds[0])) d.edges.push(makeEdge(p1.id, attachIds[0], 'tension'));
-  if (!hasEdge(d.edges, p1.id, attachIds[1])) d.edges.push(makeEdge(p1.id, attachIds[1], 'tension'));
-  if (!hasEdge(d.edges, p2.id, attachIds[1])) d.edges.push(makeEdge(p2.id, attachIds[1], 'tension'));
-  if (!hasEdge(d.edges, p2.id, attachIds[2])) d.edges.push(makeEdge(p2.id, attachIds[2], 'tension'));
+  // Centroid and height of the face
+  const cx = baseNodes.reduce((s, n) => s + n.x, 0) / 3;
+  const cy = baseNodes.reduce((s, n) => s + n.y, 0) / 3;
+  const cz = baseNodes.reduce((s, n) => s + n.z, 0) / 3;
 
-  // Form-find
+  // Create 3 new top nodes (temporary positions — formFindAll will fix x,y)
+  const newHeight = cz + 1.0 + rand(0, 1.0);
+  const topNodes: DiagramNode[] = [];
+  for (let i = 0; i < 3; i++) {
+    const n = makeNode(cx + rand(-0.5, 0.5), cy + rand(-0.5, 0.5), newHeight + rand(-0.2, 0.2));
+    topNodes.push(n);
+    d.nodes.push(n);
+  }
+
+  // Struts: base[i] → top[i]
+  for (let i = 0; i < 3; i++) {
+    d.edges.push(makeEdge(face[i], topNodes[i].id, 'compression'));
+  }
+
+  // Top ring cables: top[i] → top[i+1]
+  for (let i = 0; i < 3; i++) {
+    d.edges.push(makeEdge(topNodes[i].id, topNodes[(i + 1) % 3].id, 'tension'));
+  }
+
+  // Diagonal cables: base[i] → top[i+1]
+  for (let i = 0; i < 3; i++) {
+    if (!hasEdge(d.edges, face[i], topNodes[(i + 1) % 3].id)) {
+      d.edges.push(makeEdge(face[i], topNodes[(i + 1) % 3].id, 'tension'));
+    }
+  }
+
+  // Note: bottom ring cables already exist (they ARE the shared face)
+  // No need to add them → this is proper adhesion
+
   return formFindAll(d);
 }
 
@@ -343,8 +409,22 @@ function isTensionConnected(nodes: DiagramNode[], edges: DiagramEdge[]): boolean
 // TENSEGRITY VALIDATION
 // ═════════════════════════════════════════════════════════════════
 
+/**
+ * Tensegrity validity — for stacked prisms (Class-k), shared nodes
+ * have k struts. The essential check is that the tension network
+ * is connected and all plate endpoints have at least 2 cables.
+ */
 function isTensegrityValid(d: DiagramData): boolean {
-  for (const n of d.nodes) if (compressionDegree(d.edges, n.id) > 1) return false;
+  // Check tension network connectivity
+  if (!isTensionConnected(d.nodes, d.edges)) return false;
+
+  // Every plate endpoint should have at least 2 cable connections
+  const pEnds = new Set(plateEndpoints(d));
+  for (const pe of pEnds) {
+    const cableDeg = d.edges.filter(e => e.elementType === 'tension' && (e.source === pe || e.target === pe)).length;
+    if (cableDeg < 2) return false;
+  }
+
   return true;
 }
 

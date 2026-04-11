@@ -5,9 +5,9 @@ import { findNullspaceBasis } from './src/engine/linalg';
 const empty: DiagramData = { nodes: [], edges: [] };
 const fg: ForceGrammarState = { active: true, interimForces: [], selectedForceId: null, feasibilityDomain: null, isComplete: false };
 
-function checkSelfStress(d: DiagramData): { valid: boolean; detail: string } {
+function checkSS(d: DiagramData): boolean {
   const m = d.edges.length, n = d.nodes.length;
-  if (m === 0) return { valid: false, detail: 'empty' };
+  if (m === 0) return false;
   const nodeIdx = new Map(d.nodes.map((nd, i) => [nd.id, i]));
   const A: number[][] = Array.from({ length: 3 * n }, () => new Array(m).fill(0));
   for (let e = 0; e < m; e++) {
@@ -21,55 +21,42 @@ function checkSelfStress(d: DiagramData): { valid: boolean; detail: string } {
     A[3*iT][e]=-dx/len; A[3*iT+1][e]=-dy/len; A[3*iT+2][e]=-dz/len;
   }
   const basis = findNullspaceBasis(A);
-  if (basis.length === 0) return { valid: false, detail: 'no self-stress (nullspace=0)' };
+  if (basis.length === 0) return false;
   for (const raw of basis) {
     for (const sign of [1, -1]) {
       const v = raw.map(x => x * sign);
-      const ok = d.edges.every((e, i) => (e.elementType === 'compression' ? v[i] <= 0.001 : v[i] >= -0.001));
-      if (ok) return { valid: true, detail: `nullspace=${basis.length}` };
+      if (d.edges.every((e, i) => (e.elementType === 'compression' ? v[i] <= 0.001 : v[i] >= -0.001))) return true;
     }
   }
-  return { valid: false, detail: `nullspace=${basis.length} (wrong signs)` };
+  return false;
 }
 
-function checkTensegrityTopo(d: DiagramData): boolean {
-  return d.nodes.every(n =>
-    d.edges.filter(e => e.elementType === 'compression' && (e.source === n.id || e.target === n.id)).length <= 1
-  );
-}
+console.log('=== Cellular Morphogenesis: Full Prism Stacking ===\n');
 
-console.log('=== Cellular Morphogenesis Test ===\n');
-
-for (const steps of [1, 2, 3, 5, 8]) {
-  let valid = 0, topo = 0, total = 20;
-  let plates = 0, cables = 0, nodes = 0;
-  for (let trial = 0; trial < total; trial++) {
+for (const steps of [1, 2, 3, 5, 8, 10]) {
+  let valid = 0, total = 10;
+  let avgN = 0, avgP = 0, avgC = 0;
+  for (let t = 0; t < total; t++) {
     const r = autoExploreForceGrammar(empty, fg, steps, 3);
     const d = r.diagram;
-    if (checkTensegrityTopo(d)) topo++;
-    if (checkSelfStress(d).valid) valid++;
-    plates += d.edges.filter(e => e.elementType === 'compression').length;
-    cables += d.edges.filter(e => e.elementType === 'tension').length;
-    nodes += d.nodes.length;
+    if (checkSS(d)) valid++;
+    avgN += d.nodes.length;
+    avgP += d.edges.filter(e => e.elementType === 'compression').length;
+    avgC += d.edges.filter(e => e.elementType === 'tension').length;
   }
-  console.log(`steps=${steps.toString().padStart(2)}: topo=${topo}/${total} stress=${valid}/${total} avg=(${(nodes/total).toFixed(0)}n ${(plates/total).toFixed(0)}p ${(cables/total).toFixed(0)}c)`);
+  console.log(`steps=${steps.toString().padStart(2)}: stress=${valid}/${total} avg=(${(avgN/total).toFixed(0)}n ${(avgP/total).toFixed(0)}p ${(avgC/total).toFixed(0)}c)`);
 }
 
-// Detailed run
-console.log('\n=== Detailed (steps=3) ===');
+// Show a detailed 3-step run
+console.log('\n=== Detailed (3 steps) ===');
 const r = autoExploreForceGrammar(empty, fg, 3, 3);
 const d = r.diagram;
-const p = d.edges.filter(e => e.elementType === 'compression');
-const c = d.edges.filter(e => e.elementType === 'tension');
-console.log(`Nodes: ${d.nodes.length}, Plates: ${p.length}, Cables: ${c.length}`);
-console.log(`Topo valid: ${checkTensegrityTopo(d)}`);
-const ss = checkSelfStress(d);
-console.log(`Self-stress: ${ss.valid} (${ss.detail})`);
-
-// Print structure
-for (const e of d.edges) {
-  const s = d.nodes.find(n => n.id === e.source)!;
-  const t = d.nodes.find(n => n.id === e.target)!;
-  const label = e.elementType === 'compression' ? 'PLATE' : 'cable';
-  console.log(`  ${label}: (${s.x.toFixed(1)},${s.y.toFixed(1)},${s.z.toFixed(1)}) → (${t.x.toFixed(1)},${t.y.toFixed(1)},${t.z.toFixed(1)})`);
+console.log(`Nodes: ${d.nodes.length}, Plates: ${d.edges.filter(e=>e.elementType==='compression').length}, Cables: ${d.edges.filter(e=>e.elementType==='tension').length}`);
+console.log(`Self-stress: ${checkSS(d)}`);
+console.log('\nNodes by z:');
+const byZ = [...d.nodes].sort((a, b) => a.z - b.z);
+for (const n of byZ) {
+  const cd = d.edges.filter(e => e.elementType === 'compression' && (e.source === n.id || e.target === n.id)).length;
+  const td = d.edges.filter(e => e.elementType === 'tension' && (e.source === n.id || e.target === n.id)).length;
+  console.log(`  z=${n.z.toFixed(2)} comp=${cd} cable=${td}`);
 }
