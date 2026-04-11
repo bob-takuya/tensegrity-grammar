@@ -124,98 +124,56 @@ export function GrammarPanel() {
         </div>
       </div>
 
-      {/* ─── Force-Based Grammar (Mirtsopoulos & Fivet) ────────── */}
+      {/* ─── L-System Tensegrity Grammar ────────────────────────── */}
       <div className="force-grammar-section">
-        <h4>Force-Based Grammar</h4>
+        <h4>L-System Tensegrity</h4>
         <p className="hint-text">
-          Build structures where equilibrium is guaranteed by construction.
-          Interim forces are routed through members to supports.
+          Grow tensegrity structures organically. Each step adds one
+          compression plate (面材) with minimal cables, always preserving
+          the tensegrity invariant.
         </p>
-        {!state.forceGrammar.active ? (
-          <button
-            className="explore-btn force-grammar-start"
-            onClick={() => dispatch({ type: 'START_FORCE_GRAMMAR' })}
-          >
-            Start Force Grammar
-          </button>
-        ) : (
-          <>
-            <div className="fg-controls">
-              <button
-                className="explore-btn"
-                onClick={() => dispatch({ type: 'STOP_FORCE_GRAMMAR' })}
-              >
-                Stop
-              </button>
-            </div>
-
-            {/* Force-based auto-explore */}
-            {!state.forceGrammar.isComplete && (
-              <div className="fg-auto-explore">
-                <div className="explore-row">
-                  <input
-                    type="number"
-                    className="step-input"
-                    min={1}
-                    max={50}
-                    value={fgSteps}
-                    onChange={(e) => setFgSteps(Math.max(1, Math.min(50, parseInt(e.target.value) || 1)))}
-                  />
-                  <span className="step-label">steps</span>
-                  <button
-                    className="explore-btn explore-go"
-                    onClick={() => dispatch({ type: 'FORCE_GRAMMAR_AUTO_EXPLORE', steps: fgSteps })}
-                  >
-                    Auto Resolve
-                  </button>
-                </div>
-              </div>
-            )}
-
-            {state.forceGrammar.isComplete ? (
-              <div className="fg-complete">
-                Structure complete — all forces resolved.
-              </div>
-            ) : (
-              <div className="fg-forces">
-                <div className="fg-instructions">
-                  1. Select an interim force below<br/>
-                  2. Click on the canvas to place a new node<br/>
-                  &nbsp;&nbsp;&nbsp;(on the line of action = optimal)<br/>
-                  3. Or click an existing node to connect
-                </div>
-                {state.forceGrammar.interimForces.map((f) => {
-                  const fMag = Math.sqrt(f.fx * f.fx + f.fy * f.fy);
-                  const isSelected = state.forceGrammar.selectedForceId === f.id;
-                  const node = state.diagram.nodes.find((n) => n.id === f.nodeId);
-                  return (
-                    <div
-                      key={f.id}
-                      className={`fg-force-item ${isSelected ? 'selected' : ''}`}
-                      onClick={() =>
-                        dispatch({
-                          type: 'SELECT_INTERIM_FORCE',
-                          forceId: isSelected ? null : f.id,
-                        })
-                      }
-                    >
-                      <span className="fg-force-node">
-                        ({node?.x.toFixed(1)}, {node?.y.toFixed(1)})
-                      </span>
-                      <span className="fg-force-vec">
-                        ({f.fx.toFixed(2)}, {f.fy.toFixed(2)})
-                      </span>
-                      <span className="fg-force-mag">{fMag.toFixed(2)}</span>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-          </>
-        )}
-        <div className="fg-ref">
-          Ref: Mirtsopoulos &amp; Fivet (archiDOCT 2020)
+        <div className="fg-rules-info">
+          <div className="fg-rule"><b>SEED</b> — first plate suspended from supports</div>
+          <div className="fg-rule"><b>SPROUT</b> — insert plate along an existing cable</div>
+          <div className="fg-rule"><b>BRANCH</b> — attach plate branching from a node</div>
         </div>
+
+        <div className="fg-auto-explore">
+          <div className="explore-row">
+            <input
+              type="number"
+              className="step-input"
+              min={1}
+              max={20}
+              value={fgSteps}
+              onChange={(e) => setFgSteps(Math.max(1, Math.min(20, parseInt(e.target.value) || 1)))}
+            />
+            <span className="step-label">plates</span>
+            <button
+              className="explore-btn explore-go"
+              onClick={() => dispatch({ type: 'FORCE_GRAMMAR_AUTO_EXPLORE', steps: fgSteps })}
+            >
+              Grow
+            </button>
+          </div>
+        </div>
+
+        {(() => {
+          const plates = state.diagram.edges.filter(e => e.elementType === 'compression').length;
+          const cables = state.diagram.edges.filter(e => e.elementType === 'tension').length;
+          const valid = state.diagram.edges.length > 0 && state.diagram.nodes.every(n =>
+            state.diagram.edges.filter(e =>
+              e.elementType === 'compression' && (e.source === n.id || e.target === n.id)
+            ).length <= 1
+          );
+          if (plates === 0 && cables === 0) return null;
+          return (
+            <div className={`tensegrity-status ${valid ? 'valid' : 'invalid'}`} style={{ marginTop: 8 }}>
+              <span className="status-icon">{valid ? '✓' : '✗'}</span>
+              <span>{plates} plates, {cables} cables{valid ? ' — valid tensegrity' : ' — invalid'}</span>
+            </div>
+          );
+        })()}
       </div>
     </div>
   );

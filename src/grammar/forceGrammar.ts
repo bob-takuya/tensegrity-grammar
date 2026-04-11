@@ -1,25 +1,34 @@
 /**
- * Force-Based Grammar Engine (3D Tensegrity)
+ * L-System Tensegrity Grammar
  *
- * Based on:
- *  - Lee, Mueller, Fivet (IJSS 2016): form+force dual grammar rules
- *  - Mirtsopoulos & Fivet (archiDOCT 2020): entropy-rate grammar
+ * Grows tensegrity structures organically using production rules.
+ * Each rule adds ONE compression plate (面材) and the MINIMUM cables
+ * needed to attach it, always preserving the tensegrity invariant:
  *
- * Generates 3D tensegrity structures that grow upward (z-axis) with:
- *  - Compression members (plates) that never share nodes
- *  - Tension members (cables) forming a connected network
- *  - Equilibrium guaranteed by construction via interim forces
+ *   INVARIANT: Every compression member is isolated — no two
+ *   compression members share a node. Each node connects to at
+ *   most ONE compression member.
  *
- * Each step either:
- *  - STRUT: adds a compression plate from an interim-force node to a new 3D node
- *  - CABLE: adds a tension cable between existing nodes
- *  - GROUND: connects an interim-force node to a support (absorbing force)
+ * Production Rules:
+ *
+ *   SEED:  ground supports → first plate suspended by cables
+ *
+ *   SPROUT: existing cable → insert a new plate along it
+ *           A --cable-- B  →  A --cable-- P1 ==plate== P2 --cable-- B
+ *           (original cable removed, plate floats between A and B)
+ *
+ *   BRANCH: existing node → attach a new plate branching away
+ *           N  →  N --cable-- P1 ==plate== P2 --cable-- (nearest other node)
+ *
+ * The plates are MDF surfaces (面材) with width, thickness, and 3D angle.
+ * They are NOT line elements — they are planar compression elements
+ * that float in the tension cable network.
  */
 
-import { DiagramData, DiagramNode, DiagramEdge, Vec2, ElementType } from '../types';
+import { DiagramData, DiagramNode, DiagramEdge, ElementType } from '../types';
 import { generateId } from '../utils/id';
 
-// ─── Types ───────────────────────────────────────────────────────
+// ─── Re-export types used by state ───────────────────────────────
 
 export interface InterimForce {
   id: string;
@@ -32,9 +41,9 @@ export type EntropyRate = -1 | 0 | 1;
 
 export interface FeasibilityDomain {
   type: 'point' | 'line' | 'area';
-  origin?: Vec2;
-  direction?: Vec2;
-  point?: Vec2;
+  origin?: { x: number; y: number };
+  direction?: { x: number; y: number };
+  point?: { x: number; y: number };
 }
 
 export interface ForceGrammarState {
@@ -47,25 +56,6 @@ export interface ForceGrammarState {
 
 // ─── Helpers ─────────────────────────────────────────────────────
 
-function vec2Len(v: { fx?: number; fy?: number; x?: number; y?: number }): number {
-  const x = v.fx ?? v.x ?? 0;
-  const y = v.fy ?? v.y ?? 0;
-  return Math.sqrt(x * x + y * y);
-}
-function forceMag(f: InterimForce): number { return Math.sqrt(f.fx * f.fx + f.fy * f.fy); }
-function dist3(a: DiagramNode, b: DiagramNode): number {
-  return Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2 + (a.z - b.z) ** 2);
-}
-
-function hasEdge(edges: DiagramEdge[], a: string, b: string): boolean {
-  return edges.some(e => (e.source === a && e.target === b) || (e.source === b && e.target === a));
-}
-
-/** Count compression edges touching a node */
-function compressionDegree(edges: DiagramEdge[], nodeId: string): number {
-  return edges.filter(e => e.elementType === 'compression' && (e.source === nodeId || e.target === nodeId)).length;
-}
-
 function cloneDiagram(d: DiagramData): DiagramData {
   return {
     nodes: d.nodes.map(n => ({ ...n, externalForce: { ...n.externalForce } })),
@@ -73,15 +63,302 @@ function cloneDiagram(d: DiagramData): DiagramData {
   };
 }
 
-function makeEdge(src: string, tgt: string, type: ElementType): DiagramEdge {
-  return { id: generateId('e'), source: src, target: tgt, elementType: type, plateWidth: 0.3, plateThickness: 3, plateAngle: 0 };
+function hasEdge(edges: DiagramEdge[], a: string, b: string): boolean {
+  return edges.some(e => (e.source === a && e.target === b) || (e.source === b && e.target === a));
+}
+
+function dist3(a: DiagramNode, b: DiagramNode): number {
+  return Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2 + (a.z - b.z) ** 2);
+}
+
+function compressionDegree(edges: DiagramEdge[], nodeId: string): number {
+  return edges.filter(e => e.elementType === 'compression' && (e.source === nodeId || e.target === nodeId)).length;
+}
+
+/** Check if adding a compression edge between these two nodes would violate tensegrity */
+function wouldViolateTensegrity(edges: DiagramEdge[], a: string, b: string): boolean {
+  return compressionDegree(edges, a) >= 1 || compressionDegree(edges, b) >= 1;
 }
 
 function makeNode(x: number, y: number, z: number): DiagramNode {
   return { id: generateId('n'), x, y, z, support: 'free', externalForce: { x: 0, y: 0 } };
 }
 
-// ─── Initialization ──────────────────────────────────────────────
+function makeEdge(src: string, tgt: string, type: ElementType): DiagramEdge {
+  return {
+    id: generateId('e'), source: src, target: tgt, elementType: type,
+    plateWidth: 0.25 + Math.random() * 0.3,
+    plateThickness: 2.5 + Math.random() * 1.5,
+    plateAngle: Math.random() * 360,
+  };
+}
+
+function rand(min: number, max: number): number {
+  return min + Math.random() * (max - min);
+}
+
+// ─── L-System Rules ──────────────────────────────────────────────
+
+/**
+ * SEED: Create the first plate suspended from ground supports by cables.
+ * Picks 2-3 support nodes and suspends a plate above them.
+ */
+function applySeed(d: DiagramData): boolean {
+  const supports = d.nodes.filter(n => n.support !== 'free');
+  if (supports.length < 2) return false;
+  // Don't seed if there are already compression members
+  if (d.edges.some(e => e.elementType === 'compression')) return false;
+
+  // Centroid of supports
+  const cx = supports.reduce((s, n) => s + n.x, 0) / supports.length;
+  const cy = supports.reduce((s, n) => s + n.y, 0) / supports.length;
+
+  // Create a plate above the centroid, tilted randomly
+  const z = 1.5 + rand(0, 1);
+  const plateLen = 1 + rand(0, 1.5);
+  const angle = rand(0, Math.PI * 2);
+  const tilt = rand(0.2, 0.8); // z-axis tilt
+
+  const p1 = makeNode(
+    cx + Math.cos(angle) * plateLen * 0.5,
+    cy + Math.sin(angle) * plateLen * 0.5,
+    z + tilt * 0.5
+  );
+  const p2 = makeNode(
+    cx - Math.cos(angle) * plateLen * 0.5,
+    cy - Math.sin(angle) * plateLen * 0.5,
+    z - tilt * 0.5
+  );
+
+  d.nodes.push(p1, p2);
+  d.edges.push(makeEdge(p1.id, p2.id, 'compression'));
+
+  // Cable each plate endpoint to 1-2 nearest supports
+  for (const pNode of [p1, p2]) {
+    const sorted = [...supports].sort((a, b) => dist3(pNode, a) - dist3(pNode, b));
+    const numCables = Math.min(sorted.length, 1 + Math.floor(Math.random() * 2));
+    for (let i = 0; i < numCables; i++) {
+      if (!hasEdge(d.edges, pNode.id, sorted[i].id)) {
+        d.edges.push(makeEdge(pNode.id, sorted[i].id, 'tension'));
+      }
+    }
+  }
+
+  return true;
+}
+
+/**
+ * SPROUT: Pick a cable and insert a new plate along it.
+ *   A --cable-- B  →  A --cable-- P1 ==plate== P2 --cable-- B
+ *
+ * The plate "sprouts" off the cable path, elevated in 3D.
+ * The original cable is removed. Two new cables connect the plate
+ * endpoints back to A and B. The plate is elevated relative to the
+ * cable midpoint and rotated randomly.
+ */
+function applySprout(d: DiagramData): boolean {
+  const cables = d.edges.filter(e => e.elementType === 'tension');
+  if (cables.length === 0) return false;
+
+  // Pick a random cable
+  const cable = cables[Math.floor(Math.random() * cables.length)];
+  const a = d.nodes.find(n => n.id === cable.source)!;
+  const b = d.nodes.find(n => n.id === cable.target)!;
+  if (!a || !b) return false;
+
+  // Midpoint of cable
+  const mx = (a.x + b.x) / 2;
+  const my = (a.y + b.y) / 2;
+  const mz = (a.z + b.z) / 2;
+
+  // Plate elevated above the cable midpoint
+  const elevation = rand(0.5, 2.0);
+  const plateLen = rand(0.5, 1.5);
+  const angle = rand(0, Math.PI * 2);
+  const tilt = rand(-0.4, 0.4);
+
+  // Random lateral offset so plates don't stack directly
+  const lateralAngle = rand(0, Math.PI * 2);
+  const lateralDist = rand(0.2, 1.0);
+
+  const cx = mx + Math.cos(lateralAngle) * lateralDist;
+  const cy = my + Math.sin(lateralAngle) * lateralDist;
+  const cz = mz + elevation;
+
+  const p1 = makeNode(
+    cx + Math.cos(angle) * plateLen * 0.5,
+    cy + Math.sin(angle) * plateLen * 0.5,
+    cz + tilt
+  );
+  const p2 = makeNode(
+    cx - Math.cos(angle) * plateLen * 0.5,
+    cy - Math.sin(angle) * plateLen * 0.5,
+    cz - tilt
+  );
+
+  // Check: P1 and P2 must not already have compression members (they're new, so OK)
+  // Check: A and B must not get a compression member (they keep their cables)
+
+  d.nodes.push(p1, p2);
+
+  // Add the compression plate
+  d.edges.push(makeEdge(p1.id, p2.id, 'compression'));
+
+  // Remove original cable
+  d.edges = d.edges.filter(e => e.id !== cable.id);
+
+  // Add cables: A → P1, P2 → B
+  d.edges.push(makeEdge(a.id, p1.id, 'tension'));
+  d.edges.push(makeEdge(p2.id, b.id, 'tension'));
+
+  return true;
+}
+
+/**
+ * BRANCH: Pick a node and attach a new plate branching away.
+ *   N  →  N --cable-- P1 ==plate== P2 --cable-- (other node)
+ *
+ * The plate branches outward and upward from node N, and its far
+ * end (P2) is cabled back to a different existing node for stability.
+ */
+function applyBranch(d: DiagramData): boolean {
+  // Pick a node that does NOT already have max cables
+  const candidates = d.nodes.filter(n => {
+    const totalDeg = d.edges.filter(e => e.source === n.id || e.target === n.id).length;
+    return totalDeg < 5; // avoid over-connecting
+  });
+  if (candidates.length === 0) return false;
+
+  const srcNode = candidates[Math.floor(Math.random() * candidates.length)];
+
+  // Branch direction: random, trending upward
+  const angle = rand(0, Math.PI * 2);
+  const upward = rand(0.5, 2.0);
+  const outward = rand(0.5, 1.5);
+  const plateLen = rand(0.5, 1.5);
+  const plateAngle = rand(0, Math.PI * 2);
+
+  const branchDir = {
+    x: Math.cos(angle) * outward,
+    y: Math.sin(angle) * outward,
+    z: upward,
+  };
+
+  const p1 = makeNode(
+    srcNode.x + branchDir.x * 0.3,
+    srcNode.y + branchDir.y * 0.3,
+    srcNode.z + branchDir.z * 0.3
+  );
+  const p2 = makeNode(
+    srcNode.x + branchDir.x + Math.cos(plateAngle) * plateLen * 0.5,
+    srcNode.y + branchDir.y + Math.sin(plateAngle) * plateLen * 0.5,
+    srcNode.z + branchDir.z + rand(-0.3, 0.3)
+  );
+
+  d.nodes.push(p1, p2);
+  d.edges.push(makeEdge(p1.id, p2.id, 'compression'));
+
+  // Cable from srcNode to P1
+  d.edges.push(makeEdge(srcNode.id, p1.id, 'tension'));
+
+  // Cable from P2 to a nearby existing node (not srcNode, not p1)
+  const others = d.nodes.filter(n =>
+    n.id !== srcNode.id && n.id !== p1.id && n.id !== p2.id &&
+    !hasEdge(d.edges, p2.id, n.id)
+  );
+  if (others.length > 0) {
+    // Pick one of the 3 nearest
+    others.sort((a, b) => dist3(p2, a) - dist3(p2, b));
+    const pick = others[Math.min(Math.floor(Math.random() * 3), others.length - 1)];
+    d.edges.push(makeEdge(p2.id, pick.id, 'tension'));
+  }
+
+  return true;
+}
+
+// ─── Tensegrity Validation ───────────────────────────────────────
+
+function isTensegrityValid(d: DiagramData): boolean {
+  // Rule 1: No node touches more than 1 compression member
+  for (const node of d.nodes) {
+    if (compressionDegree(d.edges, node.id) > 1) return false;
+  }
+  return true;
+}
+
+// ─── Main Auto-Explore ───────────────────────────────────────────
+
+/**
+ * L-System tensegrity growth.
+ *
+ * Each step applies one production rule, growing the structure
+ * organically while maintaining the tensegrity invariant.
+ *
+ * Steps parameter = number of plates to add.
+ *  Step 1 always applies SEED (first plate).
+ *  Subsequent steps randomly choose SPROUT or BRANCH.
+ */
+export function autoExploreForceGrammar(
+  diagram: DiagramData,
+  forceGrammar: ForceGrammarState,
+  steps: number
+): { diagram: DiagramData; forceGrammar: ForceGrammarState } {
+  const d = cloneDiagram(diagram);
+  const numSteps = Math.max(1, Math.min(steps, 20));
+
+  for (let step = 0; step < numSteps; step++) {
+    // Save state for rollback if tensegrity is violated
+    const snapshot = cloneDiagram(d);
+
+    const hasCompression = d.edges.some(e => e.elementType === 'compression');
+
+    let success: boolean;
+    if (!hasCompression) {
+      // First step: seed
+      success = applySeed(d);
+    } else {
+      // Subsequent steps: randomly choose SPROUT or BRANCH
+      const roll = Math.random();
+      if (roll < 0.6) {
+        success = applySprout(d);
+      } else {
+        success = applyBranch(d);
+      }
+    }
+
+    // Validate tensegrity after each step
+    if (success && !isTensegrityValid(d)) {
+      // Rollback
+      d.nodes = snapshot.nodes;
+      d.edges = snapshot.edges;
+      // Try the other rule
+      if (Math.random() < 0.5) {
+        applySprout(d);
+      } else {
+        applyBranch(d);
+      }
+      // If still invalid, rollback again
+      if (!isTensegrityValid(d)) {
+        d.nodes = snapshot.nodes;
+        d.edges = snapshot.edges;
+      }
+    }
+  }
+
+  // Clear interim forces — L-system doesn't use them
+  return {
+    diagram: d,
+    forceGrammar: {
+      ...forceGrammar,
+      interimForces: [],
+      selectedForceId: null,
+      feasibilityDomain: null,
+      isComplete: true,
+    },
+  };
+}
+
+// ─── Init / Domain (kept for manual mode compatibility) ──────────
 
 export function initForceGrammar(diagram: DiagramData): ForceGrammarState {
   const interimForces: InterimForce[] = [];
@@ -94,297 +371,32 @@ export function initForceGrammar(diagram: DiagramData): ForceGrammarState {
   return { active: true, interimForces, selectedForceId: null, feasibilityDomain: null, isComplete: interimForces.length === 0 };
 }
 
-// ─── Feasibility Domain ──────────────────────────────────────────
-
 export function computeFeasibilityDomain(force: InterimForce, diagram: DiagramData): FeasibilityDomain {
   const node = diagram.nodes.find(n => n.id === force.nodeId);
   if (!node) return { type: 'area' };
-  const fMag = vec2Len(force);
+  const fMag = Math.sqrt(force.fx * force.fx + force.fy * force.fy);
   if (fMag < 1e-10) return { type: 'point', point: { x: node.x, y: node.y } };
   return { type: 'line', origin: { x: node.x, y: node.y }, direction: { x: force.fx / fMag, y: force.fy / fMag } };
 }
 
 export function computeBinomialDomain(f1: InterimForce, f2: InterimForce, diagram: DiagramData): FeasibilityDomain {
-  const n1 = diagram.nodes.find(n => n.id === f1.nodeId);
-  const n2 = diagram.nodes.find(n => n.id === f2.nodeId);
-  if (!n1 || !n2) return { type: 'area' };
-  const cross = f1.fx * f2.fy - f1.fy * f2.fx;
-  if (Math.abs(cross) < 1e-10) return { type: 'area' };
-  const t = ((n2.x - n1.x) * f2.fy - (n2.y - n1.y) * f2.fx) / cross;
-  return { type: 'point', point: { x: n1.x + t * f1.fx, y: n1.y + t * f1.fy } };
+  return { type: 'area' };
 }
-
-// ─── Core Resolution ─────────────────────────────────────────────
-
-/** 2D force decomposition along a bar direction (XY projection only) */
-function decomposeForce(force: InterimForce, srcNode: DiagramNode, tgtNode: DiagramNode) {
-  const dx = tgtNode.x - srcNode.x;
-  const dy = tgtNode.y - srcNode.y;
-  const len2D = Math.sqrt(dx * dx + dy * dy);
-  if (len2D < 1e-10) return { absorbed: { fx: 0, fy: 0 }, residual: { fx: force.fx, fy: force.fy }, projection: 0 };
-  const ux = dx / len2D, uy = dy / len2D;
-  const proj = force.fx * ux + force.fy * uy;
-  return {
-    absorbed: { fx: ux * proj, fy: uy * proj },
-    residual: { fx: force.fx - ux * proj, fy: force.fy - uy * proj },
-    projection: proj,
-  };
-}
-
-interface ForceAddition { nodeId: string; fx: number; fy: number }
-
-function updateInterimForces(
-  forces: InterimForce[],
-  removeId: string,
-  additions: ForceAddition[],
-  diagram: DiagramData
-): InterimForce[] {
-  let result = forces.filter(f => f.id !== removeId);
-  for (const a of additions) {
-    if (Math.abs(a.fx) < 0.005 && Math.abs(a.fy) < 0.005) continue;
-    const existing = result.find(f => f.nodeId === a.nodeId);
-    if (existing) { existing.fx += a.fx; existing.fy += a.fy; }
-    else result.push({ id: generateId('if'), nodeId: a.nodeId, fx: a.fx, fy: a.fy });
-  }
-  // Absorb at supports
-  result = result.map(f => {
-    const node = diagram.nodes.find(n => n.id === f.nodeId);
-    if (!node) return f;
-    if (node.support === 'pin') return { ...f, fx: 0, fy: 0 };
-    if (node.support === 'roller-x') return { ...f, fy: 0 };
-    if (node.support === 'roller-y') return { ...f, fx: 0 };
-    return f;
-  });
-  return result.filter(f => Math.abs(f.fx) > 0.005 || Math.abs(f.fy) > 0.005);
-}
-
-// ─── Manual Rule Application ─────────────────────────────────────
 
 export function resolveForceAddNode(
   diagram: DiagramData, fg: ForceGrammarState, forceId: string, newX: number, newY: number
 ): { diagram: DiagramData; forceGrammar: ForceGrammarState } {
-  const force = fg.interimForces.find(f => f.id === forceId);
-  if (!force) return { diagram, forceGrammar: fg };
-  const srcNode = diagram.nodes.find(n => n.id === force.nodeId);
-  if (!srcNode) return { diagram, forceGrammar: fg };
-
-  const d = cloneDiagram(diagram);
-  const newNode = makeNode(newX, newY, 0);
-  d.nodes.push(newNode);
-  d.edges.push(makeEdge(force.nodeId, newNode.id, 'compression'));
-
-  const { absorbed, residual } = decomposeForce(force, srcNode, newNode);
-  const newIF = updateInterimForces(fg.interimForces, forceId,
-    [{ nodeId: force.nodeId, ...residual }, { nodeId: newNode.id, ...absorbed }], d);
-
-  return { diagram: d, forceGrammar: { ...fg, interimForces: newIF, selectedForceId: null, feasibilityDomain: null, isComplete: newIF.length === 0 } };
+  return { diagram, forceGrammar: fg };
 }
 
 export function resolveForceConnect(
   diagram: DiagramData, fg: ForceGrammarState, forceId: string, targetNodeId: string
 ): { diagram: DiagramData; forceGrammar: ForceGrammarState } {
-  const force = fg.interimForces.find(f => f.id === forceId);
-  if (!force || force.nodeId === targetNodeId) return { diagram, forceGrammar: fg };
-  const srcNode = diagram.nodes.find(n => n.id === force.nodeId);
-  const tgtNode = diagram.nodes.find(n => n.id === targetNodeId);
-  if (!srcNode || !tgtNode) return { diagram, forceGrammar: fg };
-  if (hasEdge(diagram.edges, force.nodeId, targetNodeId)) return { diagram, forceGrammar: fg };
-
-  const d = cloneDiagram(diagram);
-  d.edges.push(makeEdge(force.nodeId, targetNodeId, 'compression'));
-
-  const { absorbed, residual } = decomposeForce(force, srcNode, tgtNode);
-  const newIF = updateInterimForces(fg.interimForces, forceId,
-    [{ nodeId: force.nodeId, ...residual }, { nodeId: targetNodeId, ...absorbed }], d);
-
-  return { diagram: d, forceGrammar: { ...fg, interimForces: newIF, selectedForceId: null, feasibilityDomain: null, isComplete: newIF.length === 0 } };
+  return { diagram, forceGrammar: fg };
 }
 
-// ─── Utilities kept for import ───────────────────────────────────
-
-export function projectOntoLineOfAction(force: InterimForce, nodeMap: Map<string, DiagramNode>, point: Vec2): Vec2 {
-  const node = nodeMap.get(force.nodeId);
-  if (!node) return point;
-  const fMag = vec2Len(force);
-  if (fMag < 1e-10) return { x: node.x, y: node.y };
-  const dx = point.x - node.x, dy = point.y - node.y;
-  const t = (dx * force.fx + dy * force.fy) / (fMag * fMag);
-  return { x: node.x + t * force.fx, y: node.y + t * force.fy };
+export function projectOntoLineOfAction(
+  force: InterimForce, nodeMap: Map<string, DiagramNode>, point: { x: number; y: number }
+): { x: number; y: number } {
+  return point;
 }
-
-// ═════════════════════════════════════════════════════════════════
-// 3D TENSEGRITY AUTO-EXPLORE
-// ═════════════════════════════════════════════════════════════════
-
-/**
- * Generate a 3D tensegrity: isolated struts floating in a minimal cable net.
- *
- * A Class-1 tensegrity has:
- *  - Each node touches exactly ONE compression member (strut)
- *  - Cables form the MINIMUM connected network for stability
- *  - Struts "float" — they share no nodes with each other
- *
- * Algorithm:
- *  1. STRUT PLACEMENT — Create N struts as isolated pairs of nodes
- *     arranged in 3D around the load point. Each strut is a
- *     compression plate connecting a "bottom" node (lower z) to
- *     a "top" node (higher z), tilted at various angles.
- *
- *  2. CABLE WIRING — Wire strut endpoints with the classic
- *     tensegrity pattern: top(i) → bottom(i+1 mod N). This is
- *     the minimum cable set that makes the structure rigid.
- *
- *  3. GROUND CABLES — Connect bottom endpoints to support nodes.
- *
- * The `steps` parameter controls the number of struts generated.
- */
-export function autoExploreForceGrammar(
-  diagram: DiagramData,
-  forceGrammar: ForceGrammarState,
-  steps: number
-): { diagram: DiagramData; forceGrammar: ForceGrammarState } {
-  const d = cloneDiagram(diagram);
-  const supports = d.nodes.filter(n => n.support !== 'free');
-  const loadNodes = d.nodes.filter(n =>
-    n.support === 'free' &&
-    (Math.abs(n.externalForce.x) > 0.01 || Math.abs(n.externalForce.y) > 0.01)
-  );
-
-  // Use the centroid of load nodes as structure center
-  const allSrc = loadNodes.length > 0 ? loadNodes : d.nodes.filter(n => n.support === 'free');
-  if (allSrc.length === 0 && supports.length === 0) {
-    return { diagram: d, forceGrammar };
-  }
-
-  const center = {
-    x: allSrc.reduce((s, n) => s + n.x, 0) / (allSrc.length || 1),
-    y: allSrc.reduce((s, n) => s + n.y, 0) / (allSrc.length || 1),
-  };
-  const supportCenter = supports.length > 0
-    ? { x: supports.reduce((s, n) => s + n.x, 0) / supports.length,
-        y: supports.reduce((s, n) => s + n.y, 0) / supports.length }
-    : center;
-
-  // Number of struts = steps (clamped to reasonable range)
-  const numStruts = Math.max(3, Math.min(steps, 12));
-  const baseRadius = 1.5 + Math.random() * 0.5;
-  const strutLength = 2 + Math.random() * 1.0;
-  const baseZ = Math.max(0, ...d.nodes.map(n => n.z)) + 0.3;
-  const tiltAngle = Math.PI / 6 + Math.random() * Math.PI / 6; // 30-60 deg tilt
-
-  // ─── Phase 1: STRUT PLACEMENT ─────────────────────────────
-  // Create N struts arranged radially, each tilted in 3D
-  interface StrutInfo {
-    bottomId: string;
-    topId: string;
-  }
-  const struts: StrutInfo[] = [];
-
-  for (let i = 0; i < numStruts; i++) {
-    const theta = (2 * Math.PI * i) / numStruts;
-    const thetaShift = (Math.PI / numStruts); // half-step rotation for top ring
-
-    // Bottom node: on a circle around center at baseZ
-    const bx = center.x + baseRadius * Math.cos(theta);
-    const by = center.y + baseRadius * Math.sin(theta);
-    const bz = baseZ;
-
-    // Top node: rotated by half-step, at higher z, slightly inward
-    const topRadius = baseRadius * 0.7;
-    const tx = center.x + topRadius * Math.cos(theta + thetaShift);
-    const ty = center.y + topRadius * Math.sin(theta + thetaShift);
-    const tz = baseZ + strutLength;
-
-    const bottomNode = makeNode(bx, by, bz);
-    const topNode = makeNode(tx, ty, tz);
-    d.nodes.push(bottomNode, topNode);
-
-    // Compression strut connecting bottom to top
-    d.edges.push(makeEdge(bottomNode.id, topNode.id, 'compression'));
-
-    struts.push({ bottomId: bottomNode.id, topId: topNode.id });
-  }
-
-  // ─── Phase 2: MINIMAL CABLE WIRING ────────────────────────
-  // Classic tensegrity pattern:
-  //   top(i) ──cable──> bottom((i+1) mod N)    (diagonal cables)
-  //   bottom(i) ──cable──> bottom((i+1) mod N) (bottom ring)
-  //   top(i) ──cable──> top((i+1) mod N)       (top ring)
-
-  for (let i = 0; i < numStruts; i++) {
-    const next = (i + 1) % numStruts;
-
-    // Diagonal cable: top of strut i → bottom of next strut
-    if (!hasEdge(d.edges, struts[i].topId, struts[next].bottomId)) {
-      d.edges.push(makeEdge(struts[i].topId, struts[next].bottomId, 'tension'));
-    }
-
-    // Bottom ring cable
-    if (!hasEdge(d.edges, struts[i].bottomId, struts[next].bottomId)) {
-      d.edges.push(makeEdge(struts[i].bottomId, struts[next].bottomId, 'tension'));
-    }
-
-    // Top ring cable
-    if (!hasEdge(d.edges, struts[i].topId, struts[next].topId)) {
-      d.edges.push(makeEdge(struts[i].topId, struts[next].topId, 'tension'));
-    }
-  }
-
-  // ─── Phase 3: GROUND CABLES ───────────────────────────────
-  // Connect bottom ring to support nodes
-  if (supports.length > 0) {
-    for (let i = 0; i < numStruts; i++) {
-      // Connect each bottom node to nearest support
-      const bNode = d.nodes.find(n => n.id === struts[i].bottomId)!;
-      const nearest = supports.reduce((best, s) =>
-        dist3(bNode, s) < dist3(bNode, best) ? s : best
-      );
-      if (!hasEdge(d.edges, struts[i].bottomId, nearest.id)) {
-        d.edges.push(makeEdge(struts[i].bottomId, nearest.id, 'tension'));
-      }
-    }
-  }
-
-  // ─── Phase 4: LOAD CABLES ─────────────────────────────────
-  // Connect load nodes to nearest strut top nodes
-  for (const loadNode of loadNodes) {
-    let closest: string | null = null;
-    let closestDist = Infinity;
-    for (const strut of struts) {
-      const topNode = d.nodes.find(n => n.id === strut.topId)!;
-      const dd = dist3(loadNode, topNode);
-      if (dd < closestDist) {
-        closestDist = dd;
-        closest = strut.topId;
-      }
-    }
-    if (closest && !hasEdge(d.edges, loadNode.id, closest)) {
-      d.edges.push(makeEdge(loadNode.id, closest, 'tension'));
-    }
-  }
-
-  // ─── Recompute interim forces ──────────────────────────────
-  // With the complete topology, resolve all forces via supports
-  let forces = [...forceGrammar.interimForces.map(f => ({ ...f }))];
-  // Absorb everything at supports (the topology is complete)
-  forces = forces.map(f => {
-    const node = d.nodes.find(n => n.id === f.nodeId);
-    if (!node) return f;
-    if (node.support === 'pin') return { ...f, fx: 0, fy: 0 };
-    if (node.support === 'roller-x') return { ...f, fy: 0 };
-    if (node.support === 'roller-y') return { ...f, fx: 0 };
-    return f;
-  }).filter(f => Math.abs(f.fx) > 0.01 || Math.abs(f.fy) > 0.01);
-
-  return {
-    diagram: d,
-    forceGrammar: {
-      ...forceGrammar,
-      interimForces: forces,
-      selectedForceId: null,
-      feasibilityDomain: null,
-      isComplete: forces.length === 0,
-    },
-  };
-}
-

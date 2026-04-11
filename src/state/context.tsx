@@ -4,17 +4,15 @@ import { appReducer, createInitialState } from './reducer';
 
 // ─── Default example: simple Warren truss ────────────────────────
 function createDefaultDiagram(): DiagramData {
+  // Start with just 3 ground supports — no edges. The L-system grammar
+  // grows the tensegrity structure from these anchor points.
   return {
     nodes: [
-      { id: 'n0', x: 0, y: 0, z: 0, support: 'pin', externalForce: { x: 0, y: 0 } },
-      { id: 'n1', x: 4, y: 0, z: 0, support: 'roller-x', externalForce: { x: 0, y: 0 } },
-      { id: 'n2', x: 2, y: 2, z: 1, support: 'free', externalForce: { x: 0, y: -2 } },
+      { id: 'n0', x: -2, y: -1, z: 0, support: 'pin', externalForce: { x: 0, y: 0 } },
+      { id: 'n1', x: 2, y: -1, z: 0, support: 'pin', externalForce: { x: 0, y: 0 } },
+      { id: 'n2', x: 0, y: 2, z: 0, support: 'pin', externalForce: { x: 0, y: 0 } },
     ],
-    edges: [
-      { id: 'e0', source: 'n0', target: 'n1', elementType: 'compression' as const, plateWidth: 0.3, plateThickness: 3, plateAngle: 0 },
-      { id: 'e1', source: 'n0', target: 'n2', elementType: 'compression' as const, plateWidth: 0.3, plateThickness: 3, plateAngle: 0 },
-      { id: 'e2', source: 'n1', target: 'n2', elementType: 'compression' as const, plateWidth: 0.3, plateThickness: 3, plateAngle: 0 },
-    ],
+    edges: [],
   };
 }
 
