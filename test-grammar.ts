@@ -21,35 +21,55 @@ function checkSelfStress(d: DiagramData): { valid: boolean; detail: string } {
     A[3*iT][e]=-dx/len; A[3*iT+1][e]=-dy/len; A[3*iT+2][e]=-dz/len;
   }
   const basis = findNullspaceBasis(A);
-  if (basis.length === 0) return { valid: false, detail: 'no self-stress (rank=m)' };
+  if (basis.length === 0) return { valid: false, detail: 'no self-stress (nullspace=0)' };
   for (const raw of basis) {
     for (const sign of [1, -1]) {
       const v = raw.map(x => x * sign);
-      const ok = d.edges.every((e, i) =>
-        (e.elementType === 'compression' ? v[i] <= 0.001 : v[i] >= -0.001)
-      );
-      if (ok) return { valid: true, detail: `nulldim=${basis.length}` };
+      const ok = d.edges.every((e, i) => (e.elementType === 'compression' ? v[i] <= 0.001 : v[i] >= -0.001));
+      if (ok) return { valid: true, detail: `nullspace=${basis.length}` };
     }
   }
-  return { valid: false, detail: `nulldim=${basis.length} wrong signs` };
+  return { valid: false, detail: `nullspace=${basis.length} (wrong signs)` };
 }
 
-console.log('=== Full Tensegrity Verification ===\n');
-console.log('Testing SEED (force-density form-finding) + SPROUT/BRANCH growth\n');
+function checkTensegrityTopo(d: DiagramData): boolean {
+  return d.nodes.every(n =>
+    d.edges.filter(e => e.elementType === 'compression' && (e.source === n.id || e.target === n.id)).length <= 1
+  );
+}
 
-for (const steps of [3, 5, 7, 10]) {
-  let validSS = 0, validTopo = 0, total = 20;
+console.log('=== Cellular Morphogenesis Test ===\n');
+
+for (const steps of [1, 2, 3, 5, 8]) {
+  let valid = 0, topo = 0, total = 20;
+  let plates = 0, cables = 0, nodes = 0;
   for (let trial = 0; trial < total; trial++) {
     const r = autoExploreForceGrammar(empty, fg, steps, 3);
     const d = r.diagram;
-    // Topology check
-    const topoOk = d.nodes.every(nd =>
-      d.edges.filter(e => e.elementType === 'compression' && (e.source === nd.id || e.target === nd.id)).length <= 1
-    );
-    if (topoOk) validTopo++;
-    // Self-stress check (only on SEED, before SPROUT/BRANCH)
-    const ss = checkSelfStress(d);
-    if (ss.valid) validSS++;
+    if (checkTensegrityTopo(d)) topo++;
+    if (checkSelfStress(d).valid) valid++;
+    plates += d.edges.filter(e => e.elementType === 'compression').length;
+    cables += d.edges.filter(e => e.elementType === 'tension').length;
+    nodes += d.nodes.length;
   }
-  console.log(`steps=${steps.toString().padStart(2)}: topo=${validTopo}/${total} self-stress=${validSS}/${total}`);
+  console.log(`steps=${steps.toString().padStart(2)}: topo=${topo}/${total} stress=${valid}/${total} avg=(${(nodes/total).toFixed(0)}n ${(plates/total).toFixed(0)}p ${(cables/total).toFixed(0)}c)`);
+}
+
+// Detailed run
+console.log('\n=== Detailed (steps=3) ===');
+const r = autoExploreForceGrammar(empty, fg, 3, 3);
+const d = r.diagram;
+const p = d.edges.filter(e => e.elementType === 'compression');
+const c = d.edges.filter(e => e.elementType === 'tension');
+console.log(`Nodes: ${d.nodes.length}, Plates: ${p.length}, Cables: ${c.length}`);
+console.log(`Topo valid: ${checkTensegrityTopo(d)}`);
+const ss = checkSelfStress(d);
+console.log(`Self-stress: ${ss.valid} (${ss.detail})`);
+
+// Print structure
+for (const e of d.edges) {
+  const s = d.nodes.find(n => n.id === e.source)!;
+  const t = d.nodes.find(n => n.id === e.target)!;
+  const label = e.elementType === 'compression' ? 'PLATE' : 'cable';
+  console.log(`  ${label}: (${s.x.toFixed(1)},${s.y.toFixed(1)},${s.z.toFixed(1)}) → (${t.x.toFixed(1)},${t.y.toFixed(1)},${t.z.toFixed(1)})`);
 }
