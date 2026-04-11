@@ -101,6 +101,7 @@ export function appReducer(state: AppState, action: AppAction): AppState {
         id: generateId('n'),
         x: action.x,
         y: action.y,
+        z: 0,
         support: 'free',
         externalForce: { x: 0, y: 0 },
       };
@@ -115,7 +116,7 @@ export function appReducer(state: AppState, action: AppAction): AppState {
       const diagram = {
         ...state.diagram,
         nodes: state.diagram.nodes.map((n) =>
-          n.id === action.id ? { ...n, x: action.x, y: action.y } : n
+          n.id === action.id ? { ...n, x: action.x, y: action.y, z: action.z ?? n.z } : n
         ),
       };
       return recompute({ ...state, diagram });
@@ -138,6 +139,7 @@ export function appReducer(state: AppState, action: AppAction): AppState {
         elementType: 'compression',
         plateWidth: 0.3,
         plateThickness: 3,
+        plateAngle: 0,
       };
       const diagram = {
         ...s.diagram,
@@ -218,6 +220,17 @@ export function appReducer(state: AppState, action: AppAction): AppState {
         ...s.diagram,
         edges: s.diagram.edges.map((e) =>
           e.id === action.id ? { ...e, plateThickness: action.thickness } : e
+        ),
+      };
+      return recompute({ ...s, diagram });
+    }
+
+    case 'SET_PLATE_ANGLE': {
+      const s = pushUndo(state);
+      const diagram = {
+        ...s.diagram,
+        edges: s.diagram.edges.map((e) =>
+          e.id === action.id ? { ...e, plateAngle: action.angle } : e
         ),
       };
       return recompute({ ...s, diagram });

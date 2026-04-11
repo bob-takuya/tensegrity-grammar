@@ -24,7 +24,7 @@ function cloneDiagram(d: DiagramData): DiagramData {
 }
 
 function newEdge(source: string, target: string, elementType: ElementType = 'compression'): DiagramEdge {
-  return { id: generateId('e'), source, target, elementType, plateWidth: 0.3, plateThickness: 3 };
+  return { id: generateId('e'), source, target, elementType, plateWidth: 0.3, plateThickness: 3, plateAngle: 0 };
 }
 
 // ─── Helper: get adjacent edges for a node ───────────────────────
@@ -96,6 +96,7 @@ const edgeSubdivision: GrammarRule = {
       id: newNodeId,
       x: mid.x,
       y: mid.y,
+      z: 0,
       support: 'free',
       externalForce: { x: 0, y: 0 },
     };
@@ -153,6 +154,7 @@ const branching: GrammarRule = {
       id: newNodeId,
       x: node.x + len * Math.cos(rad),
       y: node.y + len * Math.sin(rad),
+      z: 0,
       support: 'free',
       externalForce: { x: 0, y: 0 },
     });
@@ -223,6 +225,7 @@ const extension: GrammarRule = {
       id: newNodeId,
       x: node.x + len * Math.cos(outAngle),
       y: node.y + len * Math.sin(outAngle),
+      z: 0,
       support: 'free',
       externalForce: { x: 0, y: 0 },
     });
@@ -405,6 +408,7 @@ const parallelOffset: GrammarRule = {
       id: newSrcId,
       x: srcNode.x + p.x,
       y: srcNode.y + p.y,
+      z: 0,
       support: 'free',
       externalForce: { x: 0, y: 0 },
     });
@@ -412,6 +416,7 @@ const parallelOffset: GrammarRule = {
       id: newTgtId,
       x: tgtNode.x + p.x,
       y: tgtNode.y + p.y,
+      z: 0,
       support: 'free',
       externalForce: { x: 0, y: 0 },
     });

@@ -14,10 +14,17 @@ export interface Vec2 {
   y: number;
 }
 
+export interface Vec3 {
+  x: number;
+  y: number;
+  z: number;
+}
+
 export interface DiagramNode {
   id: string;
   x: number;
   y: number;
+  z: number;           // 3D elevation
   support: SupportType;
   externalForce: Vec2;
 }
@@ -30,6 +37,7 @@ export interface DiagramEdge {
   // Plate properties (Phase 3: tensegrity)
   plateWidth: number;    // width of the plate (perpendicular to edge), world units
   plateThickness: number; // thickness of the plate (for fabrication), mm
+  plateAngle: number;    // rotation angle of plate around its axis (degrees)
 }
 
 // ─── Diagram Data (serializable snapshot) ────────────────────────
@@ -146,7 +154,7 @@ export interface AppState {
 
 export type AppAction =
   | { type: 'ADD_NODE'; x: number; y: number }
-  | { type: 'MOVE_NODE'; id: string; x: number; y: number }
+  | { type: 'MOVE_NODE'; id: string; x: number; y: number; z?: number }
   | { type: 'DELETE_ELEMENT'; id: string }
   | { type: 'ADD_EDGE'; source: string; target: string }
   | { type: 'SET_SUPPORT'; id: string; support: SupportType }
@@ -154,6 +162,7 @@ export type AppAction =
   | { type: 'SET_ELEMENT_TYPE'; id: string; elementType: ElementType }
   | { type: 'SET_PLATE_WIDTH'; id: string; width: number }
   | { type: 'SET_PLATE_THICKNESS'; id: string; thickness: number }
+  | { type: 'SET_PLATE_ANGLE'; id: string; angle: number }
   | { type: 'SELECT'; ids: string[] }
   | { type: 'SET_MODE'; mode: EditMode }
   | { type: 'SET_EDGE_START'; id: string | null }

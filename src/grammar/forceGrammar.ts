@@ -173,6 +173,7 @@ export function resolveForceAddNode(
     id: newNodeId,
     x: newX,
     y: newY,
+    z: 0,
     support: 'free',
     externalForce: { x: 0, y: 0 },
   });
@@ -185,6 +186,7 @@ export function resolveForceAddNode(
     elementType: 'compression',
     plateWidth: 0.3,
     plateThickness: 3,
+    plateAngle: 0,
   });
 
   // Compute force decomposition
@@ -291,6 +293,7 @@ export function resolveForceConnect(
     elementType: 'compression',
     plateWidth: 0.3,
     plateThickness: 3,
+    plateAngle: 0,
   });
 
   // Force decomposition (same as above)

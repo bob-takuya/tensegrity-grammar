@@ -107,6 +107,23 @@ export function PropertiesPanel() {
           />
         </div>
         <div className="prop-group">
+          <label>Position Z (elevation)</label>
+          <input
+            type="number"
+            step="0.5"
+            value={selectedNode.z}
+            onChange={(e) =>
+              dispatch({
+                type: 'MOVE_NODE',
+                id: selectedNode.id,
+                x: selectedNode.x,
+                y: selectedNode.y,
+                z: parseFloat(e.target.value) || 0,
+              })
+            }
+          />
+        </div>
+        <div className="prop-group">
           <label>Support</label>
           <select
             value={selectedNode.support}
@@ -212,6 +229,21 @@ export function PropertiesPanel() {
                     type: 'SET_PLATE_WIDTH',
                     id: selectedEdge.id,
                     width: Math.max(0.05, parseFloat(e.target.value) || 0.3),
+                  })
+                }
+              />
+            </div>
+            <div className="prop-group">
+              <label>Plate Angle (degrees)</label>
+              <input
+                type="number"
+                step="5"
+                value={selectedEdge.plateAngle}
+                onChange={(e) =>
+                  dispatch({
+                    type: 'SET_PLATE_ANGLE',
+                    id: selectedEdge.id,
+                    angle: parseFloat(e.target.value) || 0,
                   })
                 }
               />

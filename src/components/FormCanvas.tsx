@@ -438,6 +438,14 @@ export function FormCanvas() {
       ctx.strokeStyle = '#fff';
       ctx.lineWidth = 1.5;
       ctx.stroke();
+
+      // Z elevation label
+      if (Math.abs(node.z) > 0.01) {
+        ctx.font = '9px monospace';
+        ctx.fillStyle = '#7b1fa2';
+        ctx.textAlign = 'left';
+        ctx.fillText(`z=${node.z.toFixed(1)}`, sx + NODE_RADIUS + 3, sy - 2);
+      }
     }
 
     // ─── Rule match highlights ──────────────────────────────────
@@ -605,7 +613,7 @@ export function FormCanvas() {
     ctx.font = 'bold 11px sans-serif';
     ctx.fillStyle = '#888';
     ctx.textAlign = 'left';
-    ctx.fillText(`Form Diagram — ${mode}`, 10, 18);
+    ctx.fillText(`Form Diagram (XY Projection) — ${mode}`, 10, 18);
   }, [diagram, vt, selectedIds, mode, edgeStartNode, equilibrium, ruleMatches, highlightedMatchIndex, forceGrammar, size]);
 
   return (

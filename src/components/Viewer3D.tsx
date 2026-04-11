@@ -166,30 +166,44 @@ export function Viewer3D() {
       roughness: 0.6,
     });
 
+    // Coordinate mapping: diagram (x, y, z) → Three.js (x, z_up=y, -y)
+    // diagram.x → 3D X, diagram.z → 3D Y (up), diagram.y → 3D -Z
+    const toThree = (n: { x: number; y: number; z: number }) =>
+      new THREE.Vector3(n.x, n.z, -n.y);
+
     // Draw edges
     for (const edge of diagram.edges) {
       const src = nodeMap.get(edge.source);
       const tgt = nodeMap.get(edge.target);
       if (!src || !tgt) continue;
 
-      const start = new THREE.Vector3(src.x, 0, -src.y); // Y-up in 3D, Z maps to -diagram.y
-      const end = new THREE.Vector3(tgt.x, 0, -tgt.y);
+      const start = toThree(src);
+      const end = toThree(tgt);
       const mid = new THREE.Vector3().addVectors(start, end).multiplyScalar(0.5);
       const dir = new THREE.Vector3().subVectors(end, start);
       const edgeLen = dir.length();
+      if (edgeLen < 1e-6) continue;
 
       if (edge.elementType === 'compression') {
         // Plate: box with width and thickness
         const pw = edge.plateWidth * WORLD_SCALE;
-        const pt = (edge.plateThickness / 100) * WORLD_SCALE; // mm to world units
+        const pt = (edge.plateThickness / 100) * WORLD_SCALE;
         const geo = new THREE.BoxGeometry(edgeLen, pt, pw);
         const mesh = new THREE.Mesh(geo, plateMat.clone());
         mesh.position.copy(mid);
-        mesh.position.y = pt / 2;
 
-        // Rotate to align with edge direction
-        const angle = Math.atan2(dir.z, dir.x);
-        mesh.rotation.y = -angle;
+        // Align box X-axis with the edge direction using lookAt + quaternion
+        const dirN = dir.clone().normalize();
+        const quat = new THREE.Quaternion();
+        quat.setFromUnitVectors(new THREE.Vector3(1, 0, 0), dirN);
+        mesh.quaternion.copy(quat);
+
+        // Apply plate rotation around the edge axis
+        if (edge.plateAngle !== 0) {
+          const axisRot = new THREE.Quaternion();
+          axisRot.setFromAxisAngle(dirN, (edge.plateAngle * Math.PI) / 180);
+          mesh.quaternion.premultiply(axisRot);
+        }
 
         mesh.castShadow = true;
         mesh.receiveShadow = true;
@@ -203,10 +217,11 @@ export function Viewer3D() {
         geo.rotateZ(Math.PI / 2); // align along X
         const mesh = new THREE.Mesh(geo, cableMat.clone());
         mesh.position.copy(mid);
-        mesh.position.y = 0.03; // slight elevation
 
-        const angle = Math.atan2(dir.z, dir.x);
-        mesh.rotation.y = -angle;
+        const dirN = dir.clone().normalize();
+        const quat = new THREE.Quaternion();
+        quat.setFromUnitVectors(new THREE.Vector3(1, 0, 0), dirN);
+        mesh.quaternion.copy(quat);
 
         mesh.castShadow = true;
         mesh.userData.isStructure = true;
@@ -222,7 +237,8 @@ export function Viewer3D() {
         nodeGeo,
         node.support !== 'free' ? supportMat.clone() : nodeMat.clone()
       );
-      mesh.position.set(node.x, 0.03, -node.y);
+      const pos = toThree(node);
+      mesh.position.copy(pos);
       mesh.castShadow = true;
       mesh.userData.isStructure = true;
       mesh.userData.nodeId = node.id;
@@ -232,8 +248,8 @@ export function Viewer3D() {
       if (node.support !== 'free') {
         const markerGeo = new THREE.ConeGeometry(0.08, 0.15, 4);
         const marker = new THREE.Mesh(markerGeo, supportMat.clone());
-        marker.position.set(node.x, -0.075, -node.y);
-        marker.rotation.x = Math.PI; // point down
+        marker.position.copy(pos).add(new THREE.Vector3(0, -0.1, 0));
+        marker.rotation.x = Math.PI;
         marker.userData.isStructure = true;
         scene.add(marker);
       }
@@ -243,19 +259,8 @@ export function Viewer3D() {
       if (Math.abs(ef.x) > 0.001 || Math.abs(ef.y) > 0.001) {
         const fLen = Math.sqrt(ef.x * ef.x + ef.y * ef.y);
         const arrowDir = new THREE.Vector3(ef.x / fLen, 0, -ef.y / fLen);
-        const arrowOrigin = new THREE.Vector3(
-          node.x - ef.x * 0.5,
-          0.03,
-          -node.y + ef.y * 0.5
-        );
-        const arrow = new THREE.ArrowHelper(
-          arrowDir,
-          arrowOrigin,
-          fLen * 0.5,
-          0x9c27b0,
-          0.1,
-          0.06
-        );
+        const arrowOrigin = pos.clone().add(arrowDir.clone().multiplyScalar(-fLen * 0.3));
+        const arrow = new THREE.ArrowHelper(arrowDir, arrowOrigin, fLen * 0.5, 0x9c27b0, 0.1, 0.06);
         arrow.userData.isStructure = true;
         scene.add(arrow);
       }
@@ -263,17 +268,23 @@ export function Viewer3D() {
 
     // Auto-fit camera to structure
     if (diagram.nodes.length > 0) {
-      const xs = diagram.nodes.map((n) => n.x);
-      const ys = diagram.nodes.map((n) => n.y);
-      const cx = (Math.min(...xs) + Math.max(...xs)) / 2;
-      const cy = (Math.min(...ys) + Math.max(...ys)) / 2;
+      const positions = diagram.nodes.map(toThree);
+      const xs = positions.map((p) => p.x);
+      const ys = positions.map((p) => p.y);
+      const zs = positions.map((p) => p.z);
+      const center = new THREE.Vector3(
+        (Math.min(...xs) + Math.max(...xs)) / 2,
+        (Math.min(...ys) + Math.max(...ys)) / 2,
+        (Math.min(...zs) + Math.max(...zs)) / 2
+      );
       const range = Math.max(
         Math.max(...xs) - Math.min(...xs),
         Math.max(...ys) - Math.min(...ys),
+        Math.max(...zs) - Math.min(...zs),
         2
       );
-      orbitRef.current.target.set(cx, 0, -cy);
-      orbitRef.current.distance = range * 1.5;
+      orbitRef.current.target.copy(center);
+      orbitRef.current.distance = range * 1.8;
     }
   }, [diagram, equilibrium]);
 

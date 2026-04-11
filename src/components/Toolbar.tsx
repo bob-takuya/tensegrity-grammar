@@ -1,6 +1,7 @@
 import React, { useCallback } from 'react';
 import { useAppState } from '../state/context';
 import { EditMode, DiagramData } from '../types';
+import { applySelfWeight } from '../engine/gravity';
 
 const modes: { mode: EditMode; label: string; shortcut: string; icon: string }[] = [
   { mode: 'select', label: 'Select', shortcut: 'V', icon: '⇲' },
@@ -90,6 +91,19 @@ export function Toolbar() {
         </button>
         <button className="tool-btn" onClick={handleLoad} title="Load diagram from JSON">
           📂 Load
+        </button>
+      </div>
+
+      <div className="toolbar-group">
+        <button
+          className="tool-btn"
+          onClick={() => {
+            const updated = applySelfWeight(state.diagram);
+            dispatch({ type: 'LOAD_STATE', data: updated });
+          }}
+          title="Compute and apply self-weight (gravity) from plate masses"
+        >
+          ⬇ Self-Weight
         </button>
       </div>
 
