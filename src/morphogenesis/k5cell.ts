@@ -15,7 +15,7 @@
 
 import { Vec3, MNode, MEdge, K5Cell, StructureGraph } from './types';
 import { signedTetraVolume, isGeneralPosition, vdist } from './geometry';
-import { findNullspaceBasis } from '../engine/linalg';
+import { findNullspaceBasis } from './linalg';
 
 /**
  * Enumerate all 10 edges of K₅ on 5 nodes [0,1,2,3,4].

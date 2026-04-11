@@ -1,24 +1,7 @@
 import React, { useRef, useEffect, useState } from 'react';
 import * as THREE from 'three';
 import { useAppState } from '../state/context';
-import { DiagramData, DiagramNode, DiagramEdge, Vec2 } from '../types';
-import { sub, add, scale, normalize, length, perp } from '../engine/geometry';
-
-/**
- * 3D Viewer for the tensegrity structure.
- *
- * Renders:
- *  - Compression members as 3D rectangular plates (boxes)
- *  - Tension members as thin cables (lines/cylinders)
- *  - Nodes as small spheres
- *  - Supports as ground markers
- *  - Force arrows
- *
- * The 2D diagram is extruded into 3D using plate thickness.
- * OrbitControls-style interaction (rotate, pan, zoom) is implemented manually.
- */
-
-const WORLD_SCALE = 1; // 1 world unit = 1 Three.js unit
+import { MorphogenesisState, MNode, MEdge } from '../morphogenesis/types';
 
 export function Viewer3D() {
   const { state } = useAppState();
@@ -29,85 +12,55 @@ export function Viewer3D() {
   const frameRef = useRef<number>(0);
   const [size, setSize] = useState({ w: 600, h: 500 });
 
-  // Orbit state
   const orbitRef = useRef({
-    theta: Math.PI / 4,
-    phi: Math.PI / 3,
-    distance: 8,
-    target: new THREE.Vector3(2, 0, 1),
-    isDragging: false,
-    isPanning: false,
-    lastX: 0,
-    lastY: 0,
+    theta: Math.PI / 4, phi: Math.PI / 3, distance: 8,
+    target: new THREE.Vector3(0, 1, 0),
+    isDragging: false, isPanning: false, lastX: 0, lastY: 0,
   });
-
-  const { diagram, equilibrium } = state;
 
   // Initialize Three.js
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
 
-    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
     renderer.setPixelRatio(window.devicePixelRatio);
-    renderer.setClearColor(0xf0f0ee);
+    renderer.setClearColor(0xf5f5f0);
     renderer.shadowMap.enabled = true;
-    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     container.appendChild(renderer.domElement);
     rendererRef.current = renderer;
 
     const scene = new THREE.Scene();
     sceneRef.current = scene;
-
-    const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 100);
+    const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 200);
     cameraRef.current = camera;
 
-    // Lighting
-    const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
-    scene.add(ambientLight);
+    scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+    const dir = new THREE.DirectionalLight(0xffffff, 0.8);
+    dir.position.set(5, 10, 7); dir.castShadow = true;
+    scene.add(dir);
+    scene.add(new THREE.DirectionalLight(0xffffff, 0.3).translateX(-3).translateY(5).translateZ(-5));
 
-    const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
-    dirLight.position.set(5, 10, 7);
-    dirLight.castShadow = true;
-    dirLight.shadow.mapSize.width = 1024;
-    dirLight.shadow.mapSize.height = 1024;
-    scene.add(dirLight);
-
-    const fillLight = new THREE.DirectionalLight(0xffffff, 0.3);
-    fillLight.position.set(-3, 5, -5);
-    scene.add(fillLight);
-
-    // Ground plane
-    const groundGeo = new THREE.PlaneGeometry(20, 20);
-    const groundMat = new THREE.MeshStandardMaterial({
-      color: 0xe8e8e5,
-      roughness: 0.9,
-    });
-    const ground = new THREE.Mesh(groundGeo, groundMat);
-    ground.rotation.x = -Math.PI / 2;
-    ground.position.y = -0.01;
-    ground.receiveShadow = true;
-    ground.name = '__ground';
+    // Ground
+    const ground = new THREE.Mesh(
+      new THREE.PlaneGeometry(30, 30),
+      new THREE.MeshStandardMaterial({ color: 0xe8e8e5, roughness: 0.9 })
+    );
+    ground.rotation.x = -Math.PI / 2; ground.receiveShadow = true; ground.name = '__ground';
     scene.add(ground);
+    const grid = new THREE.GridHelper(30, 60, 0xcccccc, 0xdddddd);
+    grid.name = '__grid'; scene.add(grid);
 
-    // Grid helper
-    const grid = new THREE.GridHelper(20, 40, 0xcccccc, 0xdddddd);
-    grid.name = '__grid';
-    scene.add(grid);
-
-    // Resize observer
-    const ro = new ResizeObserver((entries) => {
-      for (const entry of entries) {
-        const { width, height } = entry.contentRect;
-        setSize({ w: width, h: height });
-        renderer.setSize(width, height);
-        camera.aspect = width / height;
+    const ro = new ResizeObserver(entries => {
+      for (const e of entries) {
+        setSize({ w: e.contentRect.width, h: e.contentRect.height });
+        renderer.setSize(e.contentRect.width, e.contentRect.height);
+        camera.aspect = e.contentRect.width / e.contentRect.height;
         camera.updateProjectionMatrix();
       }
     });
     ro.observe(container);
 
-    // Animation loop
     const animate = () => {
       frameRef.current = requestAnimationFrame(animate);
       updateCamera(camera, orbitRef.current);
@@ -115,218 +68,119 @@ export function Viewer3D() {
     };
     animate();
 
-    return () => {
-      cancelAnimationFrame(frameRef.current);
-      ro.disconnect();
-      renderer.dispose();
-      container.removeChild(renderer.domElement);
-    };
+    return () => { cancelAnimationFrame(frameRef.current); ro.disconnect(); renderer.dispose(); container.removeChild(renderer.domElement); };
   }, []);
 
-  // Update scene when diagram changes
+  // Rebuild scene from morpho state
   useEffect(() => {
     const scene = sceneRef.current;
     if (!scene) return;
 
-    // Remove old structure objects (keep lights, ground, grid)
+    // Remove old structure objects
     const toRemove: THREE.Object3D[] = [];
-    scene.traverse((obj) => {
-      if (obj.userData.isStructure) toRemove.push(obj);
-    });
-    toRemove.forEach((obj) => {
-      if (obj.parent) obj.parent.remove(obj);
-      if (obj instanceof THREE.Mesh) {
-        obj.geometry.dispose();
-        if (Array.isArray(obj.material)) obj.material.forEach((m) => m.dispose());
-        else obj.material.dispose();
-      }
+    scene.traverse(obj => { if (obj.userData.isStructure) toRemove.push(obj); });
+    toRemove.forEach(obj => {
+      obj.parent?.remove(obj);
+      if (obj instanceof THREE.Mesh) { obj.geometry.dispose(); if (Array.isArray(obj.material)) obj.material.forEach(m => m.dispose()); else obj.material.dispose(); }
     });
 
-    const nodeMap = new Map(diagram.nodes.map((n) => [n.id, n]));
-    const forces = equilibrium?.forces || new Map<string, number>();
+    const { graph } = state.morpho;
+    const nodeMap = new Map(graph.nodes.map(n => [n.id, n]));
+    const selectedNodes = new Set(state.selectedNodeIds);
+    const selectedEdges = new Set(state.selectedEdgeIds);
 
     // Materials
-    const plateMat = new THREE.MeshStandardMaterial({
-      color: 0xd4a574,
-      roughness: 0.7,
-      metalness: 0.1,
-    });
-    const cableMat = new THREE.MeshStandardMaterial({
-      color: 0x3388dd,
-      roughness: 0.3,
-      metalness: 0.6,
-    });
-    const nodeMat = new THREE.MeshStandardMaterial({
-      color: 0x444444,
-      roughness: 0.5,
-      metalness: 0.3,
-    });
-    const supportMat = new THREE.MeshStandardMaterial({
-      color: 0x4caf50,
-      roughness: 0.6,
-    });
+    const strutMat = new THREE.MeshStandardMaterial({ color: 0x607d8b, roughness: 0.4, metalness: 0.3 });
+    const cableMat = new THREE.MeshStandardMaterial({ color: 0xff5722, roughness: 0.3, metalness: 0.1 });
+    const selectedMat = new THREE.MeshStandardMaterial({ color: 0xffeb3b, roughness: 0.3, emissive: 0x333300 });
 
-    // Coordinate mapping: diagram (x, y, z) → Three.js (x, z_up=y, -y)
-    // diagram.x → 3D X, diagram.z → 3D Y (up), diagram.y → 3D -Z
-    const toThree = (n: { x: number; y: number; z: number }) =>
-      new THREE.Vector3(n.x, n.z, -n.y);
+    // Edges
+    for (const edge of graph.edges) {
+      const a = nodeMap.get(edge.n[0]), b = nodeMap.get(edge.n[1]);
+      if (!a || !b) continue;
 
-    // Draw edges
-    for (const edge of diagram.edges) {
-      const src = nodeMap.get(edge.source);
-      const tgt = nodeMap.get(edge.target);
-      if (!src || !tgt) continue;
-
-      const start = toThree(src);
-      const end = toThree(tgt);
+      const start = new THREE.Vector3(a.pos[0], a.pos[2], -a.pos[1]); // y→z, z→y
+      const end = new THREE.Vector3(b.pos[0], b.pos[2], -b.pos[1]);
       const mid = new THREE.Vector3().addVectors(start, end).multiplyScalar(0.5);
       const dir = new THREE.Vector3().subVectors(end, start);
-      const edgeLen = dir.length();
-      if (edgeLen < 1e-6) continue;
+      const len = dir.length();
+      if (len < 1e-6) continue;
 
-      if (edge.elementType === 'compression') {
-        // Plate: box with width and thickness
-        const pw = edge.plateWidth * WORLD_SCALE;
-        const pt = (edge.plateThickness / 100) * WORLD_SCALE;
-        const geo = new THREE.BoxGeometry(edgeLen, pt, pw);
-        const mesh = new THREE.Mesh(geo, plateMat.clone());
+      const isSelected = selectedEdges.has(edge.id);
+      const mat = isSelected ? selectedMat.clone() : (edge.type === 'strut' ? strutMat.clone() : cableMat.clone());
+
+      if (edge.type === 'strut') {
+        // Thick cylinder for struts
+        const geo = new THREE.CylinderGeometry(0.04, 0.04, len, 8);
+        geo.rotateZ(Math.PI / 2);
+        const mesh = new THREE.Mesh(geo, mat);
         mesh.position.copy(mid);
-
-        // Align box X-axis with the edge direction using lookAt + quaternion
-        const dirN = dir.clone().normalize();
-        const quat = new THREE.Quaternion();
-        quat.setFromUnitVectors(new THREE.Vector3(1, 0, 0), dirN);
-        mesh.quaternion.copy(quat);
-
-        // Apply plate rotation around the edge axis
-        if (edge.plateAngle !== 0) {
-          const axisRot = new THREE.Quaternion();
-          axisRot.setFromAxisAngle(dirN, (edge.plateAngle * Math.PI) / 180);
-          mesh.quaternion.premultiply(axisRot);
-        }
-
+        const q = new THREE.Quaternion();
+        q.setFromUnitVectors(new THREE.Vector3(1, 0, 0), dir.clone().normalize());
+        mesh.quaternion.copy(q);
         mesh.castShadow = true;
-        mesh.receiveShadow = true;
-        mesh.userData.isStructure = true;
-        mesh.userData.edgeId = edge.id;
+        mesh.userData = { isStructure: true, edgeId: edge.id };
         scene.add(mesh);
       } else {
-        // Cable: thin cylinder
-        const radius = 0.015;
-        const geo = new THREE.CylinderGeometry(radius, radius, edgeLen, 6);
-        geo.rotateZ(Math.PI / 2); // align along X
-        const mesh = new THREE.Mesh(geo, cableMat.clone());
+        // Thin line for cables
+        const geo = new THREE.CylinderGeometry(0.012, 0.012, len, 4);
+        geo.rotateZ(Math.PI / 2);
+        const mesh = new THREE.Mesh(geo, mat);
         mesh.position.copy(mid);
-
-        const dirN = dir.clone().normalize();
-        const quat = new THREE.Quaternion();
-        quat.setFromUnitVectors(new THREE.Vector3(1, 0, 0), dirN);
-        mesh.quaternion.copy(quat);
-
-        mesh.castShadow = true;
-        mesh.userData.isStructure = true;
-        mesh.userData.edgeId = edge.id;
+        const q = new THREE.Quaternion();
+        q.setFromUnitVectors(new THREE.Vector3(1, 0, 0), dir.clone().normalize());
+        mesh.quaternion.copy(q);
+        mesh.userData = { isStructure: true, edgeId: edge.id };
         scene.add(mesh);
       }
     }
 
-    // Draw nodes
+    // Nodes
     const nodeGeo = new THREE.SphereGeometry(0.06, 12, 8);
-    for (const node of diagram.nodes) {
-      const mesh = new THREE.Mesh(
-        nodeGeo,
-        node.support !== 'free' ? supportMat.clone() : nodeMat.clone()
+    for (const node of graph.nodes) {
+      const isSelected = selectedNodes.has(node.id);
+      const mesh = new THREE.Mesh(nodeGeo,
+        isSelected ? selectedMat.clone() : new THREE.MeshStandardMaterial({ color: 0x333333, roughness: 0.5 })
       );
-      const pos = toThree(node);
-      mesh.position.copy(pos);
+      mesh.position.set(node.pos[0], node.pos[2], -node.pos[1]);
       mesh.castShadow = true;
-      mesh.userData.isStructure = true;
-      mesh.userData.nodeId = node.id;
+      mesh.userData = { isStructure: true, nodeId: node.id };
       scene.add(mesh);
-
-      // Support marker
-      if (node.support !== 'free') {
-        const markerGeo = new THREE.ConeGeometry(0.08, 0.15, 4);
-        const marker = new THREE.Mesh(markerGeo, supportMat.clone());
-        marker.position.copy(pos).add(new THREE.Vector3(0, -0.1, 0));
-        marker.rotation.x = Math.PI;
-        marker.userData.isStructure = true;
-        scene.add(marker);
-      }
-
-      // External force arrow
-      const ef = node.externalForce;
-      if (Math.abs(ef.x) > 0.001 || Math.abs(ef.y) > 0.001) {
-        const fLen = Math.sqrt(ef.x * ef.x + ef.y * ef.y);
-        const arrowDir = new THREE.Vector3(ef.x / fLen, 0, -ef.y / fLen);
-        const arrowOrigin = pos.clone().add(arrowDir.clone().multiplyScalar(-fLen * 0.3));
-        const arrow = new THREE.ArrowHelper(arrowDir, arrowOrigin, fLen * 0.5, 0x9c27b0, 0.1, 0.06);
-        arrow.userData.isStructure = true;
-        scene.add(arrow);
-      }
     }
 
-    // Auto-fit camera to structure
-    if (diagram.nodes.length > 0) {
-      const positions = diagram.nodes.map(toThree);
-      const xs = positions.map((p) => p.x);
-      const ys = positions.map((p) => p.y);
-      const zs = positions.map((p) => p.z);
-      const center = new THREE.Vector3(
-        (Math.min(...xs) + Math.max(...xs)) / 2,
-        (Math.min(...ys) + Math.max(...ys)) / 2,
-        (Math.min(...zs) + Math.max(...zs)) / 2
-      );
-      const range = Math.max(
-        Math.max(...xs) - Math.min(...xs),
-        Math.max(...ys) - Math.min(...ys),
-        Math.max(...zs) - Math.min(...zs),
-        2
-      );
+    // Auto-fit camera
+    if (graph.nodes.length > 0) {
+      const positions = graph.nodes.map(n => new THREE.Vector3(n.pos[0], n.pos[2], -n.pos[1]));
+      const box = new THREE.Box3().setFromPoints(positions);
+      const center = box.getCenter(new THREE.Vector3());
+      const size = box.getSize(new THREE.Vector3());
       orbitRef.current.target.copy(center);
-      orbitRef.current.distance = range * 1.8;
+      orbitRef.current.distance = Math.max(size.x, size.y, size.z, 3) * 2;
     }
-  }, [diagram, equilibrium]);
+  }, [state.morpho, state.selectedNodeIds, state.selectedEdgeIds]);
 
-  // Mouse interaction (orbit controls)
+  // Mouse interaction
   const handleMouseDown = (e: React.MouseEvent) => {
-    if (e.button === 0) {
-      orbitRef.current.isDragging = true;
-    } else if (e.button === 2 || e.button === 1) {
-      orbitRef.current.isPanning = true;
-    }
-    orbitRef.current.lastX = e.clientX;
-    orbitRef.current.lastY = e.clientY;
+    if (e.button === 0) orbitRef.current.isDragging = true;
+    else if (e.button === 2 || e.button === 1) orbitRef.current.isPanning = true;
+    orbitRef.current.lastX = e.clientX; orbitRef.current.lastY = e.clientY;
   };
-
   const handleMouseMove = (e: React.MouseEvent) => {
-    const orbit = orbitRef.current;
-    const dx = e.clientX - orbit.lastX;
-    const dy = e.clientY - orbit.lastY;
-    orbit.lastX = e.clientX;
-    orbit.lastY = e.clientY;
-
-    if (orbit.isDragging) {
-      orbit.theta -= dx * 0.005;
-      orbit.phi = Math.max(0.1, Math.min(Math.PI - 0.1, orbit.phi - dy * 0.005));
-    }
-    if (orbit.isPanning) {
+    const o = orbitRef.current;
+    const dx = e.clientX - o.lastX, dy = e.clientY - o.lastY;
+    o.lastX = e.clientX; o.lastY = e.clientY;
+    if (o.isDragging) { o.theta -= dx * 0.005; o.phi = Math.max(0.1, Math.min(Math.PI - 0.1, o.phi - dy * 0.005)); }
+    if (o.isPanning) {
       const camera = cameraRef.current;
       if (camera) {
         const right = new THREE.Vector3();
-        const up = new THREE.Vector3(0, 1, 0);
-        right.crossVectors(camera.getWorldDirection(new THREE.Vector3()), up).normalize();
-        orbit.target.addScaledVector(right, -dx * 0.005 * orbit.distance);
-        orbit.target.y += dy * 0.005 * orbit.distance;
+        right.crossVectors(camera.getWorldDirection(new THREE.Vector3()), new THREE.Vector3(0, 1, 0)).normalize();
+        o.target.addScaledVector(right, -dx * 0.005 * o.distance);
+        o.target.y += dy * 0.005 * o.distance;
       }
     }
   };
-
-  const handleMouseUp = () => {
-    orbitRef.current.isDragging = false;
-    orbitRef.current.isPanning = false;
-  };
-
+  const handleMouseUp = () => { orbitRef.current.isDragging = false; orbitRef.current.isPanning = false; };
   const handleWheel = (e: React.WheelEvent) => {
     e.preventDefault();
     orbitRef.current.distance *= e.deltaY > 0 ? 1.1 : 0.9;
@@ -334,29 +188,20 @@ export function Viewer3D() {
   };
 
   return (
-    <div
-      ref={containerRef}
-      className="canvas-container viewer-3d"
-      onMouseDown={handleMouseDown}
-      onMouseMove={handleMouseMove}
-      onMouseUp={handleMouseUp}
-      onMouseLeave={handleMouseUp}
-      onWheel={handleWheel}
-      onContextMenu={(e) => e.preventDefault()}
-    >
+    <div ref={containerRef} className="canvas-container viewer-3d"
+      onMouseDown={handleMouseDown} onMouseMove={handleMouseMove}
+      onMouseUp={handleMouseUp} onMouseLeave={handleMouseUp}
+      onWheel={handleWheel} onContextMenu={e => e.preventDefault()}>
       <div className="viewer-3d-label">3D View</div>
     </div>
   );
 }
 
-function updateCamera(
-  camera: THREE.PerspectiveCamera,
-  orbit: { theta: number; phi: number; distance: number; target: THREE.Vector3 }
-) {
-  camera.position.set(
-    orbit.target.x + orbit.distance * Math.sin(orbit.phi) * Math.cos(orbit.theta),
-    orbit.target.y + orbit.distance * Math.cos(orbit.phi),
-    orbit.target.z + orbit.distance * Math.sin(orbit.phi) * Math.sin(orbit.theta)
+function updateCamera(c: THREE.PerspectiveCamera, o: { theta: number; phi: number; distance: number; target: THREE.Vector3 }) {
+  c.position.set(
+    o.target.x + o.distance * Math.sin(o.phi) * Math.cos(o.theta),
+    o.target.y + o.distance * Math.cos(o.phi),
+    o.target.z + o.distance * Math.sin(o.phi) * Math.sin(o.theta)
   );
-  camera.lookAt(orbit.target);
+  c.lookAt(o.target);
 }

@@ -1,34 +1,23 @@
 import { AppProvider } from './state/context';
-import { Toolbar } from './components/Toolbar';
-import { FormCanvas } from './components/FormCanvas';
-import { ForceCanvas } from './components/ForceCanvas';
 import { Viewer3D } from './components/Viewer3D';
-import { PropertiesPanel } from './components/PropertiesPanel';
-import { GrammarPanel } from './components/GrammarPanel';
-import { HistoryPanel } from './components/HistoryPanel';
-import { TensegrityPanel } from './components/TensegrityPanel';
+import { ControlPanel } from './components/ControlPanel';
 import './App.css';
 
 export default function App() {
   return (
     <AppProvider>
       <div className="app">
-        <Toolbar />
+        <div className="toolbar">
+          <div className="toolbar-group toolbar-title">
+            <span className="app-title">Tensegrity Morphogenesis</span>
+          </div>
+        </div>
         <div className="main-content">
-          <div className="canvases-area">
-            <div className="canvases-row-top">
-              <FormCanvas />
-              <ForceCanvas />
-            </div>
-            <div className="canvases-row-bottom">
-              <Viewer3D />
-            </div>
+          <div className="viewer-area">
+            <Viewer3D />
           </div>
           <div className="sidebar">
-            <PropertiesPanel />
-            <GrammarPanel />
-            <TensegrityPanel />
-            <HistoryPanel />
+            <ControlPanel />
           </div>
         </div>
       </div>
