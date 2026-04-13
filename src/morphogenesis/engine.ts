@@ -1,15 +1,20 @@
 /**
- * Morphogenesis Engine: prism-based tensegrity generation.
+ * Cellular Morphogenesis Engine (Aloui, Orden, Rhode-Barbarigos 2019)
  *
- * Each cell is a 3-strut tensegrity prism:
- *   - 6 nodes (3 bottom + 3 top)
- *   - 3 struts (bottom[i] → top[i])
- *   - 9 cables (3 bottom ring + 3 top ring + 3 diagonals)
- *   - Each node has EXACTLY 1 strut → Class-1 within the cell
+ * Proper implementation of the paper's approach:
  *
- * Growth: stack new prism cells on the top face, or attach side-by-side.
- * Stacking creates shared nodes with 2 struts (Class-2 at interface).
- * For pure Class-1, cells are connected via cable-only bridges.
+ *   1. Build blocks = K₅ tensegrity cells (complete graph on 5 nodes, 10 edges)
+ *   2. ADHESION: add new cell sharing 3 or 4 nodes with existing structure.
+ *      Each cell contributes a new self-stress basis vector (Eq. 13 via nullspace).
+ *   3. FUSION: remove edges by LINEAR COMBINATION of self-stress basis vectors
+ *      so the target edge's force density becomes zero.
+ *      - Single edge: β = -w_existing[e] / w_new[e], always works (Appendix B).
+ *      - Multiple edges: geometric constraints on new node positions (Eqs 15-19).
+ *
+ * Triplex example from Section 5.1:
+ *   Cell 1 (ABCDE) + Cell 2 (BCDEF) → adhere → 2 basis vectors
+ *   Remove edges BD and CE (quadric constraint on E and F positions)
+ *   Result: 6 nodes, 12 edges Triplex with 1 self-stress state
  */
 
 import { Vec3, MorphogenesisState, StructureGraph, K5Cell } from './types';
@@ -27,7 +32,7 @@ export function createEmptyState(): MorphogenesisState {
   };
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────
+// ─── Basic helpers ───────────────────────────────────────────────
 
 function addNode(state: MorphogenesisState, pos: Vec3): number {
   const id = state.graph.nextNodeId++;
@@ -35,400 +40,421 @@ function addNode(state: MorphogenesisState, pos: Vec3): number {
   return id;
 }
 
-function addEdge(state: MorphogenesisState, a: number, b: number, type: 'strut' | 'cable', forceDensity: number): number {
-  const existing = state.graph.edges.find(e =>
+function nodePos(state: MorphogenesisState, id: number): Vec3 {
+  return state.graph.nodes.find(n => n.id === id)?.pos || [0, 0, 0];
+}
+
+function findEdge(state: MorphogenesisState, a: number, b: number) {
+  return state.graph.edges.find(e =>
     (e.n[0] === a && e.n[1] === b) || (e.n[0] === b && e.n[1] === a)
   );
-  if (existing) return existing.id;
+}
 
+function addOrGetEdge(state: MorphogenesisState, a: number, b: number): number {
+  const existing = findEdge(state, a, b);
+  if (existing) return existing.id;
   const id = state.graph.nextEdgeId++;
   state.graph.edges.push({
-    id, n: [a, b], type, forceDensity, typeLocked: true,
+    id, n: [a, b], type: 'cable', forceDensity: 0, typeLocked: false,
   });
   return id;
 }
 
-function nodePos(state: MorphogenesisState, id: number): Vec3 {
-  const n = state.graph.nodes.find(nd => nd.id === id);
-  return n ? n.pos : [0, 0, 0];
-}
-
-function compressionDegree(state: MorphogenesisState, nodeId: number): number {
-  return state.graph.edges.filter(e =>
-    e.type === 'strut' && (e.n[0] === nodeId || e.n[1] === nodeId)
-  ).length;
-}
-
-// ─── 3-Strut Prism Form-Finding ──────────────────────────────────
+// ─── K₅ Cell self-stress via equilibrium matrix nullspace ───────
 
 /**
- * Solve for the top ring positions of a 3-strut prism given bottom positions.
- * Uses the partitioned force density method with centroid constraint.
- *
- * Force densities: qStrut=-1, qRing=0.5, qDiag=1.0
+ * Given 5 points in general position, compute the self-stress axial forces
+ * from the nullspace of the equilibrium matrix. Returns 10 axial force values
+ * in the order: (0,1), (0,2), (0,3), (0,4), (1,2), (1,3), (1,4), (2,3), (2,4), (3,4).
  */
-function formFindPrismTop(
-  bottomPos: Vec3[],
-  targetHeight: number
-): Vec3[] | null {
-  const N = 3;
-  const qStrut = -1, qRing = 0.5, qDiag = 1.0;
+function computeK5Stress(points: Vec3[]): number[] | null {
+  if (points.length !== 5) return null;
 
-  // D (2N × 2N): 0..N-1 = bottom, N..2N-1 = top
-  const nN = 2 * N;
-  const L: number[][] = Array.from({ length: nN }, () => new Array(nN).fill(0));
-  const addQ = (i: number, j: number, q: number) => {
-    L[i][i] += q; L[j][j] += q; L[i][j] -= q; L[j][i] -= q;
-  };
-  for (let k = 0; k < N; k++) {
-    addQ(k, N + k, qStrut);             // strut b_k → t_k
-    addQ(k, (k + 1) % N, qRing);        // bottom ring
-    addQ(N + k, N + (k + 1) % N, qRing); // top ring
-    addQ(k, N + (k + 1) % N, qDiag);    // diagonal
+  // Edge pairs in order
+  const pairs: [number, number][] = [];
+  for (let i = 0; i < 5; i++) for (let j = i + 1; j < 5; j++) pairs.push([i, j]);
+
+  // Build equilibrium matrix A (3·5=15 rows × 10 cols)
+  const A: number[][] = Array.from({ length: 15 }, () => new Array(10).fill(0));
+  for (let e = 0; e < 10; e++) {
+    const [i, j] = pairs[e];
+    const dx = points[j][0] - points[i][0];
+    const dy = points[j][1] - points[i][1];
+    const dz = points[j][2] - points[i][2];
+    const len = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    if (len < 1e-15) return null;
+    const ux = dx / len, uy = dy / len, uz = dz / len;
+    A[3 * i][e] = ux; A[3 * i + 1][e] = uy; A[3 * i + 2][e] = uz;
+    A[3 * j][e] = -ux; A[3 * j + 1][e] = -uy; A[3 * j + 2][e] = -uz;
   }
 
-  // L_tt and L_tb
-  const L_tt: number[][] = Array.from({ length: N }, (_, i) =>
-    Array.from({ length: N }, (_, j) => L[N + i][N + j])
-  );
-  const L_tb: number[][] = Array.from({ length: N }, (_, i) =>
-    Array.from({ length: N }, (_, j) => L[N + i][j])
-  );
-
-  const bx = bottomPos.map(p => p[0]);
-  const by = bottomPos.map(p => p[1]);
-
-  const rhsX = new Array(N).fill(0), rhsY = new Array(N).fill(0);
-  for (let i = 0; i < N; i++) for (let j = 0; j < N; j++) {
-    rhsX[i] -= L_tb[i][j] * bx[j];
-    rhsY[i] -= L_tb[i][j] * by[j];
-  }
-
-  // Centroid constraint (L_tt singular): last row = [1,1,...,1], rhs = sum_centroid
-  const L_reg = L_tt.map(row => [...row]);
-  for (let j = 0; j < N; j++) L_reg[N - 1][j] = 1;
-  const cxSum = bx.reduce((s, v) => s + v, 0);
-  const cySum = by.reduce((s, v) => s + v, 0);
-  rhsX[N - 1] = cxSum;
-  rhsY[N - 1] = cySum;
-
-  const tx = solve(L_reg, rhsX);
-  const ty = solve(L_reg, rhsY);
-  if (!tx || !ty) return null;
-
-  // Bottom centroid z
-  const cz = bottomPos.reduce((s, p) => s + p[2], 0) / N;
-  return tx.map((x, i) => [x, ty[i], cz + targetHeight] as Vec3);
+  const basis = findNullspaceBasis(A);
+  if (basis.length === 0) return null;
+  return basis[0]; // axial forces t_i
 }
 
-// ─── Create a 3-Strut Prism Cell ─────────────────────────────────
+// ─── Adhesion: add K₅ cell sharing existing nodes ───────────────
 
-interface PrismCell {
+interface K5CellInfo {
   id: number;
-  bottomIds: number[];  // 3 node ids
-  topIds: number[];     // 3 node ids
-  strutEdgeIds: number[];
-  cableEdgeIds: number[];
+  nodeIds: number[];        // 5 node IDs in cell-local order
+  edgeIds: number[];        // 10 edge IDs in K₅-pair order
+  stressVector: number[];   // length = current total edges; sparse (zero outside this cell)
 }
 
 /**
- * Create a 3-strut prism cell with given bottom node IDs (must already exist)
- * and new top node positions (will be added).
+ * Create a K₅ cell sharing `sharedIds` (3 or 4) with existing structure.
+ * New nodes are added with positions from `newPositions`.
+ * Returns the cell or null if creation fails.
  */
-function createPrismCell(
+function adhereCell(
   state: MorphogenesisState,
-  bottomIds: number[],
-  topPositions: Vec3[]
-): PrismCell | null {
-  if (bottomIds.length !== 3 || topPositions.length !== 3) return null;
+  sharedIds: number[],
+  newPositions: Vec3[]
+): K5CellInfo | null {
+  if (sharedIds.length + newPositions.length !== 5) return null;
+  if (sharedIds.length < 3 || sharedIds.length > 4) return null;
 
-  // Add top nodes
-  const topIds = topPositions.map(p => addNode(state, p));
+  // Create new nodes
+  const newIds = newPositions.map(p => addNode(state, p));
+  const nodeIds = [...sharedIds, ...newIds];
+  const points = nodeIds.map(id => nodePos(state, id));
 
-  // Force densities matching the form-finding solution
-  const Q_STRUT = -1, Q_RING = 0.5, Q_DIAG = 1.0;
+  // Compute self-stress for the cell
+  const cellStress = computeK5Stress(points);
+  if (!cellStress) return null;
 
-  const strutEdgeIds: number[] = [];
-  const cableEdgeIds: number[] = [];
-
-  // Struts: b[i] → t[i]
-  for (let i = 0; i < 3; i++) {
-    strutEdgeIds.push(addEdge(state, bottomIds[i], topIds[i], 'strut', Q_STRUT));
-  }
-
-  // Bottom ring cables: b[i] → b[(i+1)%3]
-  for (let i = 0; i < 3; i++) {
-    cableEdgeIds.push(addEdge(state, bottomIds[i], bottomIds[(i + 1) % 3], 'cable', Q_RING));
-  }
-
-  // Top ring cables: t[i] → t[(i+1)%3]
-  for (let i = 0; i < 3; i++) {
-    cableEdgeIds.push(addEdge(state, topIds[i], topIds[(i + 1) % 3], 'cable', Q_RING));
-  }
-
-  // Diagonal cables: b[i] → t[(i+1)%3]
-  for (let i = 0; i < 3; i++) {
-    cableEdgeIds.push(addEdge(state, bottomIds[i], topIds[(i + 1) % 3], 'cable', Q_DIAG));
-  }
-
-  const cellId = state.nextCellId++;
-  return { id: cellId, bottomIds, topIds, strutEdgeIds, cableEdgeIds };
-}
-
-// ─── Seed: first prism ───────────────────────────────────────────
-
-function seedPrism(state: MorphogenesisState, radius: number = 1.5): PrismCell | null {
-  // 3 bottom nodes on a circle at z=0
-  const bottomPos: Vec3[] = [
-    [radius, 0, 0],
-    [radius * Math.cos(2 * Math.PI / 3), radius * Math.sin(2 * Math.PI / 3), 0],
-    [radius * Math.cos(4 * Math.PI / 3), radius * Math.sin(4 * Math.PI / 3), 0],
-  ];
-  const bottomIds = bottomPos.map(p => addNode(state, p));
-
-  // Form-find top positions
-  const topPos = formFindPrismTop(bottomPos, 2.0);
-  if (!topPos) return null;
-
-  return createPrismCell(state, bottomIds, topPos);
-}
-
-// ─── Adhere: new prism on top face ───────────────────────────────
-
-function adherePrism(
-  state: MorphogenesisState,
-  sharedIds: number[],  // 3 existing nodes that become the new cell's bottom
-  heightOffset: number,
-  directionSpread: number = 0
-): PrismCell | null {
-  if (sharedIds.length !== 3) return null;
-
-  const bottomPos = sharedIds.map(id => nodePos(state, id));
-
-  // Form-find top positions
-  const topPos = formFindPrismTop(bottomPos, heightOffset);
-  if (!topPos) return null;
-
-  // Add random spread for variety
-  if (directionSpread > 0) {
-    for (const p of topPos) {
-      p[0] += (Math.random() - 0.5) * directionSpread;
-      p[1] += (Math.random() - 0.5) * directionSpread;
+  // Create/get edges (10 K₅ edges)
+  const edgeIds: number[] = [];
+  for (let i = 0; i < 5; i++) {
+    for (let j = i + 1; j < 5; j++) {
+      edgeIds.push(addOrGetEdge(state, nodeIds[i], nodeIds[j]));
     }
   }
 
-  return createPrismCell(state, sharedIds, topPos);
+  // Build the cell's stress vector in the FULL edge-index space
+  const edgeIdxMap = new Map(state.graph.edges.map((e, i) => [e.id, i]));
+  const fullStress = new Array(state.graph.edges.length).fill(0);
+  for (let k = 0; k < 10; k++) {
+    const idx = edgeIdxMap.get(edgeIds[k]);
+    if (idx !== undefined) fullStress[idx] = cellStress[k];
+  }
+
+  // Extend ALL existing basis vectors to the new edge count (pad with zeros)
+  for (let b = 0; b < state.stressBasis.length; b++) {
+    while (state.stressBasis[b].length < state.graph.edges.length) {
+      state.stressBasis[b].push(0);
+    }
+  }
+
+  state.stressBasis.push(fullStress);
+
+  const cellId = state.nextCellId++;
+  state.cells.push({ id: cellId, nodeIds, edgeIds, selfStress: cellStress, signPattern: 'typeI' } as any);
+
+  return { id: cellId, nodeIds, edgeIds, stressVector: fullStress };
 }
 
-// ─── Auto-Grow: multiple prisms connected by cable bridges ──────
+// ─── Fusion: remove an edge via stress basis linear combination ─
 
 /**
- * Generate N prisms, each at a different position, connected by cables.
- * This preserves Class-1: no two struts share a node because prisms
- * do not share any nodes — they are connected only through cables.
+ * Remove edge `edgeId` via Gauss elimination on the stress basis.
  *
- * For multiple connected prisms, extra "bridge" cables link the
- * closest nodes between adjacent prisms. Force densities are then
- * recomputed from the full structure's equilibrium matrix nullspace.
+ * Algorithm:
+ *   1. Find all basis vectors with non-zero value at this edge (contributors)
+ *   2. Pick one as pivot (w₀ with value v₀)
+ *   3. For each other contributor wᵢ: wᵢ_new = wᵢ + (-vᵢ/v₀) × w₀
+ *      This zeros out the edge in all non-pivot contributors
+ *   4. Remove the pivot basis vector (its value at the edge was not zeroed)
+ *   5. Remove the edge from the graph
+ *
+ * Result: basis dimension decreases by 1, remaining vectors all have zero at the edge.
  */
+function fuseEdge(state: MorphogenesisState, edgeId: number): boolean {
+  const edgeIdx = state.graph.edges.findIndex(e => e.id === edgeId);
+  if (edgeIdx === -1) return false;
+
+  // Extend basis vectors to current edge count
+  for (const b of state.stressBasis) {
+    while (b.length < state.graph.edges.length) b.push(0);
+  }
+
+  // Find contributors
+  const contributors: number[] = [];
+  for (let b = 0; b < state.stressBasis.length; b++) {
+    if (Math.abs(state.stressBasis[b][edgeIdx]) > 1e-12) contributors.push(b);
+  }
+
+  if (contributors.length === 0) {
+    // Nothing to do for the basis; just remove the edge
+    removeEdgeFromBasis(state, edgeIdx, edgeId);
+    return true;
+  }
+
+  // Pick last contributor as pivot (so splicing doesn't affect earlier indices)
+  const pivotBasisIdx = contributors[contributors.length - 1];
+  const w0 = state.stressBasis[pivotBasisIdx];
+  const v0 = w0[edgeIdx];
+
+  // Zero out the edge in all non-pivot contributors via Gauss elimination
+  for (let i = 0; i < contributors.length - 1; i++) {
+    const ci = contributors[i];
+    const wi = state.stressBasis[ci];
+    const vi = wi[edgeIdx];
+    const beta = -vi / v0;
+    state.stressBasis[ci] = wi.map((val, k) => val + beta * w0[k]);
+  }
+
+  // Remove the pivot basis vector
+  state.stressBasis.splice(pivotBasisIdx, 1);
+
+  // Remove the edge
+  removeEdgeFromBasis(state, edgeIdx, edgeId);
+  return true;
+}
+
+function removeEdgeFromBasis(state: MorphogenesisState, edgeIdx: number, edgeId: number): void {
+  state.graph.edges.splice(edgeIdx, 1);
+  for (let b = 0; b < state.stressBasis.length; b++) {
+    state.stressBasis[b].splice(edgeIdx, 1);
+  }
+  // Remove from cell edge lists
+  for (const cell of state.cells) {
+    (cell as any).edgeIds = (cell as any).edgeIds.filter((id: number) => id !== edgeId);
+  }
+}
+
+// ─── Seed: first K₅ cell ────────────────────────────────────────
+
+function seedCell(state: MorphogenesisState, radius: number = 1.5): K5CellInfo | null {
+  // 5 points in general position (non-coplanar tetrahedron + apex)
+  const points: Vec3[] = [
+    [radius, 0, 0],
+    [-radius * 0.5, radius * 0.866, 0],
+    [-radius * 0.5, -radius * 0.866, 0],
+    [0, 0, radius * 1.5],
+    [0.3, 0.2, radius * 0.7],
+  ];
+
+  const nodeIds = points.map(p => addNode(state, p));
+  const cellStress = computeK5Stress(points);
+  if (!cellStress) return null;
+
+  const edgeIds: number[] = [];
+  for (let i = 0; i < 5; i++)
+    for (let j = i + 1; j < 5; j++)
+      edgeIds.push(addOrGetEdge(state, nodeIds[i], nodeIds[j]));
+
+  const fullStress = new Array(state.graph.edges.length).fill(0);
+  const edgeIdxMap = new Map(state.graph.edges.map((e, i) => [e.id, i]));
+  for (let k = 0; k < 10; k++) {
+    const idx = edgeIdxMap.get(edgeIds[k]);
+    if (idx !== undefined) fullStress[idx] = cellStress[k];
+  }
+
+  state.stressBasis.push(fullStress);
+  const cellId = state.nextCellId++;
+  state.cells.push({ id: cellId, nodeIds, edgeIds, selfStress: cellStress, signPattern: 'typeI' } as any);
+  return { id: cellId, nodeIds, edgeIds, stressVector: fullStress };
+}
+
+// ─── Auto-grow: adhesion + fusion sequence ──────────────────────
+
 export function autoGrow(
   state: MorphogenesisState,
   numCells: number,
   options: {
     baseRadius?: number;
-    layerHeight?: number;
     spread?: number;
     fuseProbability?: number;
     maxCompDeg?: number;
   } = {}
 ): boolean {
-  const {
-    baseRadius = 1.2,
-    spread = 0.3,
-  } = options;
+  const { baseRadius = 1.5, spread = 0.5, fuseProbability = 0.5 } = options;
 
-  // Create N prisms at different positions
-  for (let i = 0; i < numCells; i++) {
-    // Place each prism at a different location in 3D
-    // First cell at origin, subsequent cells offset
-    const angle = (2 * Math.PI * i) / Math.max(numCells, 1);
-    const r = i === 0 ? 0 : 3 + i * 0.8;
-    const cx = r * Math.cos(angle);
-    const cy = r * Math.sin(angle);
-    const cz = i * 0.4 * spread; // slight vertical stagger
+  if (state.cells.length === 0) {
+    if (!seedCell(state, baseRadius)) return false;
+  }
 
-    // Create bottom ring for this prism
-    const bottomPos: Vec3[] = [
-      [cx + baseRadius, cy, cz],
-      [cx + baseRadius * Math.cos(2 * Math.PI / 3), cy + baseRadius * Math.sin(2 * Math.PI / 3), cz],
-      [cx + baseRadius * Math.cos(4 * Math.PI / 3), cy + baseRadius * Math.sin(4 * Math.PI / 3), cz],
+  for (let step = 1; step < numCells; step++) {
+    const nodeIds = state.graph.nodes.map(n => n.id);
+    if (nodeIds.length < 4) break;
+
+    // Prefer RECENTLY added 4 nodes (end of list) for organic growth
+    // With some randomization
+    const recentIds = nodeIds.slice(-Math.min(8, nodeIds.length));
+    shuffleArray(recentIds);
+    const sharedIds = recentIds.slice(0, 4);
+
+    const sharedPos = sharedIds.map(id => nodePos(state, id));
+    const cx = sharedPos.reduce((s, p) => s + p[0], 0) / 4;
+    const cy = sharedPos.reduce((s, p) => s + p[1], 0) / 4;
+    const cz = sharedPos.reduce((s, p) => s + p[2], 0) / 4;
+
+    // Place new node offset from the shared face centroid
+    const r = 1.5 + Math.random() * 0.5;
+    const theta = Math.random() * Math.PI * 2;
+    const phi = Math.random() * Math.PI;
+    const newPos: Vec3 = [
+      cx + r * Math.sin(phi) * Math.cos(theta),
+      cy + r * Math.sin(phi) * Math.sin(theta),
+      cz + r * Math.cos(phi) + spread,
     ];
-    const bottomIds = bottomPos.map(p => addNode(state, p));
 
-    // Form-find top positions
-    const topPos = formFindPrismTop(bottomPos, 2.0);
-    if (!topPos) continue;
+    if (!isGeneralPos([...sharedPos, newPos])) continue;
 
-    const cell = createPrismCell(state, bottomIds, topPos);
+    const cell = adhereCell(state, sharedIds, [newPos]);
     if (!cell) continue;
-    state.cells.push(cell as any);
+
+    // Optional fusion: remove one shared K₄ edge to create interesting topology
+    if (Math.random() < fuseProbability) {
+      const sharedEdges: number[] = [];
+      for (let i = 0; i < 4; i++) {
+        for (let j = i + 1; j < 4; j++) {
+          const edge = findEdge(state, sharedIds[i], sharedIds[j]);
+          if (edge) sharedEdges.push(edge.id);
+        }
+      }
+      if (sharedEdges.length > 0) {
+        shuffleArray(sharedEdges);
+        fuseEdge(state, sharedEdges[0]);
+      }
+    }
   }
 
-  // Connect prisms with bridge cables (closest pairs between different prisms)
-  if (numCells > 1) {
-    connectPrismsWithCables(state);
-  }
-
-  // Recompute force densities from the full structure's nullspace
-  recomputeStressBasis(state);
-
+  assignTypesFromBasis(state);
   return state.cells.length > 0;
 }
 
 /**
- * Add cable bridges between separate prisms to form one connected structure.
- * Each pair of adjacent prisms gets 2-3 connecting cables between closest nodes.
+ * After all adhesion+fusion operations, assign strut/cable types based
+ * on the sign of force densities in a chosen linear combination of
+ * basis vectors. Uses the sum of basis vectors by default, then optionally
+ * flips signs to favor a target Class.
  */
-function connectPrismsWithCables(state: MorphogenesisState): void {
-  const cells = state.cells as any as PrismCell[];
+function assignTypesFromBasis(state: MorphogenesisState): void {
+  const { edges } = state.graph;
+  const m = edges.length;
+  if (m === 0 || state.stressBasis.length === 0) return;
 
-  for (let i = 0; i < cells.length; i++) {
-    for (let j = i + 1; j < cells.length; j++) {
-      const nodesA = [...cells[i].bottomIds, ...cells[i].topIds];
-      const nodesB = [...cells[j].bottomIds, ...cells[j].topIds];
-
-      // Find closest pair
-      let bestDist = Infinity, bestA = -1, bestB = -1;
-      for (const a of nodesA) {
-        for (const b of nodesB) {
-          const pa = nodePos(state, a), pb = nodePos(state, b);
-          const d = Math.sqrt((pa[0]-pb[0])**2 + (pa[1]-pb[1])**2 + (pa[2]-pb[2])**2);
-          if (d < bestDist) { bestDist = d; bestA = a; bestB = b; }
-        }
-      }
-
-      // Only connect if they are reasonably close (adjacent prisms)
-      if (bestDist < 6 && bestA !== -1) {
-        addEdge(state, bestA, bestB, 'cable', 0.5);
-
-        // Add second closest pair for stability
-        let bestD2 = Infinity, bestA2 = -1, bestB2 = -1;
-        for (const a of nodesA) {
-          for (const b of nodesB) {
-            if (a === bestA && b === bestB) continue;
-            const pa = nodePos(state, a), pb = nodePos(state, b);
-            const d = Math.sqrt((pa[0]-pb[0])**2 + (pa[1]-pb[1])**2 + (pa[2]-pb[2])**2);
-            if (d < bestD2) { bestD2 = d; bestA2 = a; bestB2 = b; }
-          }
-        }
-        if (bestA2 !== -1 && bestD2 < 6) {
-          addEdge(state, bestA2, bestB2, 'cable', 0.5);
-        }
-      }
-    }
-  }
-}
-
-// ─── Stress Basis + Force Density Recomputation ────────────────
-
-/**
- * Rebuild the stress basis from the equilibrium matrix and
- * assign force densities from a linear combination that matches
- * the locked strut/cable type assignment.
- */
-function recomputeStressBasis(state: MorphogenesisState): void {
-  const { nodes, edges } = state.graph;
-  if (edges.length === 0 || nodes.length === 0) return;
-
-  const m = edges.length, n = nodes.length;
-  const nodeIdx = new Map(nodes.map((nd, i) => [nd.id, i]));
-
-  // Build equilibrium matrix A (3n × m)
-  const A: number[][] = Array.from({ length: 3 * n }, () => new Array(m).fill(0));
+  // Compute edge lengths for q = t/L conversion
   const lengths = new Array(m).fill(1);
   for (let e = 0; e < m; e++) {
-    const [ni, nj] = edges[e].n;
-    const pi = nodes.find(nd => nd.id === ni)!;
-    const pj = nodes.find(nd => nd.id === nj)!;
-    const dx = pj.pos[0] - pi.pos[0];
-    const dy = pj.pos[1] - pi.pos[1];
-    const dz = pj.pos[2] - pi.pos[2];
-    const len = Math.sqrt(dx * dx + dy * dy + dz * dz);
-    if (len < 1e-12) continue;
-    lengths[e] = len;
-    const ii = nodeIdx.get(ni)!, ij = nodeIdx.get(nj)!;
-    A[3 * ii][e] = dx / len; A[3 * ii + 1][e] = dy / len; A[3 * ii + 2][e] = dz / len;
-    A[3 * ij][e] = -dx / len; A[3 * ij + 1][e] = -dy / len; A[3 * ij + 2][e] = -dz / len;
+    const [a, b] = edges[e].n;
+    const pa = nodePos(state, a), pb = nodePos(state, b);
+    const dx = pb[0] - pa[0], dy = pb[1] - pa[1], dz = pb[2] - pa[2];
+    lengths[e] = Math.sqrt(dx * dx + dy * dy + dz * dz);
   }
 
-  const basis = findNullspaceBasis(A);
-  state.stressBasis = basis;
-  if (basis.length === 0) return;
+  // Pad basis vectors to full edge count
+  for (const b of state.stressBasis) {
+    while (b.length < m) b.push(0);
+  }
 
-  // Find a linear combination α₁w₁ + α₂w₂ + ... that matches the type pattern:
-  // struts should have negative values, cables positive.
-  const k = basis.length;
+  // Try ±1 combinations of basis vectors; pick the one that maximizes
+  // the number of nodes with exactly 1 strut (Class-1 proximity)
+  const k = state.stressBasis.length;
+  const nTrials = k <= 10 ? (1 << k) : 500;
 
-  // Target sign pattern from locked types
-  const targetSigns = edges.map(e => e.type === 'strut' ? -1 : 1);
-
-  // Find best combination via random search (then sign-flip refinement)
-  let bestCoeffs = new Array(k).fill(0);
-  bestCoeffs[0] = 1;
+  let bestCombined: number[] = new Array(m).fill(0);
   let bestScore = -Infinity;
 
-  const scoreCombo = (coeffs: number[]): number => {
-    // Build combined stress vector
-    const t = new Array(m).fill(0);
-    for (let i = 0; i < k; i++) {
-      for (let e = 0; e < m; e++) t[e] += coeffs[i] * basis[i][e];
-    }
-    // Score: count edges where sign matches target (positive match) minus mismatches
-    let score = 0;
-    for (let e = 0; e < m; e++) {
-      const mag = Math.abs(t[e]);
-      if (mag < 1e-10) continue; // zero forces don't count either way
-      const sign = t[e] > 0 ? 1 : -1;
-      score += sign === targetSigns[e] ? mag : -mag;
-    }
-    return score;
-  };
+  const nodeIdxMap = new Map(state.graph.nodes.map((n, i) => [n.id, i]));
 
-  // Try all ±1 combinations for small k, random for large k
-  const numTrials = k <= 8 ? (1 << k) : 500;
-  for (let trial = 0; trial < numTrials; trial++) {
+  for (let trial = 0; trial < nTrials; trial++) {
     const coeffs = new Array(k);
-    if (k <= 8) {
+    if (k <= 10) {
       for (let i = 0; i < k; i++) coeffs[i] = ((trial >> i) & 1) ? 1 : -1;
     } else {
       for (let i = 0; i < k; i++) coeffs[i] = (Math.random() - 0.5) * 2;
     }
-    const s = scoreCombo(coeffs);
-    if (s > bestScore) { bestScore = s; bestCoeffs = [...coeffs]; }
-  }
 
-  // Build the final stress and convert to force densities (q = t / L)
-  const t = new Array(m).fill(0);
-  for (let i = 0; i < k; i++) {
-    for (let e = 0; e < m; e++) t[e] += bestCoeffs[i] * basis[i][e];
-  }
+    // Compute combined axial forces
+    const t = new Array(m).fill(0);
+    for (let i = 0; i < k; i++)
+      for (let e = 0; e < m; e++)
+        t[e] += coeffs[i] * state.stressBasis[i][e];
 
-  // Normalize the overall magnitude (scale so max |q| = 1)
-  let maxQ = 0;
-  for (let e = 0; e < m; e++) maxQ = Math.max(maxQ, Math.abs(t[e] / lengths[e]));
-  const scale = maxQ > 1e-12 ? 1 / maxQ : 1;
+    // For each edge, try both sign orientations (since flipping all signs
+    // gives a valid self-stress too)
+    for (const signFlip of [1, -1]) {
+      const strutCount = new Array(state.graph.nodes.length).fill(0);
+      const cableCount = new Array(state.graph.nodes.length).fill(0);
+      let nStruts = 0, nCables = 0;
+      for (let e = 0; e < m; e++) {
+        const q = signFlip * t[e] / lengths[e];
+        if (Math.abs(q) < 1e-10) continue;
+        const ai = nodeIdxMap.get(edges[e].n[0])!;
+        const bi = nodeIdxMap.get(edges[e].n[1])!;
+        if (q < 0) {
+          strutCount[ai]++; strutCount[bi]++; nStruts++;
+        } else {
+          cableCount[ai]++; cableCount[bi]++; nCables++;
+        }
+      }
 
-  for (let e = 0; e < m; e++) {
-    const q = (t[e] / lengths[e]) * scale;
-    edges[e].forceDensity = q;
-    // Update type based on ACTUAL sign (locked types may be overridden by math)
-    if (!edges[e].typeLocked) {
-      edges[e].type = q > 1e-10 ? 'cable' : q < -1e-10 ? 'strut' : edges[e].type;
+      if (nStruts === 0 || nCables === 0) continue; // must have both
+
+      // Score: strongly prefer every node has ≥1 strut; penalize cable-only
+      let score = 0;
+      for (let i = 0; i < strutCount.length; i++) {
+        const s = strutCount[i], c = cableCount[i];
+        if (s === 0 && c > 0) score -= 100; // cable-only node = forbidden
+        else if (s === 1) score += 10;
+        else if (s === 2) score += 3;
+        else if (s === 3) score += 1;
+        else if (s > 3) score -= 2 * (s - 3);
+      }
+      // Also prefer fewer struts overall
+      score -= nStruts * 0.1;
+
+      if (score > bestScore) {
+        bestScore = score;
+        bestCombined = t.map(v => v * signFlip);
+      }
     }
+  }
+
+  // Assign types from best combination
+  for (let e = 0; e < m; e++) {
+    const q = bestCombined[e] / lengths[e];
+    edges[e].forceDensity = q;
+    edges[e].type = q > 1e-10 ? 'cable' : q < -1e-10 ? 'strut' : 'cable';
+    edges[e].typeLocked = false;
   }
 }
 
-// ─── Verify ──────────────────────────────────────────────────────
+// ─── Utility ─────────────────────────────────────────────────────
+
+function isGeneralPos(points: Vec3[]): boolean {
+  // Check: no 4 points coplanar (det of 4×4 matrix ≠ 0)
+  for (let i = 0; i < points.length; i++) {
+    for (let j = i + 1; j < points.length; j++) {
+      for (let k = j + 1; k < points.length; k++) {
+        for (let l = k + 1; l < points.length; l++) {
+          const a = points[i], b = points[j], c = points[k], d = points[l];
+          const v1 = [b[0]-a[0], b[1]-a[1], b[2]-a[2]];
+          const v2 = [c[0]-a[0], c[1]-a[1], c[2]-a[2]];
+          const v3 = [d[0]-a[0], d[1]-a[1], d[2]-a[2]];
+          const det = v1[0]*(v2[1]*v3[2] - v2[2]*v3[1])
+                    - v1[1]*(v2[0]*v3[2] - v2[2]*v3[0])
+                    + v1[2]*(v2[0]*v3[1] - v2[1]*v3[0]);
+          if (Math.abs(det) < 1e-6) return false;
+        }
+      }
+    }
+  }
+  return true;
+}
+
+function shuffleArray<T>(arr: T[]): void {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+}
+
+// ─── Verification ────────────────────────────────────────────────
 
 export function verifyEquilibrium(
   nodes: { id: number; pos: Vec3 }[],
@@ -454,26 +480,21 @@ export function verifyEquilibrium(
   return maxRes;
 }
 
-// ─── Helpers for compatibility ───────────────────────────────────
+// ─── Legacy API for compatibility ───────────────────────────────
 
 export function seed(state: MorphogenesisState, _points: Vec3[]): boolean {
-  const cell = seedPrism(state, 1.5);
-  if (!cell) return false;
-  state.cells.push(cell as any);
-  recomputeStressBasis(state);
-  return true;
+  const ok = seedCell(state, 1.5);
+  if (ok) assignTypesFromBasis(state);
+  return !!ok;
 }
 
 export function grow(
   state: MorphogenesisState,
   sharedNodeIds: number[],
-  _newPositions: Vec3[],
-  _fuseEdgeId?: number
+  newPositions: Vec3[]
 ): boolean {
-  if (sharedNodeIds.length !== 3) return false;
-  const cell = adherePrism(state, sharedNodeIds, 1.8, 0.2);
+  const cell = adhereCell(state, sharedNodeIds, newPositions);
   if (!cell) return false;
-  state.cells.push(cell as any);
-  recomputeStressBasis(state);
+  assignTypesFromBasis(state);
   return true;
 }
