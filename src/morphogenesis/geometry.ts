@@ -1,5 +1,9 @@
 /**
- * 3D geometry primitives for tensegrity morphogenesis.
+ * 3D geometry primitives for cellular morphogenesis.
+ *
+ * The central quantity is the signed volume of a tetrahedron — the
+ * analytical self-stress of a K₅ cell (Eq.(13) of Aloui et al. 2019)
+ * is a ratio of such volumes.
  */
 
 import { Vec3 } from './types';
@@ -42,24 +46,29 @@ export function vdist(a: Vec3, b: Vec3): number {
 }
 
 /**
- * Signed volume of tetrahedron (P0, P1, P2, P3).
+ * F2.1 — Signed volume of a tetrahedron (P_i, P_j, P_k, P_l).
  *
- * V = (1/6) det | P1-P0  P2-P0  P3-P0 |
+ *   f(P_i, P_j, P_k, P_l) = (1/6) * det | 1  x_i  y_i  z_i |
+ *                                       | 1  x_j  y_j  z_j |
+ *                                       | 1  x_k  y_k  z_k |
+ *                                       | 1  x_l  y_l  z_l |
  *
- * This is the fundamental quantity for K₅ self-stress computation
- * (Equation 13 in Aloui et al. 2019).
+ * This is the building block of the K₅ self-stress in Eq.(13).
  */
-export function signedTetraVolume(p0: Vec3, p1: Vec3, p2: Vec3, p3: Vec3): number {
-  const a = vsub(p1, p0);
-  const b = vsub(p2, p0);
-  const c = vsub(p3, p0);
+export function vol(pi: Vec3, pj: Vec3, pk: Vec3, pl: Vec3): number {
+  const a = vsub(pj, pi);
+  const b = vsub(pk, pi);
+  const c = vsub(pl, pi);
   return vdot(a, vcross(b, c)) / 6;
 }
 
+/** Alias retained for call-sites that already use `signedTetraVolume`. */
+export const signedTetraVolume = vol;
+
 /**
- * Check general position: no 4 points are coplanar.
- * For 5 points, check all C(5,4) = 5 subsets of 4 points.
- * Returns true if ALL subsets have non-zero volume (general position).
+ * General-position test: for 5 points, every 4-subset must have
+ * non-zero tetrahedral volume. This is the pre-condition for a
+ * unique 1D self-stress on K₅.
  */
 export function isGeneralPosition(points: Vec3[], eps: number = 1e-10): boolean {
   const n = points.length;
@@ -67,8 +76,7 @@ export function isGeneralPosition(points: Vec3[], eps: number = 1e-10): boolean 
     for (let j = i + 1; j < n; j++) {
       for (let k = j + 1; k < n; k++) {
         for (let l = k + 1; l < n; l++) {
-          const vol = Math.abs(signedTetraVolume(points[i], points[j], points[k], points[l]));
-          if (vol < eps) return false;
+          if (Math.abs(vol(points[i], points[j], points[k], points[l])) < eps) return false;
         }
       }
     }

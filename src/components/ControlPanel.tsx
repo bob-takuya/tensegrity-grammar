@@ -10,24 +10,30 @@ export function ControlPanel() {
   const [adhesionAttempts, setAdhesionAttempts] = useState(6);
 
   const { morpho } = state;
-  const nNodes = morpho.graph.nodes.length;
-  const nEdges = morpho.graph.edges.length;
+  const nNodes = morpho.nodes.length;
+  const nMembers = morpho.members.length;
   const nCells = morpho.cells.length;
-  const nStruts = morpho.graph.edges.filter(e => e.type === 'strut').length;
-  const nCables = morpho.graph.edges.filter(e => e.type === 'cable').length;
-  const stressDim = morpho.stressBasis.length;
-  const actualMaxComp = nNodes > 0 ? Math.max(...morpho.graph.nodes.map(n =>
-    morpho.graph.edges.filter(e => e.type === 'strut' && (e.n[0] === n.id || e.n[1] === n.id)).length
+  const nStruts = morpho.members.filter(m => m.type === 'strut').length;
+  const nCables = morpho.members.filter(m => m.type === 'cable').length;
+  const stressDim = morpho.selfStressStates.length;
+  const actualMaxComp = nNodes > 0 ? Math.max(...morpho.nodes.map(n =>
+    morpho.members.filter(m =>
+      m.type === 'strut' && (m.node_a === n.node_id || m.node_b === n.node_id)
+    ).length
   )) : 0;
+  const nRegularCells = morpho.cells.filter(c => c.cell_type === 'regular').length;
+  const nVirtualCells = morpho.cells.filter(c => c.cell_type === 'virtual').length;
+  const nFusedCells  = morpho.cells.filter(c => c.cell_type === 'fused').length;
+  const nSteps = morpho.morphogenesisSteps.length;
 
   return (
     <div className="control-panel">
-      <h3>Tensegrity Morphogenesis</h3>
+      <h3>Cellular Morphogenesis</h3>
 
       <p className="hint-text">
         K₅ cellular morphogenesis (Aloui et al. 2019).
         Each cell = complete graph on 5 nodes with
-        guaranteed self-stress.
+        guaranteed 1D self-stress space.
       </p>
 
       <div className="control-section">
@@ -47,14 +53,14 @@ export function ControlPanel() {
           <label>K₅ adhesion attempts<span className="param-value">{adhesionAttempts}</span></label>
           <input type="range" min={0} max={20} step={1} value={adhesionAttempts}
             onChange={e => setAdhesionAttempts(parseInt(e.target.value))} />
-          <div className="param-hint">Glue K₅ cells onto 3–4 existing nodes; accepted only if Class-k holds.</div>
+          <div className="param-hint">Glue K₅ cells onto 3–4 existing nodes.</div>
         </div>
 
         <div className="param-group">
           <label>Fusion rate<span className="param-value">{(fuseProbability * 100).toFixed(0)}%</span></label>
           <input type="range" min={0} max={0.5} step={0.05} value={fuseProbability}
             onChange={e => setFuseProbability(parseFloat(e.target.value))} />
-          <div className="param-hint">Remove zero-force edges using nullspace freedom.</div>
+          <div className="param-hint">Remove members using nullspace freedom.</div>
         </div>
 
         <div className="param-group">
@@ -86,10 +92,19 @@ export function ControlPanel() {
           <div className="stat-grid">
             <div className="stat"><span className="stat-label">Cells</span><span className="stat-value">{nCells}</span></div>
             <div className="stat"><span className="stat-label">Nodes</span><span className="stat-value">{nNodes}</span></div>
+            <div className="stat"><span className="stat-label">Members</span><span className="stat-value">{nMembers}</span></div>
             <div className="stat"><span className="stat-label">Struts</span><span className="stat-value strut-color">{nStruts}</span></div>
             <div className="stat"><span className="stat-label">Cables</span><span className="stat-value cable-color">{nCables}</span></div>
-            <div className="stat"><span className="stat-label">Stress dim</span><span className="stat-value">{stressDim}</span></div>
+            <div className="stat"><span className="stat-label">dim W</span><span className="stat-value">{stressDim}</span></div>
             <div className="stat"><span className="stat-label">Class</span><span className="stat-value">{actualMaxComp}</span></div>
+            <div className="stat"><span className="stat-label">Steps</span><span className="stat-value">{nSteps}</span></div>
+          </div>
+
+          <h4>Cell types</h4>
+          <div className="stat-grid">
+            <div className="stat"><span className="stat-label">Regular</span><span className="stat-value">{nRegularCells}</span></div>
+            <div className="stat"><span className="stat-label">Virtual</span><span className="stat-value">{nVirtualCells}</span></div>
+            <div className="stat"><span className="stat-label">Fused</span><span className="stat-value">{nFusedCells}</span></div>
           </div>
 
           <div className="tensegrity-status valid" style={{ marginTop: 8 }}>
@@ -102,27 +117,27 @@ export function ControlPanel() {
       <div className="info-section">
         <h4>Operations</h4>
         <div className="fg-rules-info">
-          <div className="fg-rule"><b>SEED</b> — K₅ cell (5 nodes, 10 edges, 4 struts + 6 cables)</div>
-          <div className="fg-rule"><b>ADHESION</b> — attach K₅ cell sharing 3 nodes</div>
-          <div className="fg-rule"><b>1-EDGE FUSION</b> — remove edge (β-adjustment, always works)</div>
-          <div className="fg-rule"><b>2-EDGE FUSION</b> — plane or quadric constraint</div>
+          <div className="fg-rule"><b>INIT</b> — seed K₅ cell (5 nodes, 10 members)</div>
+          <div className="fg-rule"><b>ADHESION</b> — new K₅ sharing 3/4 nodes, Δdim W = Δe − 3Δv</div>
+          <div className="fg-rule"><b>FUSION (1-edge)</b> — linear recombination, dim W −= 1</div>
+          <div className="fg-rule"><b>FUSION (2-edge)</b> — plane (Eq.15) or quadric (Eq.18)</div>
         </div>
       </div>
 
-      {nCells > 0 && state.selectedEdgeIds.length > 0 && (
+      {nCells > 0 && state.selectedMemberIds.length > 0 && (
         <div className="selection-section">
           <h4>Selected</h4>
-          <p className="hint-text">{state.selectedEdgeIds.length} edge(s) selected</p>
-          {state.selectedEdgeIds.length === 1 && (
+          <p className="hint-text">{state.selectedMemberIds.length} member(s) selected</p>
+          {state.selectedMemberIds.length === 1 && (
             <button className="fuse-btn"
-              onClick={() => dispatch({ type: 'FUSE_EDGE', edgeId: state.selectedEdgeIds[0] })}>
-              Fuse (remove) selected edge
+              onClick={() => dispatch({ type: 'FUSE_MEMBER', memberId: state.selectedMemberIds[0] })}>
+              Fuse (remove) selected member
             </button>
           )}
-          {state.selectedEdgeIds.length === 2 && (
+          {state.selectedMemberIds.length === 2 && (
             <button className="fuse-btn"
-              onClick={() => dispatch({ type: 'FUSE_TWO_EDGES', edgeId1: state.selectedEdgeIds[0], edgeId2: state.selectedEdgeIds[1] })}>
-              Fuse 2 edges (constraint solve)
+              onClick={() => dispatch({ type: 'FUSE_TWO_MEMBERS', memberId1: state.selectedMemberIds[0], memberId2: state.selectedMemberIds[1] })}>
+              Fuse 2 members (constraint solve)
             </button>
           )}
         </div>
