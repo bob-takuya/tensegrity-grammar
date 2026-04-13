@@ -1,12 +1,12 @@
 import { AppState, AppAction } from '../types';
-import { createEmptyState, autoGrow } from '../morphogenesis/engine';
-import { fuseOneEdge, executeTwoEdgeFusion } from '../morphogenesis/fusion';
+import { createEmptyState, autoGrow, assignForceDensities } from '../morphogenesis/engine';
+import { fuseOneEdge, fuseTwoEdges } from '../morphogenesis/fusion';
 
 export function createInitialState(): AppState {
   return {
     morpho: createEmptyState(),
     selectedNodeIds: [],
-    selectedEdgeIds: [],
+    selectedMemberIds: [],
   };
 }
 
@@ -20,34 +20,40 @@ export function appReducer(state: AppState, action: AppAction): AppState {
         maxCompDeg: action.maxCompDeg,
         adhesionAttempts: action.adhesionAttempts,
       });
-      return { ...state, morpho, selectedNodeIds: [], selectedEdgeIds: [] };
+      return {
+        ...state,
+        morpho,
+        selectedNodeIds: [],
+        selectedMemberIds: [],
+      };
     }
 
     case 'CLEAR':
       return createInitialState();
 
     case 'SELECT_NODES':
-      return { ...state, selectedNodeIds: action.ids, selectedEdgeIds: [] };
+      return { ...state, selectedNodeIds: action.ids, selectedMemberIds: [] };
 
-    case 'SELECT_EDGES':
-      return { ...state, selectedEdgeIds: action.ids, selectedNodeIds: [] };
+    case 'SELECT_MEMBERS':
+      return { ...state, selectedMemberIds: action.ids, selectedNodeIds: [] };
 
-    case 'FUSE_EDGE': {
-      // Clone morpho state for immutability
+    case 'FUSE_MEMBER': {
       const morpho = JSON.parse(JSON.stringify(state.morpho));
-      fuseOneEdge(morpho, action.edgeId);
-      return { ...state, morpho, selectedEdgeIds: [] };
+      fuseOneEdge(morpho, action.memberId);
+      assignForceDensities(morpho);
+      return { ...state, morpho, selectedMemberIds: [] };
     }
 
-    case 'FUSE_TWO_EDGES': {
+    case 'FUSE_TWO_MEMBERS': {
       const morpho = JSON.parse(JSON.stringify(state.morpho));
-      executeTwoEdgeFusion(morpho, action.edgeId1, action.edgeId2);
-      return { ...state, morpho, selectedEdgeIds: [] };
+      fuseTwoEdges(morpho, action.memberId1, action.memberId2);
+      assignForceDensities(morpho);
+      return { ...state, morpho, selectedMemberIds: [] };
     }
 
     case 'UNDO':
     case 'REDO':
-      return state; // TODO
+      return state;
 
     default:
       return state;

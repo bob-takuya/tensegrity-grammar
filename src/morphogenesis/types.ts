@@ -1,64 +1,130 @@
 /**
- * Data types for Cellular Morphogenesis engine.
+ * Cellular Morphogenesis — Data Schema
  *
  * Based on: Aloui, Orden, Rhode-Barbarigos (2019)
  * "Cellular morphogenesis of three-dimensional tensegrity structures"
+ *
+ * This module defines the relational schema for the morphogenesis engine
+ * as a set of in-memory "tables". Each table corresponds to an entity in
+ * the specification; many-to-many links are modelled as explicit join rows
+ * so the state can be serialised, diffed, and step-traced.
+ *
+ * Tables:
+ *   NODE              — 3D vertex positions
+ *   MEMBER            — undirected struts/cables/candidates
+ *   CELL              — K₅ cells (regular / virtual / fused)
+ *   CELL_MEMBER       — cell ↔ member join
+ *   CELL_ADJACENCY    — edges of G_c (morphogenesis graph)
+ *   SELF_STRESS_STATE — columns of W (self-stress basis)
+ *   SELF_STRESS_ENTRY — sparse (state, member, w_value) triples
+ *   MORPHOGENESIS_STEP— journal of adhesion / fusion operations
+ *   REMOVED_MEMBER    — members dropped during a fusion step
  */
 
 // ─── Geometry ────────────────────────────────────────────────────
 
 export type Vec3 = [number, number, number];
 
-// ─── Structure Graph G(V, E) ─────────────────────────────────────
+// ─── Enumerated types ────────────────────────────────────────────
 
-export interface MNode {
-  id: number;
-  pos: Vec3;
+export type MemberType = 'strut' | 'cable' | 'candidate';
+export type CellType   = 'regular' | 'virtual' | 'fused';
+export type Operation  = 'init' | 'adhesion' | 'fusion';
+
+// ─── NODE ────────────────────────────────────────────────────────
+
+export interface NodeRow {
+  node_id: number;  // PK
+  x: number;
+  y: number;
+  z: number;
 }
 
-export interface MEdge {
-  id: number;
-  n: [number, number];        // node ids
-  type: 'strut' | 'cable' | 'unassigned';
-  forceDensity: number;        // w_ij: positive = tension, negative = compression
-  typeLocked: boolean;         // true if set by Type II assignment (don't override)
+// ─── MEMBER ──────────────────────────────────────────────────────
+
+export interface MemberRow {
+  member_id: number;            // PK
+  node_a: number;               // FK → NODE, node_a < node_b
+  node_b: number;               // FK → NODE
+  type: MemberType;             // strut / cable / candidate
+  force_density: number | null; // q_ij = w_ij / ||p_i - p_j|| (null until a w* is chosen)
 }
 
-export interface StructureGraph {
-  nodes: MNode[];
-  edges: MEdge[];
-  nextNodeId: number;
-  nextEdgeId: number;
+// ─── CELL ────────────────────────────────────────────────────────
+
+export interface CellRow {
+  cell_id: number;               // PK
+  cell_type: CellType;           // regular / virtual / fused
+  step_created: number;          // FK → MORPHOGENESIS_STEP
+  node_ids: number[];            // 5 node_ids that span this K₅
 }
 
-// ─── K₅ Cell ─────────────────────────────────────────────────────
+// ─── CELL_MEMBER (join) ─────────────────────────────────────────
 
-export interface K5Cell {
-  id: number;
-  nodeIds: number[];           // always 5 nodes
-  edgeIds: number[];           // always 10 edges (K₅ complete graph)
-  selfStress: number[];        // force density vector (10 entries, one per edge)
-  signPattern: 'typeI' | 'typeII';  // 6+/4− or 4+/6−
+export interface CellMemberRow {
+  cell_id: number;               // FK → CELL
+  member_id: number;             // FK → MEMBER
 }
 
-// ─── Morphogenesis Graph Gc(Vc, Ec) ──────────────────────────────
+// ─── CELL_ADJACENCY ─────────────────────────────────────────────
 
-export interface CellBoundary {
-  cells: [number, number];     // cell ids
-  sharedEdges: number[];       // edge ids shared between the two cells
+export interface CellAdjacencyRow {
+  cell_i: number;                // FK → CELL
+  cell_j: number;                // FK → CELL
+  shared_members: number[];      // list of member_ids shared by both cells
 }
+
+// ─── SELF_STRESS_STATE ──────────────────────────────────────────
+
+export interface SelfStressStateRow {
+  state_id: number;              // PK; column index in W
+  cell_id: number | null;        // FK → CELL; null when state is a linear combination
+}
+
+// ─── SELF_STRESS_ENTRY (sparse W) ───────────────────────────────
+
+export interface SelfStressEntryRow {
+  state_id: number;              // FK → SELF_STRESS_STATE
+  member_id: number;             // FK → MEMBER
+  w_value: number;               // W_{e,k}
+}
+
+// ─── MORPHOGENESIS_STEP ─────────────────────────────────────────
+
+export interface MorphogenesisStepRow {
+  step_id: number;               // PK
+  operation: Operation;          // init / adhesion / fusion
+  delta_e: number;               // added members this step
+  delta_v: number;               // added nodes this step
+  delta_dim_W_predicted: number; // Corollary: e_i - 3 v_i
+  delta_dim_W_actual: number;    // columns of W actually added
+}
+
+// ─── REMOVED_MEMBER ─────────────────────────────────────────────
+
+export interface RemovedMemberRow {
+  step_id: number;               // FK → MORPHOGENESIS_STEP
+  member_id: number;             // FK → MEMBER (member prior to removal)
+}
+
+// ─── Aggregate state ────────────────────────────────────────────
 
 export interface MorphogenesisState {
-  graph: StructureGraph;
-  cells: K5Cell[];
-  boundaries: CellBoundary[];
-  stressBasis: number[][];     // each column is a self-stress basis vector
-  nextCellId: number;
-  history: HistoryEntry[];
-  historyIndex: number;
-}
+  // Tables
+  nodes: NodeRow[];
+  members: MemberRow[];
+  cells: CellRow[];
+  cellMembers: CellMemberRow[];
+  cellAdjacency: CellAdjacencyRow[];
+  selfStressStates: SelfStressStateRow[];
+  selfStressEntries: SelfStressEntryRow[];
+  morphogenesisSteps: MorphogenesisStepRow[];
+  removedMembers: RemovedMemberRow[];
 
-export interface HistoryEntry {
-  label: string;
-  snapshot: string;  // JSON serialized state (without history)
+  // Auto-increment counters
+  nextNodeId: number;
+  nextMemberId: number;
+  nextCellId: number;
+  nextStateId: number;
+  nextStepId: number;
 }

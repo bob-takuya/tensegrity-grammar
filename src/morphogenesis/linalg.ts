@@ -1,14 +1,27 @@
 /**
- * Minimal linear algebra for K₅ morphogenesis engine.
+ * Minimal linear algebra for the cellular morphogenesis engine.
+ *
+ * The spec (F2.3 / F2.4) requires two primitives:
+ *   - buildA(nodes, members) — equilibrium matrix A
+ *   - nullspace(A, tol)      — basis of ker A (self-stress space W)
+ *
+ * Both are implemented with a small dense-matrix RREF and are exact
+ * enough for the K₅-scale problems the algorithm manipulates.
  */
 
-/** Gaussian elimination with partial pivoting for square systems. */
+import { NodeRow, MemberRow } from './types';
+
+// ─── Gaussian elimination primitives ─────────────────────────────
+
+/** Gaussian elimination with partial pivoting on a square system. */
 function gaussianElimination(A: number[][], b: number[]): number[] | null {
   const n = A.length;
   const aug: number[][] = A.map((row, i) => [...row, b[i]]);
   for (let col = 0; col < n; col++) {
     let maxVal = Math.abs(aug[col][col]), maxRow = col;
-    for (let r = col + 1; r < n; r++) if (Math.abs(aug[r][col]) > maxVal) { maxVal = Math.abs(aug[r][col]); maxRow = r; }
+    for (let r = col + 1; r < n; r++) {
+      if (Math.abs(aug[r][col]) > maxVal) { maxVal = Math.abs(aug[r][col]); maxRow = r; }
+    }
     if (maxVal < 1e-12) return null;
     if (maxRow !== col) [aug[col], aug[maxRow]] = [aug[maxRow], aug[col]];
     for (let r = col + 1; r < n; r++) {
@@ -26,19 +39,31 @@ function gaussianElimination(A: number[][], b: number[]): number[] | null {
   return x;
 }
 
+/** Solve A x = b for any shape. Square → direct; tall → LS; wide → min-norm. */
 export function solve(A: number[][], b: number[]): number[] | null {
   const m = A.length, n = A[0].length;
   if (m === n) return gaussianElimination(A, b);
   if (m > n) {
-    // Least squares
     const AtA: number[][] = Array.from({ length: n }, () => new Array(n).fill(0));
     const Atb = new Array(n).fill(0);
-    for (let i = 0; i < n; i++) { for (let j = 0; j < n; j++) { let s = 0; for (let k = 0; k < m; k++) s += A[k][i] * A[k][j]; AtA[i][j] = s; } for (let k = 0; k < m; k++) Atb[i] += A[k][i] * b[k]; }
+    for (let i = 0; i < n; i++) {
+      for (let j = 0; j < n; j++) {
+        let s = 0;
+        for (let k = 0; k < m; k++) s += A[k][i] * A[k][j];
+        AtA[i][j] = s;
+      }
+      for (let k = 0; k < m; k++) Atb[i] += A[k][i] * b[k];
+    }
     return gaussianElimination(AtA, Atb);
   }
-  // Under-determined: min-norm
   const AAt: number[][] = Array.from({ length: m }, () => new Array(m).fill(0));
-  for (let i = 0; i < m; i++) for (let j = 0; j < m; j++) { let s = 0; for (let k = 0; k < n; k++) s += A[i][k] * A[j][k]; AAt[i][j] = s; }
+  for (let i = 0; i < m; i++) {
+    for (let j = 0; j < m; j++) {
+      let s = 0;
+      for (let k = 0; k < n; k++) s += A[i][k] * A[j][k];
+      AAt[i][j] = s;
+    }
+  }
   const y = gaussianElimination(AAt, b);
   if (!y) return null;
   const x = new Array(n).fill(0);
@@ -46,29 +71,74 @@ export function solve(A: number[][], b: number[]): number[] | null {
   return x;
 }
 
+// ─── F2.3 — build_A(nodes, members) ──────────────────────────────
+
 /**
- * Find all nullspace basis vectors of A (any shape).
+ * Build the equilibrium matrix A of size (3 |V|) × |E|.
+ *
+ *   A_{3i+d, e} = (p_i - p_j)_d / ||p_i - p_j||    (node i)
+ *                  and the negation at node j
+ *
+ * The columns of A span the space of resolvable member forces; the
+ * self-stress space is W = ker A.
+ *
+ * @returns { A, nodeIndex }
+ *   nodeIndex maps node_id → row block index i so callers can index into A.
  */
-export function findNullspaceBasis(A: number[][]): number[][] {
+export function buildEquilibriumMatrix(
+  nodes: NodeRow[],
+  members: MemberRow[],
+): { A: number[][]; nodeIndex: Map<number, number>; lengths: number[] } {
+  const n = nodes.length;
+  const m = members.length;
+  const nodeIndex = new Map<number, number>();
+  nodes.forEach((nd, i) => nodeIndex.set(nd.node_id, i));
+
+  const A: number[][] = Array.from({ length: 3 * n }, () => new Array(m).fill(0));
+  const lengths = new Array(m).fill(1);
+
+  for (let e = 0; e < m; e++) {
+    const mem = members[e];
+    const i = nodeIndex.get(mem.node_a);
+    const j = nodeIndex.get(mem.node_b);
+    if (i === undefined || j === undefined) continue;
+    const pi = nodes[i], pj = nodes[j];
+    const dx = pj.x - pi.x, dy = pj.y - pi.y, dz = pj.z - pi.z;
+    const len = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    if (len < 1e-12) continue;
+    lengths[e] = len;
+    A[3 * i + 0][e] =  dx / len; A[3 * i + 1][e] =  dy / len; A[3 * i + 2][e] =  dz / len;
+    A[3 * j + 0][e] = -dx / len; A[3 * j + 1][e] = -dy / len; A[3 * j + 2][e] = -dz / len;
+  }
+  return { A, nodeIndex, lengths };
+}
+
+// ─── F2.4 — nullspace(A, tol) ────────────────────────────────────
+
+/**
+ * Basis of the null space of A, via RREF with relative pivot tolerance.
+ * Returns a list of basis vectors (length = number of columns of A).
+ */
+export function nullspace(A: number[][], tol?: number): number[][] {
+  if (A.length === 0 || A[0].length === 0) return [];
   const m = A.length, n = A[0].length;
   const M: number[][] = A.map(row => [...row]);
 
-  // Relative pivot tolerance: avoid promoting round-off from fill-in
-  // into a spurious pivot, which would overestimate the rank and
-  // miss genuine nullspace directions.
   let absMax = 0;
   for (let i = 0; i < m; i++) for (let j = 0; j < n; j++) {
     const v = Math.abs(A[i][j]);
     if (v > absMax) absMax = v;
   }
-  const tol = Math.max(1e-12, absMax * 1e-9);
+  const pivotTol = tol ?? Math.max(1e-12, absMax * 1e-9);
 
   const pivotCols: number[] = [];
   let row = 0;
   for (let col = 0; col < n && row < m; col++) {
     let maxVal = 0, maxRow = row;
-    for (let r = row; r < m; r++) if (Math.abs(M[r][col]) > maxVal) { maxVal = Math.abs(M[r][col]); maxRow = r; }
-    if (maxVal < tol) continue;
+    for (let r = row; r < m; r++) {
+      if (Math.abs(M[r][col]) > maxVal) { maxVal = Math.abs(M[r][col]); maxRow = r; }
+    }
+    if (maxVal < pivotTol) continue;
     [M[row], M[maxRow]] = [M[maxRow], M[row]];
     for (let r = 0; r < m; r++) {
       if (r === row) continue;
@@ -98,3 +168,6 @@ export function findNullspaceBasis(A: number[][]): number[][] {
   }
   return basis;
 }
+
+/** Legacy alias used by older call-sites. */
+export const findNullspaceBasis = nullspace;

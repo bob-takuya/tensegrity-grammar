@@ -1,7 +1,6 @@
 import React, { useRef, useEffect, useState } from 'react';
 import * as THREE from 'three';
 import { useAppState } from '../state/context';
-import { MorphogenesisState, MNode, MEdge } from '../morphogenesis/types';
 
 export function Viewer3D() {
   const { state, dispatch } = useAppState();
@@ -84,32 +83,32 @@ export function Viewer3D() {
       if (obj instanceof THREE.Mesh) { obj.geometry.dispose(); if (Array.isArray(obj.material)) obj.material.forEach(m => m.dispose()); else obj.material.dispose(); }
     });
 
-    const { graph } = state.morpho;
-    const nodeMap = new Map(graph.nodes.map(n => [n.id, n]));
+    const morpho = state.morpho;
+    const nodeMap = new Map(morpho.nodes.map(n => [n.node_id, n]));
     const selectedNodes = new Set(state.selectedNodeIds);
-    const selectedEdges = new Set(state.selectedEdgeIds);
+    const selectedEdges = new Set(state.selectedMemberIds);
 
     // Materials
     const strutMat = new THREE.MeshStandardMaterial({ color: 0x607d8b, roughness: 0.4, metalness: 0.3 });
     const cableMat = new THREE.MeshStandardMaterial({ color: 0xff5722, roughness: 0.3, metalness: 0.1 });
     const selectedMat = new THREE.MeshStandardMaterial({ color: 0xffeb3b, roughness: 0.3, emissive: 0x333300 });
 
-    // Edges
-    for (const edge of graph.edges) {
-      const a = nodeMap.get(edge.n[0]), b = nodeMap.get(edge.n[1]);
+    // Members
+    for (const member of morpho.members) {
+      const a = nodeMap.get(member.node_a), b = nodeMap.get(member.node_b);
       if (!a || !b) continue;
 
-      const start = new THREE.Vector3(a.pos[0], a.pos[2], -a.pos[1]); // y→z, z→y
-      const end = new THREE.Vector3(b.pos[0], b.pos[2], -b.pos[1]);
+      const start = new THREE.Vector3(a.x, a.z, -a.y); // y→z, z→y
+      const end = new THREE.Vector3(b.x, b.z, -b.y);
       const mid = new THREE.Vector3().addVectors(start, end).multiplyScalar(0.5);
       const dir = new THREE.Vector3().subVectors(end, start);
       const len = dir.length();
       if (len < 1e-6) continue;
 
-      const isSelected = selectedEdges.has(edge.id);
-      const mat = isSelected ? selectedMat.clone() : (edge.type === 'strut' ? strutMat.clone() : cableMat.clone());
+      const isSelected = selectedEdges.has(member.member_id);
+      const mat = isSelected ? selectedMat.clone() : (member.type === 'strut' ? strutMat.clone() : cableMat.clone());
 
-      if (edge.type === 'strut') {
+      if (member.type === 'strut') {
         // Thick cylinder for struts
         const geo = new THREE.CylinderGeometry(0.04, 0.04, len, 8);
         geo.rotateZ(Math.PI / 2);
@@ -119,7 +118,7 @@ export function Viewer3D() {
         q.setFromUnitVectors(new THREE.Vector3(1, 0, 0), dir.clone().normalize());
         mesh.quaternion.copy(q);
         mesh.castShadow = true;
-        mesh.userData = { isStructure: true, edgeId: edge.id };
+        mesh.userData = { isStructure: true, memberId: member.member_id };
         scene.add(mesh);
       } else {
         // Thin line for cables
@@ -130,34 +129,34 @@ export function Viewer3D() {
         const q = new THREE.Quaternion();
         q.setFromUnitVectors(new THREE.Vector3(1, 0, 0), dir.clone().normalize());
         mesh.quaternion.copy(q);
-        mesh.userData = { isStructure: true, edgeId: edge.id };
+        mesh.userData = { isStructure: true, memberId: member.member_id };
         scene.add(mesh);
       }
     }
 
     // Nodes
     const nodeGeo = new THREE.SphereGeometry(0.06, 12, 8);
-    for (const node of graph.nodes) {
-      const isSelected = selectedNodes.has(node.id);
+    for (const node of morpho.nodes) {
+      const isSelected = selectedNodes.has(node.node_id);
       const mesh = new THREE.Mesh(nodeGeo,
         isSelected ? selectedMat.clone() : new THREE.MeshStandardMaterial({ color: 0x333333, roughness: 0.5 })
       );
-      mesh.position.set(node.pos[0], node.pos[2], -node.pos[1]);
+      mesh.position.set(node.x, node.z, -node.y);
       mesh.castShadow = true;
-      mesh.userData = { isStructure: true, nodeId: node.id };
+      mesh.userData = { isStructure: true, nodeId: node.node_id };
       scene.add(mesh);
     }
 
     // Auto-fit camera
-    if (graph.nodes.length > 0) {
-      const positions = graph.nodes.map(n => new THREE.Vector3(n.pos[0], n.pos[2], -n.pos[1]));
+    if (morpho.nodes.length > 0) {
+      const positions = morpho.nodes.map(n => new THREE.Vector3(n.x, n.z, -n.y));
       const box = new THREE.Box3().setFromPoints(positions);
       const center = box.getCenter(new THREE.Vector3());
       const size = box.getSize(new THREE.Vector3());
       orbitRef.current.target.copy(center);
       orbitRef.current.distance = Math.max(size.x, size.y, size.z, 3) * 2;
     }
-  }, [state.morpho, state.selectedNodeIds, state.selectedEdgeIds]);
+  }, [state.morpho, state.selectedNodeIds, state.selectedMemberIds]);
 
   // Mouse interaction
   const dragStartRef = useRef<[number, number]>([0, 0]);
@@ -200,20 +199,20 @@ export function Viewer3D() {
       raycaster.setFromCamera(mouse, cameraRef.current);
 
       const hits = raycaster.intersectObjects(sceneRef.current.children, false);
-      const edgeHit = hits.find(h => h.object.userData.edgeId !== undefined);
-      if (edgeHit) {
-        const eid = edgeHit.object.userData.edgeId as number;
-        const prev = state.selectedEdgeIds;
+      const memberHit = hits.find(h => h.object.userData.memberId !== undefined);
+      if (memberHit) {
+        const mid = memberHit.object.userData.memberId as number;
+        const prev = state.selectedMemberIds;
         if (e.shiftKey) {
           // Shift+click: toggle in multi-selection (up to 2)
-          const has = prev.includes(eid);
-          const next = has ? prev.filter(id => id !== eid) : [...prev, eid].slice(-2);
-          dispatch({ type: 'SELECT_EDGES', ids: next });
+          const has = prev.includes(mid);
+          const next = has ? prev.filter(id => id !== mid) : [...prev, mid].slice(-2);
+          dispatch({ type: 'SELECT_MEMBERS', ids: next });
         } else {
-          dispatch({ type: 'SELECT_EDGES', ids: [eid] });
+          dispatch({ type: 'SELECT_MEMBERS', ids: [mid] });
         }
       } else {
-        dispatch({ type: 'SELECT_EDGES', ids: [] });
+        dispatch({ type: 'SELECT_MEMBERS', ids: [] });
       }
     }
   };
