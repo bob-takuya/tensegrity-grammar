@@ -9,6 +9,10 @@ export function Viewer3D() {
   const sceneRef = useRef<THREE.Scene | null>(null);
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
   const frameRef = useRef<number>(0);
+  // Remember which node count we last auto-fitted for, so live search
+  // ticks that add a couple of nodes at a time don't keep re-framing
+  // the camera and fighting with the user's manual orbit.
+  const lastFitCountRef = useRef(0);
   const [size, setSize] = useState({ w: 600, h: 500 });
 
   const orbitRef = useRef({
@@ -147,16 +151,30 @@ export function Viewer3D() {
       scene.add(mesh);
     }
 
-    // Auto-fit camera
-    if (morpho.nodes.length > 0) {
+    // Auto-fit camera — but only when the node count *grows* past
+    // the last point we fitted for (or shrinks back to zero). Every
+    // live search tick reruns this effect; re-framing on every tick
+    // would make the viewer jump around while the user is trying to
+    // inspect the search. We still re-fit after Phase 2 adhesions
+    // add new nodes, and on the final done-tick.
+    const nodeCount = morpho.nodes.length;
+    const running = state.search.status === 'running';
+    const shouldFit =
+      nodeCount === 0 ||
+      !running ||
+      nodeCount > lastFitCountRef.current;
+    if (shouldFit && nodeCount > 0) {
       const positions = morpho.nodes.map(n => new THREE.Vector3(n.x, n.z, -n.y));
       const box = new THREE.Box3().setFromPoints(positions);
       const center = box.getCenter(new THREE.Vector3());
-      const size = box.getSize(new THREE.Vector3());
+      const sz = box.getSize(new THREE.Vector3());
       orbitRef.current.target.copy(center);
-      orbitRef.current.distance = Math.max(size.x, size.y, size.z, 3) * 2;
+      orbitRef.current.distance = Math.max(sz.x, sz.y, sz.z, 3) * 2;
+      lastFitCountRef.current = nodeCount;
+    } else if (nodeCount === 0) {
+      lastFitCountRef.current = 0;
     }
-  }, [state.morpho, state.selectedNodeIds, state.selectedMemberIds]);
+  }, [state.morpho, state.selectedNodeIds, state.selectedMemberIds, state.search.status]);
 
   // Mouse interaction
   const dragStartRef = useRef<[number, number]>([0, 0]);
@@ -222,12 +240,43 @@ export function Viewer3D() {
     orbitRef.current.distance = Math.max(1, Math.min(50, orbitRef.current.distance));
   };
 
+  const search = state.search;
+  const running = search.status === 'running';
+  const showSearchOverlay = running || search.status === 'timeout';
+  const elapsedSec = (search.elapsedMs / 1000).toFixed(2);
+  const budgetSec = (search.timeoutMs / 1000).toFixed(1);
+
   return (
     <div ref={containerRef} className="canvas-container viewer-3d"
       onMouseDown={handleMouseDown} onMouseMove={handleMouseMove}
       onMouseUp={handleMouseUp} onMouseLeave={handleMouseUp}
       onWheel={handleWheel} onContextMenu={e => e.preventDefault()}>
       <div className="viewer-3d-label">3D View</div>
+
+      {showSearchOverlay && (
+        <div
+          style={{
+            position: 'absolute',
+            top: 12,
+            left: '50%',
+            transform: 'translateX(-50%)',
+            background: 'rgba(255, 255, 255, 0.88)',
+            border: '1px solid #ccc',
+            borderRadius: 4,
+            padding: '6px 12px',
+            fontFamily: 'monospace',
+            fontSize: 11,
+            color: search.status === 'timeout' ? '#b71c1c' : '#1565c0',
+            pointerEvents: 'none',
+            whiteSpace: 'nowrap',
+            boxShadow: '0 2px 6px rgba(0, 0, 0, 0.08)',
+          }}
+        >
+          {running
+            ? `▶ ${search.phase} · tick ${search.tick} · ${elapsedSec}s / ${budgetSec}s`
+            : `⏱ timed out after ${elapsedSec}s`}
+        </div>
+      )}
     </div>
   );
 }

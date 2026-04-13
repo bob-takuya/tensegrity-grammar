@@ -12,6 +12,11 @@
  *   Phase 3  ENFORCE_CLASS1               (Sub.D)  → lp.ts + fusion.ts
  *   Phase 4  validation
  *
+ * The top-level entry point is *async*: the search chunks itself
+ * across the event loop so the browser can redraw the viewer after
+ * every significant step, and it is governed by a wall-clock deadline
+ * instead of a fixed iteration budget.
+ *
  * Every interesting event is pushed to state.events so the UI can
  * replay the search in real time.
  */
@@ -25,6 +30,102 @@ import { buildEquilibriumMatrix, nullspace, symmetricEigenvalues } from './linal
 import { lpClass1Check, lpPairCheck } from './lp';
 import { greedyMatching, perturbMatching, Edge } from './matching';
 import { vol } from './geometry';
+
+// ─── Search driver / progress plumbing ─────────────────────
+
+/**
+ * A single tick emitted by the search. Consumers (UI / tests) use
+ * this to render intermediate state without having to know anything
+ * about the internal algorithm structure.
+ */
+export interface SearchProgress {
+  /** Coarse phase label, suitable for a status line. */
+  phase: string;
+  /** Monotonic tick counter; useful as a React dependency. */
+  tick: number;
+  /** Wall-clock milliseconds since the search started. */
+  elapsedMs: number;
+  /** Remaining budget (ms). Negative means past the deadline. */
+  remainingMs: number;
+  /** True once the deadline has been reached — loops observe this. */
+  deadlineReached: boolean;
+  /**
+   * Live reference to the mutable morphogenesis state. The caller
+   * MAY read from it but MUST NOT mutate it; treat it as a view.
+   * Because the search mutates the same object throughout, this
+   * reference is stable for the whole run.
+   */
+  state: MorphogenesisState;
+}
+
+export interface Class1SearchOptions {
+  /** Wall-clock budget for the whole search. Default 10 s. */
+  timeoutMs?: number;
+  /** Called after every significant mutation of `state`. */
+  onProgress?: (progress: SearchProgress) => void;
+  /**
+   * Optional caller-controlled cancel signal. When aborted, the
+   * current phase completes and the search returns what it has.
+   */
+  signal?: AbortSignal;
+  /**
+   * When true (the default in UI flows) the driver awaits a macrotask
+   * between ticks so React can re-render and the browser can paint.
+   * Set to false from Node test scripts to run at full speed.
+   */
+  yieldToEventLoop?: boolean;
+}
+
+/**
+ * Internal "tick & yield" helper passed down into each phase. It
+ * bumps the progress counter, lets the UI breathe, and returns true
+ * once the search is out of time (or has been aborted).
+ *
+ * The closure captures `startedAt`, `deadline`, and a mutable `tick`
+ * so the driver owns a single source of truth for elapsed time.
+ */
+type YieldFn = (phase?: string) => Promise<boolean>;
+
+function createYield(
+  startedAt: number,
+  deadline: number,
+  state: MorphogenesisState,
+  options: Class1SearchOptions,
+): { yield: YieldFn; getTick: () => number; getPhase: () => string } {
+  let tick = 0;
+  let phase = 'init';
+  const yieldToLoop = options.yieldToEventLoop ?? true;
+
+  const yieldFn: YieldFn = async (nextPhase) => {
+    if (nextPhase) phase = nextPhase;
+    tick++;
+    const now = Date.now();
+    const elapsedMs = now - startedAt;
+    const remainingMs = deadline - now;
+    const deadlineReached = remainingMs <= 0;
+    options.onProgress?.({
+      phase,
+      tick,
+      elapsedMs,
+      remainingMs,
+      deadlineReached,
+      state,
+    });
+    if (yieldToLoop) {
+      // Yield a macrotask so React can re-render the viewer panel
+      // with the latest mutations. A 0-ms setTimeout is sufficient
+      // because the browser batches paint after the macrotask.
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+    return deadlineReached || (options.signal?.aborted ?? false);
+  };
+
+  return {
+    yield: yieldFn,
+    getTick: () => tick,
+    getPhase: () => phase,
+  };
+}
 
 // ─── Phase 0 ───────────────────────────────────────────────
 
@@ -70,10 +171,11 @@ export function generateOrValidatePoints(
 
 // ─── Phase 1–2: build structure from the K₅ cover ──────────
 
-function buildStructureFromCover(
+async function buildStructureFromCover(
   P: Vec3[],
   state: MorphogenesisState,
-): boolean {
+  yieldFn: YieldFn,
+): Promise<boolean> {
   const cover = buildK5Cover(P);
   if (cover.length === 0) return false;
 
@@ -81,6 +183,7 @@ function buildStructureFromCover(
     kind: 'phase',
     message: `Phase 1 — K₅ cover built (${cover.length} cells)`,
   });
+  if (await yieldFn('Phase 1 · K₅ cover')) return true;
 
   // Seed cell
   const seedIdx = cover[0].newIdx;
@@ -90,6 +193,7 @@ function buildStructureFromCover(
   // Map source-point index → runtime node_id
   const nodeIdOf = new Map<number, number>();
   seedIdx.forEach((srcIdx, k) => nodeIdOf.set(srcIdx, seedCell.node_ids[k]));
+  if (await yieldFn('Phase 2 · seed K₅')) return true;
 
   logEvent(state, {
     kind: 'phase',
@@ -97,6 +201,10 @@ function buildStructureFromCover(
   });
 
   for (let step = 1; step < cover.length; step++) {
+    // Deadline check at the top of the loop — we'd rather have a
+    // partially-built but visible structure than an abrupt timeout
+    // mid-adhesion, so we bail cleanly on the boundary.
+    if (await yieldFn(`Phase 2 · cell ${step}/${cover.length - 1}`)) return true;
     const { sharedIdx, newIdx } = cover[step];
     const sharedNodeIds: number[] = [];
     let aborted = false;
@@ -278,27 +386,57 @@ function addAdhesionForDim(
   return false;
 }
 
-function enforceClass1(state: MorphogenesisState): {
+async function enforceClass1(
+  state: MorphogenesisState,
+  yieldFn: YieldFn,
+): Promise<{
   success: boolean;
   alpha: number[];
   matching: number[];
-} {
-  const MAX_ITER = 40;
+  timedOut: boolean;
+}> {
+  // Hard safety cap on the number of iterations so a runaway LP bug
+  // can't spin forever even if the caller's clock is wrong. Users
+  // normally terminate the search via the `timeoutMs` option instead;
+  // `HARD_ITER_CAP` exists purely as a belt-and-braces guard.
+  const HARD_ITER_CAP = 10_000;
   const MAX_ADHESION_GROWS = 3;  // bound dim-W growth so small-n runs terminate
   const SIGN_EPS = 1e-8;
   logEvent(state, { kind: 'phase', message: 'Phase 3 — Class-1 enforcement' });
+  if (await yieldFn('Phase 3 · enforce Class-1')) {
+    return { success: false, alpha: [], matching: [], timedOut: true };
+  }
 
   let perturbSeed = 0;
   let adhesionGrowCount = 0;
 
-  for (let iter = 0; iter < MAX_ITER; iter++) {
+  for (let iter = 0; iter < HARD_ITER_CAP; iter++) {
+    // Deadline check at the top of every iteration so we always
+    // emit current state before we stop.
+    if (await yieldFn(`Phase 3 · iter ${iter + 1}`)) {
+      logEvent(state, {
+        kind: 'info',
+        message: `Phase 3 stopped at iteration ${iter + 1} (time budget exhausted)`,
+      });
+      // Give the caller what we have so they can visualise it.
+      assignForceDensities(state);
+      state.matching = state.members
+        .filter(m => m.type === 'strut').map(m => m.member_id);
+      return {
+        success: false,
+        alpha: state.alpha,
+        matching: state.matching,
+        timedOut: true,
+      };
+    }
+
     const { W, memberIdx } = denseW(state);
     if (W.length === 0 || W[0].length === 0) {
       logEvent(state, {
         kind: 'failure',
         message: 'No self-stress basis left — giving up',
       });
-      return { success: false, alpha: [], matching: [] };
+      return { success: false, alpha: [], matching: [], timedOut: false };
     }
 
     const edges: Edge[] = state.members.map(m => ({
@@ -373,7 +511,14 @@ function enforceClass1(state: MorphogenesisState): {
             (counts.numZero > 0 ? `, ${counts.numZero} zero-force` : ''),
           matching_ids: actualStrutIds,
         });
-        return { success: true, alpha: lp.alpha, matching: actualStrutIds };
+        // Emit one more tick so the UI paints the final happy state.
+        await yieldFn('Phase 3 · reached Class-1');
+        return {
+          success: true,
+          alpha: lp.alpha,
+          matching: actualStrutIds,
+          timedOut: false,
+        };
       }
 
       // Roll back and treat as infeasible — the LP's sign assignment
@@ -413,7 +558,12 @@ function enforceClass1(state: MorphogenesisState): {
         assignForceDensities(state);
         state.matching = state.members
           .filter(m => m.type === 'strut').map(m => m.member_id);
-        return { success: false, alpha: lp.alpha, matching: state.matching };
+        return {
+          success: false,
+          alpha: lp.alpha,
+          matching: state.matching,
+          timedOut: false,
+        };
       }
       continue;
     }
@@ -441,7 +591,12 @@ function enforceClass1(state: MorphogenesisState): {
       assignForceDensities(state);
       state.matching = state.members
         .filter(m => m.type === 'strut').map(m => m.member_id);
-      return { success: false, alpha: lp.alpha, matching: state.matching };
+      return {
+        success: false,
+        alpha: lp.alpha,
+        matching: state.matching,
+        timedOut: false,
+      };
     }
     const pick = conflicts[0];
     logEvent(state, {
@@ -455,8 +610,21 @@ function enforceClass1(state: MorphogenesisState): {
     fuseOneEdge(state, pick.cableId);
   }
 
-  logEvent(state, { kind: 'failure', message: 'Max iterations reached' });
-  return { success: false, alpha: [], matching: [] };
+  // HARD_ITER_CAP reached — shouldn't happen in practice because the
+  // wall-clock deadline is the normal termination path.
+  logEvent(state, {
+    kind: 'failure',
+    message: `Safety iteration cap reached (${HARD_ITER_CAP})`,
+  });
+  assignForceDensities(state);
+  state.matching = state.members
+    .filter(m => m.type === 'strut').map(m => m.member_id);
+  return {
+    success: false,
+    alpha: state.alpha,
+    matching: state.matching,
+    timedOut: false,
+  };
 }
 
 // ─── Phase 4: validation ───────────────────────────────────
@@ -557,30 +725,62 @@ export interface Class1SearchResult {
   rigid: boolean;
   class1: boolean;
   numPoints: number;
+  /** True if the search was stopped by the wall-clock deadline. */
+  timedOut: boolean;
+  /** Wall-clock elapsed time (ms). */
+  elapsedMs: number;
 }
 
 /**
  * Top-level entry point. Mirrors the ALGORITHM block of the spec.
  * Does not throw on failure; instead populates `state.events` with
  * a trail that the UI can display.
+ *
+ * The search is *async* and budget-controlled:
+ *   - `options.timeoutMs` sets the wall-clock deadline (default 10 s).
+ *   - `options.onProgress` is invoked after every significant mutation
+ *     so a caller (e.g. the React UI) can redraw live.
+ *   - `options.signal` lets the caller cancel mid-run; the current
+ *     iteration completes and the function returns a partial result.
+ *
+ * On every exit path the returned `state` reflects the latest
+ * intermediate state — there is no "rollback to empty" on timeout.
  */
-export function searchClass1Tensegrity(
+export async function searchClass1Tensegrity(
   n: number,
   points: Vec3[] | null = null,
   seed?: number,
-): Class1SearchResult {
+  options: Class1SearchOptions = {},
+): Promise<Class1SearchResult> {
+  const timeoutMs = Math.max(1, options.timeoutMs ?? 10_000);
+  const startedAt = Date.now();
+  const deadline = startedAt + timeoutMs;
+  // Allocate the state first so the driver can close over it and
+  // expose it on every progress tick.
   const state = createEmptyState();
+  const driver = createYield(startedAt, deadline, state, options);
+  const yieldFn = driver.yield;
 
-  logEvent(state, { kind: 'phase', message: `Phase 0 — preparing ${n} points` });
+  logEvent(state, { kind: 'phase', message: `Phase 0 — preparing ${n} points (timeout ${timeoutMs} ms)` });
+  await yieldFn('Phase 0 · preparing points');
   const P = generateOrValidatePoints(n, points, seed);
 
-  const builtOK = buildStructureFromCover(P, state);
+  const builtOK = await buildStructureFromCover(P, state, yieldFn);
   if (!builtOK) {
     logEvent(state, { kind: 'failure', message: 'Structure build failed' });
-    return { state, success: false, rigid: false, class1: false, numPoints: n };
+    await yieldFn('aborted · build failed');
+    return {
+      state,
+      success: false,
+      rigid: false,
+      class1: false,
+      numPoints: n,
+      timedOut: Date.now() >= deadline,
+      elapsedMs: Date.now() - startedAt,
+    };
   }
 
-  const enforced = enforceClass1(state);
+  const enforced = await enforceClass1(state, yieldFn);
 
   // Ensure force densities are populated even when no LP was run (e.g.
   // dim W already 0 after strategic fusions). Must happen BEFORE V1/V4
@@ -588,6 +788,7 @@ export function searchClass1Tensegrity(
   if (!enforced.success) assignForceDensities(state);
 
   logEvent(state, { kind: 'phase', message: 'Phase 4 — validation' });
+  await yieldFn('Phase 4 · validation');
 
   // V3 — infinitesimal rigidity: rank(A) = 3|V| − 6.
   const rigid = validateRigidity(state);
@@ -623,13 +824,18 @@ export function searchClass1Tensegrity(
       `(${prestress.ok ? 'OK' : 'FAIL'})`,
   });
 
+  const elapsedMs = Date.now() - startedAt;
   const allOK = rigid && class1 && signCheck.ok && enforced.success;
   logEvent(state, {
     kind: allOK ? 'success' : 'info',
     message:
       `Validation: rigid=${rigid}, class1=${class1}, ` +
-      `signs=${signCheck.ok}, prestress=${prestress.ok}, lp=${enforced.success}`,
+      `signs=${signCheck.ok}, prestress=${prestress.ok}, lp=${enforced.success}` +
+      (enforced.timedOut ? ' (timed out)' : ''),
   });
+
+  // Final progress tick so the UI paints the validated state.
+  await yieldFn(enforced.timedOut ? 'done · timeout' : 'done');
 
   return {
     state,
@@ -637,6 +843,8 @@ export function searchClass1Tensegrity(
     rigid,
     class1,
     numPoints: n,
+    timedOut: enforced.timedOut,
+    elapsedMs,
   };
 }
 
