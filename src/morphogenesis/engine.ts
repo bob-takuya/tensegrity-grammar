@@ -220,8 +220,17 @@ function adherePrism(
   return createPrismCell(state, sharedIds, topPos);
 }
 
-// ─── Auto-Grow ───────────────────────────────────────────────────
+// ─── Auto-Grow: multiple prisms connected by cable bridges ──────
 
+/**
+ * Generate N prisms, each at a different position, connected by cables.
+ * This preserves Class-1: no two struts share a node because prisms
+ * do not share any nodes — they are connected only through cables.
+ *
+ * For multiple connected prisms, extra "bridge" cables link the
+ * closest nodes between adjacent prisms. Force densities are then
+ * recomputed from the full structure's equilibrium matrix nullspace.
+ */
 export function autoGrow(
   state: MorphogenesisState,
   numCells: number,
@@ -234,34 +243,90 @@ export function autoGrow(
   } = {}
 ): boolean {
   const {
-    baseRadius = 1.5,
-    layerHeight = 1.8,
-    spread = 0.2,
-    // maxCompDeg not used with prism approach (inherently Class-2 at interfaces)
+    baseRadius = 1.2,
+    spread = 0.3,
   } = options;
 
-  // Seed
-  if (state.cells.length === 0) {
-    const cell = seedPrism(state, baseRadius);
-    if (!cell) return false;
+  // Create N prisms at different positions
+  for (let i = 0; i < numCells; i++) {
+    // Place each prism at a different location in 3D
+    // First cell at origin, subsequent cells offset
+    const angle = (2 * Math.PI * i) / Math.max(numCells, 1);
+    const r = i === 0 ? 0 : 3 + i * 0.8;
+    const cx = r * Math.cos(angle);
+    const cy = r * Math.sin(angle);
+    const cz = i * 0.4 * spread; // slight vertical stagger
+
+    // Create bottom ring for this prism
+    const bottomPos: Vec3[] = [
+      [cx + baseRadius, cy, cz],
+      [cx + baseRadius * Math.cos(2 * Math.PI / 3), cy + baseRadius * Math.sin(2 * Math.PI / 3), cz],
+      [cx + baseRadius * Math.cos(4 * Math.PI / 3), cy + baseRadius * Math.sin(4 * Math.PI / 3), cz],
+    ];
+    const bottomIds = bottomPos.map(p => addNode(state, p));
+
+    // Form-find top positions
+    const topPos = formFindPrismTop(bottomPos, 2.0);
+    if (!topPos) continue;
+
+    const cell = createPrismCell(state, bottomIds, topPos);
+    if (!cell) continue;
     state.cells.push(cell as any);
   }
 
-  // Track current top ring for stacking
-  let currentTopIds = (state.cells[state.cells.length - 1] as any as PrismCell).topIds;
-
-  // Grow by stacking
-  for (let i = 1; i < numCells; i++) {
-    const cell = adherePrism(state, currentTopIds, layerHeight, spread);
-    if (!cell) break;
-    state.cells.push(cell as any);
-    currentTopIds = cell.topIds;
+  // Connect prisms with bridge cables (closest pairs between different prisms)
+  if (numCells > 1) {
+    connectPrismsWithCables(state);
   }
 
-  // Build stress basis from the full structure
+  // Recompute force densities from the full structure's nullspace
   recomputeStressBasis(state);
 
   return state.cells.length > 0;
+}
+
+/**
+ * Add cable bridges between separate prisms to form one connected structure.
+ * Each pair of adjacent prisms gets 2-3 connecting cables between closest nodes.
+ */
+function connectPrismsWithCables(state: MorphogenesisState): void {
+  const cells = state.cells as any as PrismCell[];
+
+  for (let i = 0; i < cells.length; i++) {
+    for (let j = i + 1; j < cells.length; j++) {
+      const nodesA = [...cells[i].bottomIds, ...cells[i].topIds];
+      const nodesB = [...cells[j].bottomIds, ...cells[j].topIds];
+
+      // Find closest pair
+      let bestDist = Infinity, bestA = -1, bestB = -1;
+      for (const a of nodesA) {
+        for (const b of nodesB) {
+          const pa = nodePos(state, a), pb = nodePos(state, b);
+          const d = Math.sqrt((pa[0]-pb[0])**2 + (pa[1]-pb[1])**2 + (pa[2]-pb[2])**2);
+          if (d < bestDist) { bestDist = d; bestA = a; bestB = b; }
+        }
+      }
+
+      // Only connect if they are reasonably close (adjacent prisms)
+      if (bestDist < 6 && bestA !== -1) {
+        addEdge(state, bestA, bestB, 'cable', 0.5);
+
+        // Add second closest pair for stability
+        let bestD2 = Infinity, bestA2 = -1, bestB2 = -1;
+        for (const a of nodesA) {
+          for (const b of nodesB) {
+            if (a === bestA && b === bestB) continue;
+            const pa = nodePos(state, a), pb = nodePos(state, b);
+            const d = Math.sqrt((pa[0]-pb[0])**2 + (pa[1]-pb[1])**2 + (pa[2]-pb[2])**2);
+            if (d < bestD2) { bestD2 = d; bestA2 = a; bestB2 = b; }
+          }
+        }
+        if (bestA2 !== -1 && bestD2 < 6) {
+          addEdge(state, bestA2, bestB2, 'cable', 0.5);
+        }
+      }
+    }
+  }
 }
 
 // ─── Stress Basis + Force Density Recomputation ────────────────
