@@ -90,13 +90,32 @@ export function lpClass1Check(
     return { f, g };
   };
 
-  // Multi-start: try a few initial directions (identity columns and a
-  // random one) so we don't get stuck on the zero α.
+  // Multi-start: try a few initial directions so we don't get stuck
+  // on the zero α. Besides identity columns and random directions we
+  // also include a signed-indicator seed α₀ = W^T b where b_e = -1
+  // for struts and +1 for cables. This is the direction of steepest
+  // decrease of the hinge loss at α = 0, which in well-conditioned
+  // cases already lands inside the feasible polyhedron after a single
+  // normalisation — and for the degenerate cases it still gives the
+  // descent a vastly better starting basin than plain zero.
   const starts: number[][] = [];
   for (let j = 0; j < Math.min(k, 5); j++) {
     const s = new Array(k).fill(0);
     s[j] = 1;
     starts.push(s);
+  }
+  // Signed-indicator seed α₀ = W^T b.
+  {
+    const s = new Array(k).fill(0);
+    for (const e of strutRows) {
+      for (let j = 0; j < k; j++) s[j] -= W[e][j];
+    }
+    for (const e of cableRows) {
+      for (let j = 0; j < k; j++) s[j] += W[e][j];
+    }
+    starts.push(s);
+    // And its negation, in case we got the sign convention flipped.
+    starts.push(s.map(x => -x));
   }
   starts.push(new Array(k).fill(0).map(() => Math.random() * 2 - 1));
   starts.push(new Array(k).fill(1));
@@ -142,12 +161,32 @@ export function lpClass1Check(
     for (let j = 0; j < k; j++) best[j] /= maxAbs;
   }
 
+  // Per-constraint feasibility check. The hinge-loss threshold alone
+  // is insufficient: the degenerate minimum α = 0 has a loss of
+  // |E|·ε², which for ε=1e-6 is ~1e-11 and sails under any reasonable
+  // absolute threshold — yet it corresponds to a structure where
+  // every member has force density zero, which is certainly NOT a
+  // Class-1 solution. We therefore re-evaluate each constraint on the
+  // *normalised* α and require a positive margin.
+  //
+  // After normalisation we expect max|Wα| = 1, so we demand that
+  // strut rows hit ≤ -(ε/2) and cable rows hit ≥ +(ε/2). A solution
+  // whose α was scaled by maxAbs≈0 will have all |(Wα)_e| ≈ ε/maxAbs,
+  // which fails this check unless maxAbs itself was ≥ ε.
+  const wNorm = evalWalpha(best);
+  let hardFeasible = true;
+  const margin = eps * 0.5;
+  for (const e of strutRows) {
+    if (!(wNorm[e] <= -margin)) { hardFeasible = false; break; }
+  }
+  if (hardFeasible) {
+    for (const e of cableRows) {
+      if (!(wNorm[e] >= +margin)) { hardFeasible = false; break; }
+    }
+  }
+
   return {
-    // A tiny positive residual is still practically feasible: the
-    // descent on a squared hinge only reaches true zero in the strict
-    // interior of the polyhedron. Use a generous tolerance scaled by
-    // the problem size.
-    feasible: bestF < 1e-4,
+    feasible: hardFeasible,
     alpha: best,
     residual: bestF,
   };

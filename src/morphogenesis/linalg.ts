@@ -171,3 +171,75 @@ export function nullspace(A: number[][], tol?: number): number[][] {
 
 /** Legacy alias used by older call-sites. */
 export const findNullspaceBasis = nullspace;
+
+// ─── Eigenvalues of a small symmetric matrix (Jacobi rotations) ──
+
+/**
+ * Return all eigenvalues of a real symmetric matrix `S` in ascending
+ * order. Uses the cyclic Jacobi method — O(n³) per sweep, but for
+ * Class-1 validation n is always 3·|V|, typically ≤ 60, so this is
+ * perfectly adequate and dependency-free.
+ *
+ * @param S   symmetric n×n matrix (modified? no, we copy)
+ * @param tol off-diagonal convergence threshold (default 1e-12)
+ */
+export function symmetricEigenvalues(S: number[][], tol: number = 1e-12): number[] {
+  const n = S.length;
+  if (n === 0) return [];
+  const A: number[][] = S.map(row => [...row]);
+
+  // Frobenius norm of the off-diagonal as a stopping criterion.
+  const offNorm = (M: number[][]): number => {
+    let s = 0;
+    for (let i = 0; i < n; i++) {
+      for (let j = i + 1; j < n; j++) s += 2 * M[i][j] * M[i][j];
+    }
+    return Math.sqrt(s);
+  };
+
+  let scale = 0;
+  for (let i = 0; i < n; i++) {
+    for (let j = 0; j < n; j++) {
+      const v = Math.abs(A[i][j]);
+      if (v > scale) scale = v;
+    }
+  }
+  const stop = tol * Math.max(1, scale) * n;
+
+  const maxSweeps = 100;
+  for (let sweep = 0; sweep < maxSweeps; sweep++) {
+    if (offNorm(A) < stop) break;
+    for (let p = 0; p < n - 1; p++) {
+      for (let q = p + 1; q < n; q++) {
+        const apq = A[p][q];
+        if (Math.abs(apq) < 1e-18) continue;
+        const app = A[p][p], aqq = A[q][q];
+        const theta = (aqq - app) / (2 * apq);
+        let t: number;
+        if (Math.abs(theta) > 1e18) t = 1 / (2 * theta);
+        else {
+          const sign = theta >= 0 ? 1 : -1;
+          t = sign / (Math.abs(theta) + Math.sqrt(1 + theta * theta));
+        }
+        const c = 1 / Math.sqrt(1 + t * t);
+        const s = t * c;
+        // Update A ← J^T A J
+        A[p][p] = app - t * apq;
+        A[q][q] = aqq + t * apq;
+        A[p][q] = 0; A[q][p] = 0;
+        for (let i = 0; i < n; i++) {
+          if (i === p || i === q) continue;
+          const aip = A[i][p], aiq = A[i][q];
+          A[i][p] = c * aip - s * aiq;
+          A[p][i] = A[i][p];
+          A[i][q] = s * aip + c * aiq;
+          A[q][i] = A[i][q];
+        }
+      }
+    }
+  }
+  const eigs = new Array(n);
+  for (let i = 0; i < n; i++) eigs[i] = A[i][i];
+  eigs.sort((a, b) => a - b);
+  return eigs;
+}
