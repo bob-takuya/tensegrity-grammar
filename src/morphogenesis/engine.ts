@@ -18,8 +18,7 @@ import {
   NodeRow, MemberRow,
 } from './types';
 import { cellSelfStress, k5EdgePairs } from './k5cell';
-import { adhereCell, suggestNewPositions, predictDeltaW } from './adhesion';
-import { fuseOneEdge } from './fusion';
+import { predictDeltaW } from './adhesion';
 import { buildEquilibriumMatrix, nullspace } from './linalg';
 import { vdist } from './geometry';
 
@@ -36,12 +35,24 @@ export function createEmptyState(): MorphogenesisState {
     selfStressEntries: [],
     morphogenesisSteps: [],
     removedMembers: [],
+    events: [],
+    alpha: [],
+    matching: [],
     nextNodeId: 0,
     nextMemberId: 0,
     nextCellId: 0,
     nextStateId: 0,
     nextStepId: 0,
+    nextEventId: 0,
   };
+}
+
+/** Append one event to the search trace. */
+export function logEvent(
+  state: MorphogenesisState,
+  ev: Omit<import('./types').SearchEvent, 'event_id'>,
+): void {
+  state.events.push({ event_id: state.nextEventId++, ...ev });
 }
 
 // ─── Row-level helpers ──────────────────────────────────────────
@@ -130,6 +141,16 @@ export function initializeK5(state: MorphogenesisState, points: Vec3[]): CellRow
   };
   state.morphogenesisSteps.push(step);
 
+  logEvent(state, {
+    kind: 'init',
+    message: `Seeded K₅ cell #${cellId} with 5 nodes, 10 members`,
+    cell_id: cellId,
+    node_ids: nodeIds,
+    member_ids: memberIds,
+    dim_W_before: 0,
+    dim_W_after: 1,
+  });
+
   return cell;
 }
 
@@ -170,132 +191,11 @@ export function assignForceDensities(state: MorphogenesisState): void {
   }
 }
 
-function memberLength(state: MorphogenesisState, mem: MemberRow): number {
+export function memberLength(state: MorphogenesisState, mem: MemberRow): number {
   const a = state.nodes.find(n => n.node_id === mem.node_a);
   const b = state.nodes.find(n => n.node_id === mem.node_b);
   if (!a || !b) return 1;
   return vdist([a.x, a.y, a.z], [b.x, b.y, b.z]);
-}
-
-// ─── AutoGrow ───────────────────────────────────────────────────
-
-export interface AutoGrowOptions {
-  spread?: number;
-  adhesionAttempts?: number;
-  fuseProbability?: number;
-  maxCompDeg?: number;
-}
-
-/**
- * Build a multi-cell structure by seeding with a K₅ and repeatedly
- * attaching new K₅s (adhesion). Optionally fuses a fraction of the
- * least-stressed members at the end. All steps are recorded in
- * MORPHOGENESIS_STEP so the UI can play them back.
- */
-export function autoGrow(
-  state: MorphogenesisState,
-  numCells: number,
-  options: AutoGrowOptions = {},
-): boolean {
-  const {
-    spread = 0.3,
-    adhesionAttempts = 12,
-    fuseProbability = 0,
-    maxCompDeg = 1,
-  } = options;
-
-  // Seed
-  const seedPts: Vec3[] = [
-    [ 1.0,  0.0,  0.0],
-    [-0.5,  0.866,  0.2],
-    [-0.5, -0.866,  0.1],
-    [ 0.2,  0.1,  1.2],
-    [ 0.0,  0.0, -0.9],
-  ].map(p => [
-    p[0] + (Math.random() - 0.5) * spread,
-    p[1] + (Math.random() - 0.5) * spread,
-    p[2] + (Math.random() - 0.5) * spread,
-  ] as Vec3);
-  const seed = initializeK5(state, seedPts);
-  if (!seed) return false;
-
-  // Adhesion loop
-  for (let step = 1; step < numCells; step++) {
-    let placed = false;
-    for (let attempt = 0; attempt < adhesionAttempts && !placed; attempt++) {
-      const sharedCount = Math.random() < 0.5 ? 3 : 4;
-      if (state.nodes.length < sharedCount) break;
-
-      // Pick a seed node and take its nearest neighbours as the shared face.
-      const seedIdx = Math.floor(Math.random() * state.nodes.length);
-      const seedNode = state.nodes[seedIdx];
-      const seedPos: Vec3 = [seedNode.x, seedNode.y, seedNode.z];
-      const ranked = state.nodes
-        .map(n => ({ id: n.node_id, d: vdist(seedPos, [n.x, n.y, n.z]) }))
-        .sort((a, b) => a.d - b.d)
-        .slice(0, Math.min(state.nodes.length, sharedCount * 2));
-      const shuffled = [...ranked].sort(() => Math.random() - 0.5);
-      const sharedIds = shuffled.slice(0, sharedCount).map(x => x.id);
-
-      const positions = suggestNewPositions(state, sharedIds, 1.4);
-      const res = adhereCell(state, sharedIds, positions);
-      if (res) placed = true;
-    }
-    if (!placed) break;
-  }
-
-  // Optional fusion sweep
-  if (fuseProbability > 0) {
-    const target = Math.max(
-      1,
-      Math.floor(state.members.length * fuseProbability * 0.2),
-    );
-    let removed = 0;
-    const order = [...state.members]
-      .sort((a, b) => Math.abs(a.force_density ?? 0) - Math.abs(b.force_density ?? 0))
-      .map(m => m.member_id);
-    for (const mid of order) {
-      if (removed >= target) break;
-      if (fuseOneEdge(state, mid)) removed++;
-    }
-  }
-
-  assignForceDensities(state);
-  enforceClassK(state, maxCompDeg);
-  return true;
-}
-
-/**
- * Flip signs of unassigned cells' self-stress contributions when the
- * global w* puts too many struts on a single node. This is a shallow
- * heuristic — the paper itself does not define Class-k — but it keeps
- * the UI visualisation close to the canonical Class-1 tensegrity.
- */
-function enforceClassK(state: MorphogenesisState, maxCompDeg: number): void {
-  if (!Number.isFinite(maxCompDeg) || maxCompDeg >= 6) return;
-  // A single global sign flip is the only operation that commutes with
-  // the full nullspace basis; flip if it reduces the worst-case strut
-  // degree.
-  const strutDeg = (signFlip: boolean) => {
-    const count = new Map<number, number>();
-    for (const m of state.members) {
-      const q = (m.force_density ?? 0) * (signFlip ? -1 : 1);
-      if (q >= 0) continue;
-      count.set(m.node_a, (count.get(m.node_a) || 0) + 1);
-      count.set(m.node_b, (count.get(m.node_b) || 0) + 1);
-    }
-    let worst = 0;
-    for (const v of count.values()) if (v > worst) worst = v;
-    return worst;
-  };
-
-  if (strutDeg(true) < strutDeg(false)) {
-    for (const m of state.members) {
-      if (m.force_density != null) m.force_density = -m.force_density;
-      if (m.type === 'cable') m.type = 'strut';
-      else if (m.type === 'strut') m.type = 'cable';
-    }
-  }
 }
 
 // ─── Verification helpers ──────────────────────────────────────

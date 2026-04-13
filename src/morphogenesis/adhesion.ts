@@ -101,6 +101,8 @@ export function adhereCell(
   }
 
   const dimBefore = state.selfStressStates.length;
+  const memberCountBefore = state.members.length;
+  const nodeCountBefore = state.nodes.length;
 
   const stepId = state.nextStepId++;
 
@@ -216,6 +218,23 @@ export function adhereCell(
     delta_dim_W_actual: dimAfter - dimBefore,
   });
 
+  state.events.push({
+    event_id: state.nextEventId++,
+    kind: 'adhesion',
+    message:
+      `Adhered cell #${cellId} sharing ${sharedIds.length} nodes ` +
+      `(+${addedNodeIds.length} nodes, +${addedMemberIds.length} members)`,
+    cell_id: cellId,
+    node_ids: cellNodeIds,
+    member_ids: addedMemberIds,
+    dim_W_before: dimBefore,
+    dim_W_after: dimAfter,
+  });
+
+  // Silence "unused" lint noise — these counters are kept for future
+  // asserts but not yet surfaced in events.
+  void memberCountBefore; void nodeCountBefore;
+
   return {
     cellId,
     addedNodeIds,
@@ -250,11 +269,17 @@ export function findVirtualCells(
   const out: number[][] = [];
   if (target <= 0) return out;
 
-  const { A } = buildEquilibriumMatrix(state.nodes, state.members);
+  // buildEquilibriumMatrix uses direction-cosine columns, so its null
+  // space gives AXIAL FORCES t. We store FORCE DENSITIES q = t/L in
+  // SELF_STRESS_ENTRY, so each candidate has to be divided by member
+  // length before being compared / stored.
+  const { A, lengths } = buildEquilibriumMatrix(state.nodes, state.members);
   const basis = nullspace(A);
 
+  const densityBasis: number[][] = basis.map(t => t.map((ti, i) => ti / lengths[i]));
+
   const existing = denseBasisMatrix(state);
-  for (const candidate of basis) {
+  for (const candidate of densityBasis) {
     if (!isLinearlyIndependent(candidate, existing)) continue;
     out.push(candidate);
     existing.push(candidate);

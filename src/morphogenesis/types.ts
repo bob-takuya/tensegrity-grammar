@@ -107,6 +107,35 @@ export interface RemovedMemberRow {
   member_id: number;             // FK → MEMBER (member prior to removal)
 }
 
+// ─── SEARCH_EVENT ───────────────────────────────────────────────
+
+export type SearchEventKind =
+  | 'phase'           // high-level phase boundary
+  | 'init'            // seed K₅ placed
+  | 'adhesion'        // one adhesion step executed
+  | 'fusion'          // one fusion step executed
+  | 'lp_check'        // LP feasibility attempt
+  | 'conflict'        // one LP conflict identified
+  | 'strategic_fusion'// strategic fusion triggered to break a conflict
+  | 'matching'        // current maximum matching snapshot
+  | 'success'         // final Class-1 solution reached
+  | 'failure'         // algorithm gave up / fell back
+  | 'info';           // any other progress note
+
+export interface SearchEvent {
+  event_id: number;
+  kind: SearchEventKind;
+  message: string;
+  // Optional payloads used by the UI panel
+  dim_W_before?: number;
+  dim_W_after?: number;
+  cell_id?: number;
+  member_ids?: number[];
+  node_ids?: number[];
+  matching_ids?: number[];
+  conflict_count?: number;
+}
+
 // ─── Aggregate state ────────────────────────────────────────────
 
 export interface MorphogenesisState {
@@ -121,10 +150,20 @@ export interface MorphogenesisState {
   morphogenesisSteps: MorphogenesisStepRow[];
   removedMembers: RemovedMemberRow[];
 
+  // Search trace (populated by searchClass1Tensegrity)
+  events: SearchEvent[];
+
+  // Current chosen self-stress coefficient vector α (length = dim W)
+  alpha: number[];
+
+  // Current matching (member_ids chosen as struts)
+  matching: number[];
+
   // Auto-increment counters
   nextNodeId: number;
   nextMemberId: number;
   nextCellId: number;
   nextStateId: number;
   nextStepId: number;
+  nextEventId: number;
 }

@@ -40,18 +40,24 @@ function statesWithMember(
     .map(e => ({ state_id: e.state_id, w_value: e.w_value }));
 }
 
-function replaceStateLinearCombination(
+/**
+ * Mutate column `targetStateId` to  target ← target + β · other.
+ * Unlike the name, nothing is dropped — callers decide when to drop
+ * states. This keeps the reference column alive across multiple
+ * target updates in `fuseSelfStress`.
+ */
+function addStateColumn(
   state: MorphogenesisState,
   targetStateId: number,
   otherStateId: number,
   beta: number,
 ): void {
-  // target ← target + β · other, then drop `other` from the basis.
   const members = new Set<number>();
-  state.selfStressEntries
-    .filter(e => e.state_id === targetStateId || e.state_id === otherStateId)
-    .forEach(e => members.add(e.member_id));
-
+  for (const e of state.selfStressEntries) {
+    if (e.state_id === targetStateId || e.state_id === otherStateId) {
+      members.add(e.member_id);
+    }
+  }
   for (const mid of members) {
     const tEntry = state.selfStressEntries.find(e => e.state_id === targetStateId && e.member_id === mid);
     const oEntry = state.selfStressEntries.find(e => e.state_id === otherStateId  && e.member_id === mid);
@@ -66,9 +72,11 @@ function replaceStateLinearCombination(
       state.selfStressEntries.push({ state_id: targetStateId, member_id: mid, w_value: v });
     }
   }
+}
 
-  state.selfStressEntries = state.selfStressEntries.filter(e => e.state_id !== otherStateId);
-  state.selfStressStates  = state.selfStressStates.filter(s => s.state_id !== otherStateId);
+function dropState(state: MorphogenesisState, stateId: number): void {
+  state.selfStressEntries = state.selfStressEntries.filter(e => e.state_id !== stateId);
+  state.selfStressStates  = state.selfStressStates.filter(s => s.state_id !== stateId);
 }
 
 function removeMember(state: MorphogenesisState, memberId: number): void {
@@ -82,15 +90,15 @@ function removeMember(state: MorphogenesisState, memberId: number): void {
 // ─── SUB: FUSE_SELF_STRESS ─────────────────────────────────────
 
 /**
- * Adjust the W basis so that the member `memberId` carries zero force
- * in every surviving state, then drop the member. dim W decreases by 1.
+ * Adjust W so that member `memberId` carries zero force in every
+ * surviving column, then drop the member. dim W decreases by exactly 1
+ * when at least one column originally touched the member, and by 0
+ * otherwise.
  *
- * Algorithm (matches the spec's linear-combination step):
- *   1. Collect all (state, w) pairs where w[e_r] ≠ 0.
- *   2. If none — the member is already unused; drop it.
- *   3. Otherwise pick the smallest-|w| state as the "kill target" and
- *      zero every other non-zero column against it via w' = w + β·kill.
- *      The kill target itself is discarded.
+ * The algorithm picks a single "pivot" column (the one with the
+ * largest |w_r|, for numerical stability) and, for every other column
+ * with nonzero w_r, does  target ← target + β·pivot  so target[e_r]=0.
+ * Only after all targets have been updated is the pivot itself dropped.
  */
 export function fuseSelfStress(state: MorphogenesisState, memberId: number): boolean {
   const active = statesWithMember(state, memberId);
@@ -98,41 +106,20 @@ export function fuseSelfStress(state: MorphogenesisState, memberId: number): boo
     removeMember(state, memberId);
     return true;
   }
-  if (active.length === 1) {
-    // Only one basis column touches this member — remove that column
-    // entirely (dim W drops by 1) and then drop the member.
-    const sid = active[0].state_id;
-    state.selfStressEntries = state.selfStressEntries.filter(e => e.state_id !== sid);
-    state.selfStressStates  = state.selfStressStates.filter(s => s.state_id !== sid);
-    removeMember(state, memberId);
-    return true;
-  }
 
-  // Pick the column with the smallest |w_value| at e_r as the one to
-  // sacrifice: all others are combined against it so that e_r becomes
-  // zero in every surviving column.
-  active.sort((a, b) => Math.abs(a.w_value) - Math.abs(b.w_value));
-  const killer = active[0];
+  // Pick the column with the largest |w_r| as the pivot — this
+  // minimises round-off when computing β = -target / pivot.
+  active.sort((a, b) => Math.abs(b.w_value) - Math.abs(a.w_value));
+  const pivot = active[0];
 
   for (let i = 1; i < active.length; i++) {
     const target = active[i];
-    const beta = -target.w_value / killer.w_value;
-    replaceStateLinearCombination(state, target.state_id, killer.state_id, beta);
-    // `killer` has been merged into `target` and removed — re-collect
-    // from the remaining rows to get a new killer for subsequent rounds.
-    const next = statesWithMember(state, memberId);
-    if (next.length === 0) break;
-    next.sort((a, b) => Math.abs(a.w_value) - Math.abs(b.w_value));
-    killer.state_id = next[0].state_id;
-    killer.w_value  = next[0].w_value;
+    const beta = -target.w_value / pivot.w_value;
+    addStateColumn(state, target.state_id, pivot.state_id, beta);
   }
 
-  // Drop the very last column still touching e_r (dim W -= 1)
-  const tail = statesWithMember(state, memberId);
-  for (const row of tail) {
-    state.selfStressEntries = state.selfStressEntries.filter(e => e.state_id !== row.state_id);
-    state.selfStressStates  = state.selfStressStates.filter(s => s.state_id !== row.state_id);
-  }
+  // Drop the pivot last — everyone else has already absorbed it.
+  dropState(state, pivot.state_id);
 
   removeMember(state, memberId);
   return true;
@@ -273,6 +260,7 @@ export function projectOntoQuadric(p0: Vec3, T: number[][]): Vec3 {
  */
 export function fuseOneEdge(state: MorphogenesisState, memberId: number): boolean {
   const stepId = state.nextStepId++;
+  const dimBefore = state.selfStressStates.length;
 
   fuseSelfStress(state, memberId);
   state.removedMembers.push({ step_id: stepId, member_id: memberId });
@@ -283,7 +271,16 @@ export function fuseOneEdge(state: MorphogenesisState, memberId: number): boolea
     delta_e: -1,
     delta_v: 0,
     delta_dim_W_predicted: -1,
-    delta_dim_W_actual: -1,
+    delta_dim_W_actual: state.selfStressStates.length - dimBefore,
+  });
+
+  state.events.push({
+    event_id: state.nextEventId++,
+    kind: 'fusion',
+    message: `Fused member #${memberId} (dim W ${dimBefore} → ${state.selfStressStates.length})`,
+    member_ids: [memberId],
+    dim_W_before: dimBefore,
+    dim_W_after: state.selfStressStates.length,
   });
   return true;
 }
