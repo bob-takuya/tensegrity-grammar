@@ -5,18 +5,24 @@ import type { Vec3 } from '../morphogenesis/types';
 /**
  * Control panel — simplified to the minimum.
  *
- * The only input the user exposes is `n` (number of points). An optional
- * textarea lets them paste custom coordinates. Everything else about the
- * search is driven by the Class-1 algorithm.
+ * Inputs the user can tweak:
+ *   - `n`         number of points
+ *   - `timeoutMs` wall-clock search budget (drives Phase 3 termination)
+ *   - optional custom positions and seed
+ *
+ * The search runs asynchronously via `runSearch` so the 3D viewer
+ * and the event log update in real time while it progresses. A
+ * Stop button aborts the current run via AbortController.
  */
 export function ControlPanel() {
-  const { state, dispatch } = useAppState();
+  const { state, runSearch, stopSearch, dispatch } = useAppState();
   const [n, setN] = useState(12);
+  const [timeoutSec, setTimeoutSec] = useState(10);
   const [customMode, setCustomMode] = useState(false);
   const [customText, setCustomText] = useState('');
   const [seed, setSeed] = useState<string>('');
 
-  const { morpho } = state;
+  const { morpho, search } = state;
   const nNodes = morpho.nodes.length;
   const nMembers = morpho.members.length;
   const nCells = morpho.cells.length;
@@ -24,6 +30,8 @@ export function ControlPanel() {
   const nCables = morpho.members.filter(m => m.type === 'cable').length;
   const stressDim = morpho.selfStressStates.length;
   const nEvents = morpho.events.length;
+
+  const isRunning = search.status === 'running';
 
   const actualMaxComp = nNodes > 0 ? Math.max(...morpho.nodes.map(n =>
     morpho.members.filter(m =>
@@ -48,8 +56,26 @@ export function ControlPanel() {
     const points = parseCustom();
     const target = points ? points.length : n;
     const parsedSeed = seed.trim() === '' ? undefined : Number(seed);
-    dispatch({ type: 'SEARCH', n: target, points, seed: parsedSeed });
+    runSearch({
+      n: target,
+      points,
+      seed: parsedSeed,
+      timeoutMs: Math.max(100, Math.round(timeoutSec * 1000)),
+    });
   };
+
+  // Progress bar: percentage of the timeout budget consumed so far.
+  const progressPct = search.timeoutMs > 0
+    ? Math.min(100, Math.max(0, (search.elapsedMs / search.timeoutMs) * 100))
+    : 0;
+
+  const statusLabel = {
+    idle: '',
+    running: `running · ${search.phase}`,
+    done: 'done',
+    timeout: 'timed out',
+    aborted: 'aborted',
+  }[search.status];
 
   return (
     <div className="control-panel">
@@ -65,7 +91,42 @@ export function ControlPanel() {
           <label>Number of points (n)<span className="param-value">{n}</span></label>
           <input type="range" min={5} max={40} step={1} value={n}
             onChange={e => setN(parseInt(e.target.value))}
-            disabled={customMode} />
+            disabled={customMode || isRunning} />
+        </div>
+
+        <div className="param-group">
+          <label>
+            Timeout (s)
+            <span className="param-value">{timeoutSec.toFixed(1)}</span>
+          </label>
+          <input type="range" min={0.5} max={60} step={0.5} value={timeoutSec}
+            onChange={e => setTimeoutSec(parseFloat(e.target.value))}
+            disabled={isRunning} />
+          <input
+            type="number"
+            min={0.1}
+            max={600}
+            step={0.1}
+            value={timeoutSec}
+            onChange={e => {
+              const v = parseFloat(e.target.value);
+              if (Number.isFinite(v) && v > 0) setTimeoutSec(v);
+            }}
+            disabled={isRunning}
+            style={{
+              width: '100%',
+              marginTop: 4,
+              padding: 4,
+              border: '1px solid #ddd',
+              borderRadius: 4,
+              fontSize: 11,
+              fontFamily: 'monospace',
+            }}
+          />
+          <div className="param-hint">
+            Phase 3 stops at this wall-clock budget and returns the
+            best structure it reached.
+          </div>
         </div>
 
         <div className="param-group">
@@ -74,6 +135,7 @@ export function ControlPanel() {
               type="checkbox"
               checked={customMode}
               onChange={e => setCustomMode(e.target.checked)}
+              disabled={isRunning}
               style={{ marginRight: 6 }}
             />
             Custom point positions
@@ -85,6 +147,7 @@ export function ControlPanel() {
             <textarea
               value={customText}
               onChange={e => setCustomText(e.target.value)}
+              disabled={isRunning}
               placeholder="one point per line: x y z"
               style={{
                 width: '100%', minHeight: 80, fontFamily: 'monospace',
@@ -104,6 +167,7 @@ export function ControlPanel() {
             type="text"
             value={seed}
             onChange={e => setSeed(e.target.value)}
+            disabled={isRunning}
             placeholder="empty = random"
             style={{
               width: '100%', padding: 4, border: '1px solid #ddd',
@@ -112,16 +176,71 @@ export function ControlPanel() {
           />
         </div>
 
-        <button className="generate-btn" onClick={handleSearch}>
-          Search Class-1 Tensegrity
-        </button>
+        {isRunning ? (
+          <button className="clear-btn" onClick={stopSearch}>
+            Stop Search
+          </button>
+        ) : (
+          <button className="generate-btn" onClick={handleSearch}>
+            Search Class-1 Tensegrity
+          </button>
+        )}
 
-        {nCells > 0 && (
+        {nCells > 0 && !isRunning && (
           <button className="clear-btn" onClick={() => dispatch({ type: 'CLEAR' })}>
             Clear
           </button>
         )}
       </div>
+
+      {(isRunning || search.status !== 'idle') && (
+        <div className="stats-section">
+          <h4>Search progress</h4>
+          <div
+            style={{
+              fontSize: 11,
+              color: search.status === 'timeout' ? '#b71c1c' :
+                     search.status === 'running' ? '#1565c0' : '#2e7d32',
+              marginBottom: 6,
+              fontFamily: 'monospace',
+            }}
+          >
+            {statusLabel}
+          </div>
+          <div
+            style={{
+              width: '100%',
+              height: 6,
+              background: '#e0e0e0',
+              borderRadius: 3,
+              overflow: 'hidden',
+            }}
+          >
+            <div
+              style={{
+                width: `${progressPct}%`,
+                height: '100%',
+                background: search.status === 'timeout' ? '#b71c1c' :
+                            search.status === 'running' ? '#1565c0' : '#2e7d32',
+                transition: 'width 60ms linear',
+              }}
+            />
+          </div>
+          <div
+            style={{
+              display: 'flex',
+              justifyContent: 'space-between',
+              fontSize: 10,
+              color: '#666',
+              marginTop: 4,
+              fontFamily: 'monospace',
+            }}
+          >
+            <span>tick {search.tick}</span>
+            <span>{(search.elapsedMs / 1000).toFixed(2)}s / {(search.timeoutMs / 1000).toFixed(1)}s</span>
+          </div>
+        </div>
+      )}
 
       {nCells > 0 && (
         <div className="stats-section">

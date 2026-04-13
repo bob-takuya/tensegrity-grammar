@@ -6,14 +6,60 @@
 
 import type { MorphogenesisState, Vec3 } from './morphogenesis/types';
 
+/**
+ * Where the search currently is. The UI uses this to decide whether
+ * to show the "Search" button, the "Running…" spinner + Stop button,
+ * or the final status line.
+ */
+export type SearchStatus = 'idle' | 'running' | 'done' | 'timeout' | 'aborted';
+
+export interface SearchLiveInfo {
+  status: SearchStatus;
+  /** Monotonic tick counter; bumped each time onProgress fires. */
+  tick: number;
+  /** Most recent phase label emitted by the search. */
+  phase: string;
+  /** Wall-clock elapsed (ms) at the last tick. */
+  elapsedMs: number;
+  /** Remaining budget (ms) at the last tick; ≤0 once timed out. */
+  remainingMs: number;
+  /** Full timeout budget (ms) the current run was started with. */
+  timeoutMs: number;
+}
+
 export interface AppState {
   morpho: MorphogenesisState;
   selectedNodeIds: number[];
   selectedMemberIds: number[];
+  search: SearchLiveInfo;
 }
 
 export type AppAction =
-  | { type: 'SEARCH'; n: number; points: Vec3[] | null; seed?: number }
+  | { type: 'SEARCH_START'; timeoutMs: number }
+  | {
+      type: 'SEARCH_TICK';
+      morpho: MorphogenesisState;
+      phase: string;
+      tick: number;
+      elapsedMs: number;
+      remainingMs: number;
+    }
+  | {
+      type: 'SEARCH_DONE';
+      morpho: MorphogenesisState;
+      status: 'done' | 'timeout' | 'aborted';
+      elapsedMs: number;
+    }
   | { type: 'CLEAR' }
   | { type: 'SELECT_NODES'; ids: number[] }
   | { type: 'SELECT_MEMBERS'; ids: number[] };
+
+// The payload shape of SEARCH_START that the UI provides to the
+// async driver. Kept here so callers don't have to reach into the
+// morphogenesis package.
+export interface SearchRequest {
+  n: number;
+  points: Vec3[] | null;
+  seed?: number;
+  timeoutMs: number;
+}
