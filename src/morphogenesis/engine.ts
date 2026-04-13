@@ -160,6 +160,14 @@ export function initializeK5(state: MorphogenesisState, points: Vec3[]): CellRow
  * Once W has been populated, every member inherits a force density
  * read off from the first basis column (Section 3 of the paper). This
  * is what downstream visualisation / constraint checks consume.
+ *
+ * Critically, we always re-derive member TYPE from the sign of the
+ * force density we just assigned. The previous implementation only
+ * re-typed 'candidate' members, which meant that members typed at
+ * init/adhesion time (from their own cell's self-stress) would keep
+ * their original type even if the ambient column-0 self-stress
+ * assigned them the opposite sign — producing cables with negative
+ * force density, which is exactly the regression we're fixing here.
  */
 export function assignForceDensities(state: MorphogenesisState): void {
   const m = state.members.length;
@@ -181,13 +189,15 @@ export function assignForceDensities(state: MorphogenesisState): void {
 
   // SELF_STRESS_ENTRY.w_value already stores force densities (q = w/L),
   // computed directly by cellSelfStress() via Eq.(13). Copy straight
-  // into MEMBER.force_density without re-dividing by L.
+  // into MEMBER.force_density without re-dividing by L, then sync the
+  // member type with the sign of the assigned density.
+  const eps = 1e-10;
   for (let i = 0; i < m; i++) {
     const mem = state.members[i];
     mem.force_density = w[i];
-    if (mem.type === 'candidate') {
-      mem.type = w[i] > 0 ? 'cable' : 'strut';
-    }
+    if (w[i] > eps)       mem.type = 'cable';
+    else if (w[i] < -eps) mem.type = 'strut';
+    else                  mem.type = 'candidate';
   }
 }
 

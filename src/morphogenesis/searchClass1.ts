@@ -18,12 +18,12 @@
 
 import { MorphogenesisState, Vec3 } from './types';
 import { createEmptyState, initializeK5, logEvent, assignForceDensities } from './engine';
-import { adhereCell } from './adhesion';
+import { adhereCell, suggestNewPositions } from './adhesion';
 import { fuseOneEdge } from './fusion';
 import { buildK5Cover } from './k5cover';
-import { buildEquilibriumMatrix, nullspace } from './linalg';
+import { buildEquilibriumMatrix, nullspace, symmetricEigenvalues } from './linalg';
 import { lpClass1Check, lpPairCheck } from './lp';
-import { greedyMatching, Edge } from './matching';
+import { greedyMatching, perturbMatching, Edge } from './matching';
 import { vol } from './geometry';
 
 // ─── Phase 0 ───────────────────────────────────────────────
@@ -158,22 +158,41 @@ function denseW(state: MorphogenesisState): { W: number[][]; memberIdx: Map<numb
   return { W, memberIdx };
 }
 
-/** Materialise Wα and copy it into MEMBER.force_density + type. */
+/**
+ * Materialise w* = W·α and copy it into MEMBER.force_density + type.
+ *
+ * IMPORTANT (C1 correction): the member TYPE is read off the sign of
+ * w*, never from the candidate matching. The matching M is only the
+ * *target* strut set handed to the LP; the LP's feasibility contract
+ * guarantees that, on success, sign(w*_e) agrees with "e ∈ M". If we
+ * were to instead set the type from M membership, then every time the
+ * LP returned a residual-but-we-still-accepted α (or was misclassified
+ * as feasible), we would happily label cables with q < 0 — the exact
+ * bug the cable-force-density regression exposed.
+ *
+ * Members with |w*| < ε at the current α are "zero-force" members:
+ * the LP was free to pick either sign for them. We leave them as
+ * 'candidate' and log the count so the caller can decide whether to
+ * prune them.
+ */
 function applyAlpha(
   state: MorphogenesisState,
   W: number[][],
   alpha: number[],
-  strutIds: Set<number>,
-): void {
+  eps: number = 1e-8,
+): { numStrut: number; numCable: number; numZero: number } {
   state.alpha = [...alpha];
+  let numStrut = 0, numCable = 0, numZero = 0;
   for (let i = 0; i < state.members.length; i++) {
     let v = 0;
     for (let j = 0; j < W[0].length; j++) v += W[i][j] * alpha[j];
     const m = state.members[i];
     m.force_density = v;
-    if (strutIds.has(m.member_id)) m.type = 'strut';
-    else m.type = 'cable';
+    if (v < -eps) { m.type = 'strut'; numStrut++; }
+    else if (v > +eps) { m.type = 'cable'; numCable++; }
+    else { m.type = 'candidate'; numZero++; }
   }
+  return { numStrut, numCable, numZero };
 }
 
 /**
@@ -214,13 +233,63 @@ function findConflicts(
   return out;
 }
 
+/**
+ * Grow dim W by one by adhering a brand-new K₅ cell that shares 4
+ * existing nodes with the current structure. By the Maxwell-rule
+ * corollary, a 4-shared adhesion adds Δe − 3 Δv = 4 − 3 = 1 new
+ * column to W, so repeated calls are guaranteed to raise dim W until
+ * it exceeds |M| + 3 and the Class-1 LP becomes solvable in principle.
+ *
+ * We sample candidate 4-node faces up to `maxTries` times and keep the
+ * first adhesion the engine accepts.
+ */
+function addAdhesionForDim(
+  state: MorphogenesisState,
+  maxTries: number = 20,
+): boolean {
+  if (state.nodes.length < 4) return false;
+  const nodeIds = state.nodes.map(n => n.node_id);
+
+  for (let t = 0; t < maxTries; t++) {
+    // Pick 4 distinct existing nodes uniformly at random.
+    const chosen: number[] = [];
+    const pool = [...nodeIds];
+    for (let k = 0; k < 4 && pool.length > 0; k++) {
+      const idx = Math.floor(Math.random() * pool.length);
+      chosen.push(pool[idx]);
+      pool.splice(idx, 1);
+    }
+    if (chosen.length < 4) return false;
+    const newPos = suggestNewPositions(state, chosen, 1.5);
+    const res = adhereCell(state, chosen, newPos);
+    if (res) {
+      logEvent(state, {
+        kind: 'adhesion',
+        message:
+          `dim-W growth: adhered K₅ on face ${chosen.join(',')} ` +
+          `(+${res.addedMemberIds.length} members, dim W → ${state.selfStressStates.length})`,
+        cell_id: res.cellId,
+        member_ids: res.addedMemberIds,
+        dim_W_after: state.selfStressStates.length,
+      });
+      return true;
+    }
+  }
+  return false;
+}
+
 function enforceClass1(state: MorphogenesisState): {
   success: boolean;
   alpha: number[];
   matching: number[];
 } {
   const MAX_ITER = 40;
+  const MAX_ADHESION_GROWS = 3;  // bound dim-W growth so small-n runs terminate
+  const SIGN_EPS = 1e-8;
   logEvent(state, { kind: 'phase', message: 'Phase 3 — Class-1 enforcement' });
+
+  let perturbSeed = 0;
+  let adhesionGrowCount = 0;
 
   for (let iter = 0; iter < MAX_ITER; iter++) {
     const { W, memberIdx } = denseW(state);
@@ -252,6 +321,8 @@ function enforceClass1(state: MorphogenesisState): {
       matching_ids: [...matching],
     });
 
+    const dimW = state.selfStressStates.length;
+
     // Step D2: LP feasibility check
     const strutIds = matching;
     const cableIds = edges.filter(e => !matching.includes(e.id)).map(e => e.id);
@@ -260,19 +331,64 @@ function enforceClass1(state: MorphogenesisState): {
     logEvent(state, {
       kind: 'lp_check',
       message: `LP ${lp.feasible ? 'feasible' : 'infeasible'} (residual=${lp.residual.toExponential(2)})`,
-      dim_W_before: state.selfStressStates.length,
-      dim_W_after: state.selfStressStates.length,
+      dim_W_before: dimW,
+      dim_W_after: dimW,
     });
 
+    // Sign-pattern verification (C2 correction). Even when the LP
+    // reports feasibility we double-check that w* = W·α really does
+    // pair up with the intended strut/cable split: the LP's hinge-loss
+    // minimiser accepts residuals up to 1e-4, which can allow small
+    // sign flips on members whose |w*| is near ε. However, because
+    // C1 reassigns types from sign(w*) rather than from M membership,
+    // a partial sign-mismatch is only fatal if it breaks Class-1 (two
+    // struts sharing a node). So we accept the LP whenever the
+    // sign-driven relabelling still yields a valid matching; otherwise
+    // we fall through to conflict resolution.
     if (lp.feasible) {
-      applyAlpha(state, W, lp.alpha, new Set(strutIds));
-      state.matching = [...strutIds];
-      logEvent(state, {
-        kind: 'success',
-        message: `Class-1 reached: ${strutIds.length} struts, ${cableIds.length} cables`,
-        matching_ids: [...strutIds],
+      // Tentatively apply α with sign-based typing. We snapshot the
+      // original member types so we can roll back if the resulting
+      // strut set is not a valid matching.
+      const savedTypes = state.members.map(m => m.type);
+      const savedFD = state.members.map(m => m.force_density);
+      const counts = applyAlpha(state, W, lp.alpha, SIGN_EPS);
+
+      const struts = state.members.filter(m => m.type === 'strut');
+      const seen = new Set<number>();
+      let matchingOK = true;
+      for (const s of struts) {
+        if (seen.has(s.node_a) || seen.has(s.node_b)) {
+          matchingOK = false; break;
+        }
+        seen.add(s.node_a); seen.add(s.node_b);
+      }
+
+      if (matchingOK) {
+        const actualStrutIds = struts.map(m => m.member_id);
+        state.matching = actualStrutIds;
+        logEvent(state, {
+          kind: 'success',
+          message:
+            `Class-1 reached: ${counts.numStrut} struts, ${counts.numCable} cables` +
+            (counts.numZero > 0 ? `, ${counts.numZero} zero-force` : ''),
+          matching_ids: actualStrutIds,
+        });
+        return { success: true, alpha: lp.alpha, matching: actualStrutIds };
+      }
+
+      // Roll back and treat as infeasible — the LP's sign assignment
+      // broke Class-1, so we need to retry with another matching or
+      // strategic fusion.
+      state.members.forEach((m, i) => {
+        m.type = savedTypes[i];
+        m.force_density = savedFD[i];
       });
-      return { success: true, alpha: lp.alpha, matching: strutIds };
+      logEvent(state, {
+        kind: 'info',
+        message:
+          'LP α violates Class-1 when types are derived from sign(w*); ' +
+          'treating as infeasible',
+      });
     }
 
     // Step D3: find conflicts
@@ -284,38 +400,57 @@ function enforceClass1(state: MorphogenesisState): {
     });
 
     if (conflicts.length === 0) {
+      // No pairwise conflict is diagnosable — swap one edge of the
+      // matching (ALTERNATIVE_MATCHING) and retry.
       logEvent(state, {
         kind: 'info',
-        message: 'No direct conflicts; falling through to heuristic α',
+        message: 'No direct conflicts; perturbing matching',
       });
-      applyAlpha(state, W, lp.alpha, new Set(strutIds));
-      state.matching = [...strutIds];
-      return { success: false, alpha: lp.alpha, matching: strutIds };
+      const alt = perturbMatching(edges, matching, ++perturbSeed);
+      if (alt.join(',') === matching.join(',')) {
+        // Perturbation exhausted. Honestly assign force densities from
+        // the nullspace and return.
+        assignForceDensities(state);
+        state.matching = state.members
+          .filter(m => m.type === 'strut').map(m => m.member_id);
+        return { success: false, alpha: lp.alpha, matching: state.matching };
+      }
+      continue;
     }
 
     // Step D4: strategic fusion. We zero out the highest-priority
     // blocking member from W using fuseSelfStress — this drops dim W
-    // by 1 and severs the offending sign coupling. We refuse to fuse
-    // below dim W = 1, since that would leave the structure with no
-    // self-stress at all.
-    const dimBefore = state.selfStressStates.length;
-    if (dimBefore <= 1) {
+    // by 1 and severs the offending sign coupling. When fusion is
+    // unavailable (dim W ≤ 1), try growing dim W via adhesion — but
+    // bound the number of growths so we terminate cleanly.
+    if (dimW <= 1) {
+      if (adhesionGrowCount < MAX_ADHESION_GROWS) {
+        logEvent(state, {
+          kind: 'info',
+          message:
+            `dim W ≤ 1: cannot fuse; growing basis by adhesion ` +
+            `(${adhesionGrowCount + 1}/${MAX_ADHESION_GROWS})`,
+        });
+        const grew = addAdhesionForDim(state);
+        if (grew) { adhesionGrowCount++; continue; }
+      }
       logEvent(state, {
         kind: 'failure',
-        message: 'Cannot fuse further: dim W already at 1',
+        message: 'Cannot fuse further and adhesion budget exhausted',
       });
-      applyAlpha(state, W, lp.alpha, new Set(strutIds));
-      state.matching = [...strutIds];
-      return { success: false, alpha: lp.alpha, matching: strutIds };
+      assignForceDensities(state);
+      state.matching = state.members
+        .filter(m => m.type === 'strut').map(m => m.member_id);
+      return { success: false, alpha: lp.alpha, matching: state.matching };
     }
     const pick = conflicts[0];
     logEvent(state, {
       kind: 'strategic_fusion',
       message:
         `Strategic fusion: dropping cable member #${pick.cableId} ` +
-        `(blocking strut #${pick.strutId}), dim W ${dimBefore} → …`,
+        `(blocking strut #${pick.strutId}), dim W ${dimW} → …`,
       member_ids: [pick.strutId, pick.cableId],
-      dim_W_before: dimBefore,
+      dim_W_before: dimW,
     });
     fuseOneEdge(state, pick.cableId);
   }
@@ -342,6 +477,76 @@ function validateMatching(state: MorphogenesisState): boolean {
     seen.add(s.node_a); seen.add(s.node_b);
   }
   return true;
+}
+
+/**
+ * V1 — Force density sign consistency.
+ *
+ * The contract every Class-1 tensegrity must satisfy:
+ *     type(e) = cable ⇒ q_e > +ε
+ *     type(e) = strut ⇒ q_e < -ε
+ * Violations are listed verbatim so the caller can surface them in
+ * the search trace.
+ */
+function validateSignConsistency(
+  state: MorphogenesisState,
+  eps: number = 1e-8,
+): { ok: boolean; violations: Array<{ id: number; type: string; q: number }> } {
+  const violations: Array<{ id: number; type: string; q: number }> = [];
+  for (const m of state.members) {
+    const q = m.force_density ?? 0;
+    if (m.type === 'cable' && q < +eps) {
+      violations.push({ id: m.member_id, type: 'cable', q });
+    } else if (m.type === 'strut' && q > -eps) {
+      violations.push({ id: m.member_id, type: 'strut', q });
+    }
+  }
+  return { ok: violations.length === 0, violations };
+}
+
+/**
+ * V4 — Prestress stability (Connelly & Whiteley, 1996).
+ *
+ * Build the Connelly stress matrix Ω ∈ ℝ^{n×n}:
+ *     Ω_ij = -q_e              if members e = (i, j) exists
+ *     Ω_ii =  Σ_{j ~ i} q_{ij} (row-sum condition for equilibrium)
+ *     Ω_ij =  0                otherwise
+ *
+ * The 3D stress matrix is K_geo = Ω ⊗ I₃. Prestress stability holds
+ * iff K_geo is positive-semidefinite with a 3·4 = 12-dimensional zero
+ * eigenspace coming from affine motions. Since K_geo = Ω ⊗ I₃, every
+ * eigenvalue of Ω appears with multiplicity 3, so we only need to
+ * eigen-decompose the compact n×n matrix Ω.
+ *
+ * The test here is weaker but cheap: we assert that the minimum
+ * eigenvalue of Ω is ≥ -ε, and log the spectrum for inspection. For
+ * infinitesimally rigid structures (which we already verify in V3)
+ * this is necessary and sufficient for prestress stability.
+ */
+function validatePrestressStability(
+  state: MorphogenesisState,
+  eps: number = 1e-6,
+): { ok: boolean; minEig: number } {
+  const n = state.nodes.length;
+  if (n === 0) return { ok: true, minEig: 0 };
+  const idx = new Map<number, number>();
+  state.nodes.forEach((nd, i) => idx.set(nd.node_id, i));
+
+  const Omega: number[][] = Array.from({ length: n }, () => new Array(n).fill(0));
+  for (const m of state.members) {
+    const i = idx.get(m.node_a);
+    const j = idx.get(m.node_b);
+    if (i === undefined || j === undefined) continue;
+    const q = m.force_density ?? 0;
+    Omega[i][j] -= q;
+    Omega[j][i] -= q;
+    Omega[i][i] += q;
+    Omega[j][j] += q;
+  }
+
+  const eigs = symmetricEigenvalues(Omega);
+  const minEig = eigs.length > 0 ? eigs[0] : 0;
+  return { ok: minEig > -eps, minEig };
 }
 
 // ─── Entry point ───────────────────────────────────────────
@@ -377,21 +582,58 @@ export function searchClass1Tensegrity(
 
   const enforced = enforceClass1(state);
 
+  // Ensure force densities are populated even when no LP was run (e.g.
+  // dim W already 0 after strategic fusions). Must happen BEFORE V1/V4
+  // run, otherwise they would be checking the empty state.
+  if (!enforced.success) assignForceDensities(state);
+
   logEvent(state, { kind: 'phase', message: 'Phase 4 — validation' });
+
+  // V3 — infinitesimal rigidity: rank(A) = 3|V| − 6.
   const rigid = validateRigidity(state);
+
+  // V1 — force-density sign consistency. This is the regression guard
+  // for the cable-has-negative-q bug: if any cable's q slipped negative
+  // (or any strut's q slipped positive), fail loudly with the offending
+  // member ids in the event log.
+  const signCheck = validateSignConsistency(state);
+  if (!signCheck.ok) {
+    logEvent(state, {
+      kind: 'failure',
+      message:
+        `V1 sign consistency FAILED on ${signCheck.violations.length} members: ` +
+        signCheck.violations.slice(0, 5)
+          .map(v => `#${v.id}(${v.type}, q=${v.q.toExponential(2)})`)
+          .join(', '),
+      member_ids: signCheck.violations.map(v => v.id),
+    });
+  }
+
+  // V2 — Class-1 matching: every node incident to ≤1 strut.
   const class1 = validateMatching(state);
+
+  // V4 — prestress stability: minimum eigenvalue of the Connelly
+  // stress matrix Ω must be ≥ −ε. Only meaningful once q has been
+  // assigned, which is why this is last.
+  const prestress = validatePrestressStability(state);
   logEvent(state, {
-    kind: rigid && class1 && enforced.success ? 'success' : 'info',
-    message: `Validation: rigid=${rigid}, class1=${class1}, lp=${enforced.success}`,
+    kind: prestress.ok ? 'info' : 'failure',
+    message:
+      `V4 prestress stability: min eig(Ω) = ${prestress.minEig.toExponential(2)} ` +
+      `(${prestress.ok ? 'OK' : 'FAIL'})`,
   });
 
-  // Ensure force densities are populated even when no LP was run (e.g.
-  // dim W already 0 after strategic fusions).
-  if (!enforced.success) assignForceDensities(state);
+  const allOK = rigid && class1 && signCheck.ok && enforced.success;
+  logEvent(state, {
+    kind: allOK ? 'success' : 'info',
+    message:
+      `Validation: rigid=${rigid}, class1=${class1}, ` +
+      `signs=${signCheck.ok}, prestress=${prestress.ok}, lp=${enforced.success}`,
+  });
 
   return {
     state,
-    success: enforced.success,
+    success: enforced.success && signCheck.ok,
     rigid,
     class1,
     numPoints: n,
