@@ -52,12 +52,23 @@ export function solve(A: number[][], b: number[]): number[] | null {
 export function findNullspaceBasis(A: number[][]): number[][] {
   const m = A.length, n = A[0].length;
   const M: number[][] = A.map(row => [...row]);
+
+  // Relative pivot tolerance: avoid promoting round-off from fill-in
+  // into a spurious pivot, which would overestimate the rank and
+  // miss genuine nullspace directions.
+  let absMax = 0;
+  for (let i = 0; i < m; i++) for (let j = 0; j < n; j++) {
+    const v = Math.abs(A[i][j]);
+    if (v > absMax) absMax = v;
+  }
+  const tol = Math.max(1e-12, absMax * 1e-9);
+
   const pivotCols: number[] = [];
   let row = 0;
   for (let col = 0; col < n && row < m; col++) {
     let maxVal = 0, maxRow = row;
     for (let r = row; r < m; r++) if (Math.abs(M[r][col]) > maxVal) { maxVal = Math.abs(M[r][col]); maxRow = r; }
-    if (maxVal < 1e-10) continue;
+    if (maxVal < tol) continue;
     [M[row], M[maxRow]] = [M[maxRow], M[row]];
     for (let r = 0; r < m; r++) {
       if (r === row) continue;

@@ -18,6 +18,7 @@ export function appReducer(state: AppState, action: AppAction): AppState {
         spread: action.spread,
         fuseProbability: action.fuseProbability,
         maxCompDeg: action.maxCompDeg,
+        adhesionAttempts: action.adhesionAttempts,
       });
       return { ...state, morpho, selectedNodeIds: [], selectedEdgeIds: [] };
     }

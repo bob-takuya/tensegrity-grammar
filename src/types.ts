@@ -12,7 +12,7 @@ export interface AppState {
 }
 
 export type AppAction =
-  | { type: 'GENERATE'; numCells: number; spread: number; fuseProbability: number; maxCompDeg: number }
+  | { type: 'GENERATE'; numCells: number; spread: number; fuseProbability: number; maxCompDeg: number; adhesionAttempts: number }
   | { type: 'CLEAR' }
   | { type: 'SELECT_NODES'; ids: number[] }
   | { type: 'SELECT_EDGES'; ids: number[] }

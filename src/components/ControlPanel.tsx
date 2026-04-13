@@ -7,6 +7,7 @@ export function ControlPanel() {
   const [spread, setSpread] = useState(0.4);
   const [fuseProbability, setFuseProbability] = useState(0.2);
   const [maxCompDeg, setMaxCompDeg] = useState(1); // 1 = Class-1
+  const [adhesionAttempts, setAdhesionAttempts] = useState(6);
 
   const { morpho } = state;
   const nNodes = morpho.graph.nodes.length;
@@ -43,9 +44,17 @@ export function ControlPanel() {
         </div>
 
         <div className="param-group">
+          <label>K₅ adhesion attempts<span className="param-value">{adhesionAttempts}</span></label>
+          <input type="range" min={0} max={20} step={1} value={adhesionAttempts}
+            onChange={e => setAdhesionAttempts(parseInt(e.target.value))} />
+          <div className="param-hint">Glue K₅ cells onto 3–4 existing nodes; accepted only if Class-k holds.</div>
+        </div>
+
+        <div className="param-group">
           <label>Fusion rate<span className="param-value">{(fuseProbability * 100).toFixed(0)}%</span></label>
           <input type="range" min={0} max={0.5} step={0.05} value={fuseProbability}
             onChange={e => setFuseProbability(parseFloat(e.target.value))} />
+          <div className="param-hint">Remove zero-force edges using nullspace freedom.</div>
         </div>
 
         <div className="param-group">
@@ -60,7 +69,7 @@ export function ControlPanel() {
         </div>
 
         <button className="generate-btn"
-          onClick={() => dispatch({ type: 'GENERATE', numCells, spread, fuseProbability, maxCompDeg })}>
+          onClick={() => dispatch({ type: 'GENERATE', numCells, spread, fuseProbability, maxCompDeg, adhesionAttempts })}>
           Generate
         </button>
 
