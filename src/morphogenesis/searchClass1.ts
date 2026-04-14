@@ -998,6 +998,36 @@ async function enforceClass1(
         seen.add(s.node_a); seen.add(s.node_b);
       }
 
+      // Visual connectivity check — a "success" is only valid
+      // if every input node touches at least one non-candidate
+      // member. Otherwise the user gets a trapezoid of 4 visible
+      // struts with the rest of the input points hanging as
+      // isolated dots, which is not a useful tensegrity.
+      if (matchingOK) {
+        const connectedNow = new Set<number>();
+        for (const m of state.members) {
+          if (m.type === 'candidate') continue;
+          connectedNow.add(m.node_a);
+          connectedNow.add(m.node_b);
+        }
+        const allVisuallyConnected = state.nodes.every(
+          nd => connectedNow.has(nd.node_id),
+        );
+        if (!allVisuallyConnected) {
+          const isolated = state.nodes.filter(
+            nd => !connectedNow.has(nd.node_id),
+          ).length;
+          logEvent(state, {
+            kind: 'info',
+            message:
+              `sign(Wα) is a valid matching but ${isolated} node(s) are ` +
+              `visually isolated (only touch candidate members); ` +
+              `rejecting as non-success and continuing the search`,
+          });
+          matchingOK = false;
+        }
+      }
+
       if (matchingOK) {
         const actualStrutIds = struts.map(m => m.member_id);
         state.matching = actualStrutIds;
@@ -1867,16 +1897,34 @@ async function runCoverAttempt(
   }
   let classK = 0;
   for (const c of strutCount.values()) if (c > classK) classK = c;
+  // Visually-connected definition: every input node must touch
+  // at least one NON-candidate member. Candidate members are
+  // zero-force fillers hidden from the Viewer3D, so a node that
+  // only touches candidates is visually isolated even though
+  // `state.members` has entries referencing it. Using the
+  // stricter check here means `allConnected=true` in the
+  // returned result actually matches what the user sees in the
+  // 3D view.
   const connected = new Set<number>();
   for (const m of state.members) {
+    if (m.type === 'candidate') continue;
     connected.add(m.node_a);
     connected.add(m.node_b);
   }
   const allConnected = state.nodes.every(nd => connected.has(nd.node_id));
 
+  // A Class-1 "success" from enforceClass1 is necessary but not
+  // sufficient: if the resulting structure has visually-isolated
+  // nodes (connected only via candidate members) we report it
+  // as NOT success. The caller's best-result tracking still
+  // picks this up as an improvement over a completely failed
+  // attempt, but won't announce "Class-1 tensegrity found" on
+  // a trapezoid with 8 floating dots.
+  const visuallySuccess = enforced.success && signCheck.ok && class1 && allConnected;
+
   return {
     state,
-    success: enforced.success && signCheck.ok && class1,
+    success: visuallySuccess,
     rigid,
     class1,
     numPoints: n,
@@ -1885,7 +1933,11 @@ async function runCoverAttempt(
     timedOut: enforced.timedOut,
     elapsedMs,
     searchStats: stats,
-    bestResultNote: allOK ? 'Class-1 tensegrity found' : 'attempt did not yield Class-1',
+    bestResultNote: visuallySuccess
+      ? 'Class-1 tensegrity found'
+      : (allOK && !allConnected
+          ? 'Class-1 LP reached but some nodes are visually isolated'
+          : 'attempt did not yield Class-1'),
   };
 }
 
@@ -1921,9 +1973,20 @@ function updateBestFromState(
 ): BestResult {
   const nMembers = state.members.length;
 
-  // Connected-node check.
+  // Visually-connected check. `allConnected` must mean "every
+  // input node participates in at least one *non-candidate*
+  // member", i.e. a strut or cable. The Viewer3D renderer
+  // hides candidate members (|q| ≈ 0) because drawing them
+  // as thin cables lied about the structure — but that means
+  // a best snapshot with every node only touched by
+  // candidates looks like a disconnected trapezoid in the UI
+  // even when allConnected=true under the old "any member"
+  // definition. The fix is to tighten the criterion to match
+  // what the user actually sees: a node is connected iff at
+  // least one of its edges is drawn.
   const connected = new Set<number>();
   for (const m of state.members) {
+    if (m.type === 'candidate') continue;
     connected.add(m.node_a);
     connected.add(m.node_b);
   }
