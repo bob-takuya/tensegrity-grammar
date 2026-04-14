@@ -15,7 +15,7 @@ import type { Vec3 } from '../morphogenesis/types';
  * Stop button aborts the current run via AbortController.
  */
 export function ControlPanel() {
-  const { state, runSearch, stopSearch, dispatch } = useAppState();
+  const { state, runSearch, runTriplex, stopSearch, dispatch } = useAppState();
   const [n, setN] = useState(12);
   const [timeoutSec, setTimeoutSec] = useState(10);
   const [customMode, setCustomMode] = useState(false);
@@ -81,39 +81,56 @@ export function ControlPanel() {
   }[search.status];
 
   /**
-   * Preset: load the 6 canonical Triplex points into the custom
-   * textarea. Bottom triangle {A, B, C} sits at z = 0 on angles
-   * 0°, 120°, 240°; top triangle {D, E, F} at z = h on angles
-   * 30°, 150°, 270° — a 30° (π/6) twist from the bottom. These
-   * are the coordinates used by the Triplex manual-construction
-   * regression test, so clicking the button gives the same
-   * starting configuration the algorithm is expected to solve.
+   * Return the 6 canonical Triplex points. Bottom triangle
+   * {A, B, C} sits at z = 0 on angles 0°, 120°, 240°; top triangle
+   * {D, E, F} at z = h on angles 30°, 150°, 270° (a 30° / π/6 twist
+   * from the bottom).
    */
-  const loadTriplexPreset = () => {
+  const triplexPoints = (): Vec3[] => {
     const r = 1.0;
     const h = 1.2;
     const twist = Math.PI / 6;
-    const fmt = (v: number) => v.toFixed(4);
-    const pt = (angle: number, z: number) =>
-      `${fmt(r * Math.cos(angle))} ${fmt(r * Math.sin(angle))} ${fmt(z)}`;
+    return [
+      [r * Math.cos(0),                     r * Math.sin(0),                     0],
+      [r * Math.cos((2 * Math.PI) / 3),     r * Math.sin((2 * Math.PI) / 3),     0],
+      [r * Math.cos((4 * Math.PI) / 3),     r * Math.sin((4 * Math.PI) / 3),     0],
+      [r * Math.cos(twist),                 r * Math.sin(twist),                 h],
+      [r * Math.cos(twist + (2 * Math.PI) / 3), r * Math.sin(twist + (2 * Math.PI) / 3), h],
+      [r * Math.cos(twist + (4 * Math.PI) / 3), r * Math.sin(twist + (4 * Math.PI) / 3), h],
+    ];
+  };
 
+  /**
+   * Button handler: run the hand-crafted Triplex construction (seed
+   * K₅ → adhere K₅ {BCDEF} → fuse BD → fuse CE → validate) on the
+   * 6 preset points. Bypasses the greedy search because the specific
+   * fusion sequence Aloui §5 requires is not something greedy LP
+   * enforcement can discover on its own — feeding random Triplex
+   * points through searchClass1Tensegrity consistently produces
+   * "LP failed, no struts", hence this dedicated entry point.
+   *
+   * We also populate the custom textarea with the same coordinates
+   * so the user can inspect them and switch to the normal search
+   * afterwards if they want to compare.
+   */
+  const loadTriplexPreset = () => {
+    const pts = triplexPoints();
+    const fmt = (v: number) => v.toFixed(4);
     const lines = [
       '# Triplex canonical configuration (Aloui et al. §5)',
       '# Bottom triangle  A, B, C at z=0, angles 0° 120° 240°',
-      pt(0, 0),
-      pt((2 * Math.PI) / 3, 0),
-      pt((4 * Math.PI) / 3, 0),
+      ...pts.slice(0, 3).map(p => `${fmt(p[0])} ${fmt(p[1])} ${fmt(p[2])}`),
       '# Top triangle     D, E, F at z=h, twisted by 30°',
-      pt(twist, h),
-      pt(twist + (2 * Math.PI) / 3, h),
-      pt(twist + (4 * Math.PI) / 3, h),
+      ...pts.slice(3).map(p => `${fmt(p[0])} ${fmt(p[1])} ${fmt(p[2])}`),
     ];
     setCustomText(lines.join('\n'));
     setCustomMode(true);
     setN(6);
-    // Clear the seed so the user isn't confused about
-    // determinism — Triplex is exact, not stochastic.
     setSeed('');
+    // Fire the manual Triplex construction immediately so the
+    // viewer shows the correct result (3 struts A-E, C-D, B-F,
+    // 9 cables) without the user having to also click Search.
+    runTriplex(pts, Math.max(100, Math.round(timeoutSec * 1000)));
   };
 
   return (
@@ -357,7 +374,14 @@ export function ControlPanel() {
               icon = '✗';
               const reasons: string[] = [];
               if (!search.lpSuccess) reasons.push('LP failed');
-              if (!search.class1) reasons.push(`Class-${Math.max(1, actualMaxComp)}`);
+              // Only label a Class-N violation when there ARE struts
+              // but they share a node. "no struts" handles the empty
+              // case below, and we don't want to print "Class-1" as a
+              // failure reason (the old Math.max(1, 0) produced that
+              // misleading string for zero-strut structures).
+              if (!search.class1 && nStruts > 0 && actualMaxComp >= 2) {
+                reasons.push(`Class-${actualMaxComp}`);
+              }
               if (!search.rigid) reasons.push('not rigid');
               if (nStruts === 0) reasons.push('no struts');
               label = reasons.length > 0
