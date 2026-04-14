@@ -1292,6 +1292,51 @@ async function enforceClass1(
     // by 1 and severs the offending sign coupling. When fusion is
     // unavailable (dim W ≤ 1), try growing dim W via adhesion — but
     // bound the number of growths so we terminate cleanly.
+    //
+    // spec-v9 guard — skip strategic fusion on trivial α.
+    //
+    // `findConflicts` operates on W alone (row determinants) and
+    // therefore happily reports pairwise "conflicts" even when the
+    // LP descent is parked at the degenerate α ≈ 0 minimum. Those
+    // conflicts reflect nothing about the *actual* infeasible
+    // direction — they're just geometric rank collisions — and
+    // fusing them mechanically erodes dim W without moving toward
+    // a real solution. On the Triplex that loop takes 8–24
+    // iterations (each eating ~500 ms of rAF yield time) before
+    // stumbling into a feasible adhesion. Skipping strategic
+    // fusion when α is trivial and growing dim W instead turns
+    // the same run into 2–4 iterations.
+    if (alphaIsTrivial) {
+      logEvent(state, {
+        kind: 'info',
+        message:
+          `Strategic fusion skipped: α is trivial ` +
+          `(max|Wα|=${maxAbsWalpha.toExponential(2)}); ` +
+          `${conflicts.length} pairwise conflict(s) detected ` +
+          `but unreliable — growing dim W instead`,
+      });
+      if (adhesionGrowCount < MAX_ADHESION_GROWS) {
+        const grew = addAdhesionForDim(state);
+        if (grew) { adhesionGrowCount++; continue; }
+      }
+      // adhesion budget exhausted → perturb the matching to force
+      // the LP to retarget before we declare defeat.
+      const altTriv = perturbMatching(edges, matching, ++perturbSeed);
+      if (altTriv.join(',') !== matching.join(',')) {
+        forcedMatching = altTriv;
+        continue;
+      }
+      assignForceDensities(state);
+      state.matching = state.members
+        .filter(m => m.type === 'strut').map(m => m.member_id);
+      return {
+        success: false,
+        alpha: lp.alpha,
+        matching: state.matching,
+        timedOut: false,
+      };
+    }
+
     if (dimW <= 1) {
       if (adhesionGrowCount < MAX_ADHESION_GROWS) {
         logEvent(state, {
