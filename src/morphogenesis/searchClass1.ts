@@ -397,40 +397,72 @@ function findConflicts(
 }
 
 /**
- * Grow dim W by one by adhering a brand-new K₅ cell that shares 4
- * existing nodes with the current structure. By the Maxwell-rule
- * corollary, a 4-shared adhesion adds Δe − 3 Δv = 4 − 3 = 1 new
- * column to W, so repeated calls are guaranteed to raise dim W until
- * it exceeds |M| + 3 and the Class-1 LP becomes solvable in principle.
+ * Grow dim W by one by registering a brand-new K₅ cell on five
+ * **existing input nodes** — never adds a non-input node to the
+ * final structure.
  *
- * We sample candidate 4-node faces up to `maxTries` times and keep the
- * first adhesion the engine accepts.
+ * Why the earlier implementation was buggy
+ * ────────────────────────────────────────
+ * The previous version sampled 4 existing nodes, conjured up a 5th
+ * position via `suggestNewPositions`, and called
+ *   adhereCell(state, chosen4, [newPosition])
+ * The newly-added node was placed roughly above the centroid of the
+ * chosen face. It had no way of ever being removed (no fusion target
+ * visits it), so it persisted in `state.nodes` until Phase 4. For
+ * small n (5–8) this meant the final `state.nodes.length` exceeded
+ * the caller-requested n by 2–4 nodes on a regular basis, violating
+ * the fundamental user contract "the structure has exactly the n
+ * points I gave you".
+ *
+ * The fix
+ * ────────
+ * 1. Restrict the candidate pool to the nodes that were placed by
+ *    the original K₅ cover — tracked via `state.inputNodeIds`.
+ * 2. Pick 5 distinct input nodes and register them as a new K₅
+ *    cell. We reuse `adhereCell` but with `newPositions = []`,
+ *    which the adhesion layer now accepts (sharedIds ∈ {3, 4, 5}).
+ *    The result is a new SELF_STRESS_STATE column computed from
+ *    the 5 existing coordinates, zero new nodes, and a bump in
+ *    dim W — exactly the algorithmic effect we wanted without the
+ *    phantom extra nodes.
+ * 3. If `state.inputNodeIds` has fewer than 5 entries (e.g. the
+ *    caller never went through `buildStructureFromCover`, or the
+ *    input structure hasn't been built yet), we bail immediately
+ *    rather than fall back to adding new nodes.
  */
 function addAdhesionForDim(
   state: MorphogenesisState,
   maxTries: number = 20,
 ): boolean {
-  if (state.nodes.length < 4) return false;
-  const nodeIds = state.nodes.map(n => n.node_id);
+  const inputIds = state.nodes
+    .filter(n => state.inputNodeIds.has(n.node_id))
+    .map(n => n.node_id);
+  if (inputIds.length < 5) return false;
 
   for (let t = 0; t < maxTries; t++) {
-    // Pick 4 distinct existing nodes uniformly at random.
+    // Pick 5 distinct input nodes uniformly at random.
     const chosen: number[] = [];
-    const pool = [...nodeIds];
-    for (let k = 0; k < 4 && pool.length > 0; k++) {
+    const pool = [...inputIds];
+    for (let k = 0; k < 5 && pool.length > 0; k++) {
       const idx = Math.floor(Math.random() * pool.length);
       chosen.push(pool[idx]);
       pool.splice(idx, 1);
     }
-    if (chosen.length < 4) return false;
-    const newPos = suggestNewPositions(state, chosen, 1.5);
-    const res = adhereCell(state, chosen, newPos);
+    if (chosen.length < 5) return false;
+
+    // Register the 5 existing nodes as a new K₅ cell. adhereCell's
+    // relaxed share-count check (≤ 5) handles the newPositions = []
+    // case: no new nodes are added, any K₅ edges that weren't yet
+    // members are created, and the cell's self-stress column is
+    // appended to W (bumping dim W).
+    const res = adhereCell(state, chosen, []);
     if (res) {
       logEvent(state, {
         kind: 'adhesion',
         message:
-          `dim-W growth: adhered K₅ on face ${chosen.join(',')} ` +
-          `(+${res.addedMemberIds.length} members, dim W → ${state.selfStressStates.length})`,
+          `dim-W growth: K₅ registered on existing input nodes ` +
+          `[${chosen.join(',')}] (+${res.addedMemberIds.length} members, ` +
+          `dim W → ${state.selfStressStates.length})`,
         cell_id: res.cellId,
         member_ids: res.addedMemberIds,
         dim_W_after: state.selfStressStates.length,
@@ -1064,6 +1096,13 @@ export async function searchClass1Tensegrity(
   const P = generateOrValidatePoints(n, points, seed);
 
   const buildResult = await buildStructureFromCover(P, state, yieldFn);
+
+  // Freeze the "input node set": every node currently in
+  // state.nodes came straight from the original point array P via
+  // initializeK5 / adhereCell in buildStructureFromCover. Phase 3's
+  // dim-W growth helper consults this set so it never adds a
+  // non-input node to the final structure.
+  state.inputNodeIds = new Set(state.nodes.map(n => n.node_id));
 
   if (!buildResult.built) {
     // Hard failure — we couldn't even lay down the seed K₅. Nothing
