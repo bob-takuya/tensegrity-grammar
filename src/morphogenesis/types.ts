@@ -159,6 +159,19 @@ export interface MorphogenesisState {
   // Current matching (member_ids chosen as struts)
   matching: number[];
 
+  /**
+   * Node IDs that correspond to the CALLER-PROVIDED input points.
+   * Populated by `searchClass1Tensegrity` at the end of Phase 2,
+   * when `state.nodes` still contains only the n input points.
+   * Phase 3's `addAdhesionForDim` must filter by this set so it
+   * never injects a non-input node into the final structure —
+   * otherwise a run of n=5 can end up with 7-9 nodes in
+   * `state.nodes`, violating the fundamental contract "the final
+   * structure has exactly the user's n points". Empty when no
+   * input structure has been built yet.
+   */
+  inputNodeIds: Set<number>;
+
   // Auto-increment counters
   nextNodeId: number;
   nextMemberId: number;

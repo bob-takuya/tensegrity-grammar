@@ -94,7 +94,12 @@ export function adhereCell(
   sharedIds: number[],
   newPositions: Vec3[],
 ): AdhesionResult | null {
-  if (sharedIds.length < 3 || sharedIds.length > 4) return null;
+  // Accept share counts in {3, 4, 5}. The 5-shared case is used by
+  // `addAdhesionForDim` to register a K₅ whose 5 nodes are ALREADY
+  // in the structure — we need the extra self-stress column but we
+  // must never add a new non-input node. The rest of the function
+  // handles any share count because `newPositions` can be empty.
+  if (sharedIds.length < 3 || sharedIds.length > 5) return null;
   if (sharedIds.length + newPositions.length !== 5) return null;
   for (const sid of sharedIds) {
     if (!state.nodes.find(n => n.node_id === sid)) return null;

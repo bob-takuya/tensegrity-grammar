@@ -38,6 +38,7 @@ export function createEmptyState(): MorphogenesisState {
     events: [],
     alpha: [],
     matching: [],
+    inputNodeIds: new Set<number>(),
     nextNodeId: 0,
     nextMemberId: 0,
     nextCellId: 0,
