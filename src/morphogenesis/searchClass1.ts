@@ -112,10 +112,24 @@ function createYield(
       state,
     });
     if (yieldToLoop) {
-      // Yield a macrotask so React can re-render the viewer panel
-      // with the latest mutations. A 0-ms setTimeout is sufficient
-      // because the browser batches paint after the macrotask.
-      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      // Yield until the next browser paint. requestAnimationFrame
+      // fires right before a frame is committed, which means: the
+      // search synchronously dispatches onProgress → React schedules
+      // a re-render → the current microtask ends → rAF fires → the
+      // browser paints the new frame → we resume the search. This
+      // gives the viewer a natural ~60 Hz animation loop and avoids
+      // the "search finishes too fast to see anything" problem that
+      // a plain `setTimeout(0)` has when paints are coalesced.
+      //
+      // In Node (tests) `requestAnimationFrame` is undefined, so we
+      // fall back to a macrotask.
+      await new Promise<void>((resolve) => {
+        if (typeof requestAnimationFrame !== 'undefined') {
+          requestAnimationFrame(() => resolve());
+        } else {
+          setTimeout(resolve, 0);
+        }
+      });
     }
     return deadlineReached || (options.signal?.aborted ?? false);
   };
@@ -241,6 +255,11 @@ async function buildStructureFromCover(
     }
     // Record new runtime ids for the newly introduced source-point indices
     newIdx.forEach((srcIdx, k) => nodeIdOf.set(srcIdx, res.addedNodeIds[k]));
+    // Post-adhesion yield: the viewer should paint the new cell
+    // before we start the next one. Without this, Phase 2 runs to
+    // completion in a single microtask and the user never sees the
+    // structure growing step by step.
+    if (await yieldFn(`Phase 2 · cell ${step}/${cover.length - 1} adhered`)) return true;
   }
 
   return true;
@@ -637,8 +656,21 @@ function validateRigidity(state: MorphogenesisState): boolean {
   return rank >= 3 * state.nodes.length - 6;
 }
 
+/**
+ * V2 — Class-1 matching condition.
+ *
+ * A Class-1 tensegrity requires that every node is incident to **at
+ * most one strut**. A structure with *zero* struts would trivially
+ * satisfy the "at most one" graph rule, but it is not a tensegrity
+ * at all — there are no compression elements holding the cable net
+ * apart — so we also require that at least one strut exists. Without
+ * this extra guard, the validator would report `class1 = true` on
+ * runs where the LP failed and `assignForceDensities` left every
+ * member with q ≈ 0 / type 'candidate' (#seed 101, n = 10).
+ */
 function validateMatching(state: MorphogenesisState): boolean {
   const struts = state.members.filter(m => m.type === 'strut');
+  if (struts.length === 0) return false;
   const seen = new Set<number>();
   for (const s of struts) {
     if (seen.has(s.node_a) || seen.has(s.node_b)) return false;
