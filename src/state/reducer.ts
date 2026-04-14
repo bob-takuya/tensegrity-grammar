@@ -29,28 +29,19 @@ export function createInitialState(): AppState {
 
 /**
  * Shallow-clone the live morphogenesis state so React sees a new
- * reference on every tick. The inner arrays are the *same* references
- * that the search mutates in-place — consumers should treat them as
- * append-only streams, not mutate-in-place snapshots. Creating a
- * fresh outer object is cheap and enough to re-trigger `useEffect`
- * dependencies that watch `state.morpho`.
+ * reference on every tick. We only spread the outer object — the
+ * inner arrays (nodes, members, events, …) are passed by reference.
+ * That is intentional: the search mutates them in place between
+ * yields, and the only thing React needs to re-run effects is a new
+ * outer object reference. Keeping the inner references stable lets
+ * downstream `useMemo` / `React.memo` bail out when the underlying
+ * array hasn't actually changed — e.g. `strutIds` on `m.matching`,
+ * the memoised `EventList`, etc. Copying all 12 inner arrays on
+ * every tick was a measurable overhead (~1 ms/tick) AND defeated
+ * the child memoisation.
  */
 function shallowCloneMorpho(m: AppState['morpho']): AppState['morpho'] {
-  return {
-    ...m,
-    nodes: m.nodes.slice(),
-    members: m.members.slice(),
-    cells: m.cells.slice(),
-    cellMembers: m.cellMembers.slice(),
-    cellAdjacency: m.cellAdjacency.slice(),
-    selfStressStates: m.selfStressStates.slice(),
-    selfStressEntries: m.selfStressEntries.slice(),
-    morphogenesisSteps: m.morphogenesisSteps.slice(),
-    removedMembers: m.removedMembers.slice(),
-    events: m.events.slice(),
-    alpha: m.alpha.slice(),
-    matching: m.matching.slice(),
-  };
+  return { ...m };
 }
 
 export function appReducer(state: AppState, action: AppAction): AppState {

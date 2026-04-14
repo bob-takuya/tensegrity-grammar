@@ -55,6 +55,21 @@ export function Inspector() {
     [morpho.matching],
   );
 
+  // Stabilise the `events` slice passed into EventList. `morpho`
+  // is a fresh object every search tick (the reducer shallow-clones
+  // the outer state), but as long as the underlying events array
+  // hasn't grown we can return the *same* slice reference so the
+  // memoised EventList bails out instead of reconciling hundreds
+  // of <li>s every frame. When new events arrive, events.length
+  // changes and we recompute a fresh tail slice.
+  const eventsLen = morpho.events.length;
+  const recentEvents = useMemo(
+    () => morpho.events.slice(Math.max(0, eventsLen - MAX_EVENT_ROWS)),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [eventsLen],
+  );
+  const eventsHidden = eventsLen - recentEvents.length;
+
   return (
     <div className="inspector">
       <div className="inspector-tabs">
@@ -79,7 +94,7 @@ export function Inspector() {
       </div>
 
       <div className="inspector-content">
-        {tab === 'events' && <EventList events={morpho.events} />}
+        {tab === 'events' && <EventList events={recentEvents} hidden={eventsHidden} />}
         {tab === 'tables' && <TablesView morpho={morpho} strutIds={strutIds} />}
         {tab === 'graph' && <GraphView morpho={morpho} />}
       </div>
@@ -89,12 +104,33 @@ export function Inspector() {
 
 // ─── Events ─────────────────────────────────────────────────
 
-function EventList({ events }: { events: SearchEvent[] }) {
-  if (events.length === 0) {
+// Cap the number of event rows we actually render. During a long
+// search the events array grows to hundreds of entries, and
+// reconciling that many <li>s on every live tick is the dominant
+// React cost — it's what keeps the viewer at ~1 fps on larger n.
+// The tail is the most interesting part anyway (most recent phase,
+// last LP conflict, etc.) so we slice to the most recent MAX_EVENTS.
+const MAX_EVENT_ROWS = 120;
+
+const EventList = React.memo(function EventList({
+  events,
+  hidden,
+}: {
+  events: SearchEvent[];
+  hidden: number;
+}) {
+  if (events.length === 0 && hidden === 0) {
     return <p className="inspector-empty">No events. Click <b>Search</b> to begin.</p>;
   }
   return (
     <ol className="event-list">
+      {hidden > 0 && (
+        <li className="event-row" style={{ opacity: 0.6, fontStyle: 'italic' }}>
+          <span className="event-message">
+            … {hidden} earlier event{hidden === 1 ? '' : 's'} omitted
+          </span>
+        </li>
+      )}
       {events.map(ev => (
         <li key={ev.event_id} className="event-row">
           <span
@@ -118,7 +154,7 @@ function EventList({ events }: { events: SearchEvent[] }) {
       ))}
     </ol>
   );
-}
+});
 
 // ─── Tables ─────────────────────────────────────────────────
 
