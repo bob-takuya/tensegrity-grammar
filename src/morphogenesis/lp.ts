@@ -207,36 +207,26 @@ export function lpClass1Check(
     }
   }
 
-  // Normalise α so the largest |(Wα)| lands at 1 — keeps the chosen
-  // force densities in a consistent scale for visualisation.
-  const w = evalWalpha(best);
-  let maxAbs = 0;
-  for (const v of w) if (Math.abs(v) > maxAbs) maxAbs = Math.abs(v);
-  if (maxAbs > 1e-12) {
-    for (let j = 0; j < k; j++) best[j] /= maxAbs;
-  }
-
-  // Per-constraint feasibility check. The hinge-loss threshold alone
-  // is insufficient: the degenerate minimum α = 0 has a loss of
-  // |E|·ε², which for ε=1e-6 is ~1e-11 and sails under any reasonable
-  // absolute threshold — yet it corresponds to a structure where
-  // every member has force density zero, which is certainly NOT a
-  // Class-1 solution. We therefore re-evaluate each constraint on the
-  // *normalised* α and require a positive margin.
+  // Per-constraint feasibility check on the RAW (un-normalised) α.
   //
-  // After normalisation we expect max|Wα| = 1, so we demand that
-  // strut rows hit ≤ -(ε/2) and cable rows hit ≥ +(ε/2). A solution
-  // whose α was scaled by maxAbs≈0 will have all |(Wα)_e| ≈ ε/maxAbs,
-  // which fails this check unless maxAbs itself was ≥ ε.
-  const wNorm = evalWalpha(best);
+  // We used to divide α by max|Wα| for "consistent visualisation
+  // scale", but that normalisation compressed the smallest
+  // satisfying values (ε/max|Wα|) below applyAlpha's SIGN_EPS
+  // whenever max|Wα| grew beyond ~100, causing valid struts and
+  // cables to be mis-classified as 'candidate' (the Triplex
+  // regression). We keep α at its natural scale here — the hard
+  // feasibility check already handles scale via `eps`, and
+  // applyAlpha uses |Wα| ≥ ε = 1e-6 to decide types, which is
+  // comfortable above its 1e-8 epsilon regardless of problem size.
+  const wRaw = evalWalpha(best);
   let hardFeasible = true;
   const margin = eps * 0.5;
   for (const e of strutRows) {
-    if (!(wNorm[e] <= -margin)) { hardFeasible = false; break; }
+    if (!(wRaw[e] <= -margin)) { hardFeasible = false; break; }
   }
   if (hardFeasible) {
     for (const e of cableRows) {
-      if (!(wNorm[e] >= +margin)) { hardFeasible = false; break; }
+      if (!(wRaw[e] >= +margin)) { hardFeasible = false; break; }
     }
   }
 
