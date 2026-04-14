@@ -21,6 +21,24 @@ export function Viewer3D() {
     isDragging: false, isPanning: false, lastX: 0, lastY: 0,
   });
 
+  // Shared geometries and materials, created once and reused across
+  // every scene rebuild. Previously the rebuild effect allocated a
+  // fresh CylinderGeometry + cloned MeshStandardMaterial per member
+  // per tick. For n=12 with ~80 members at 60 Hz that was ~10k THREE
+  // allocations / second churning through the GPU driver — easily
+  // enough to drop the effective viewer framerate to ~1 fps on
+  // mid-range hardware. Struts and cables are drawn by scaling a
+  // shared unit-length cylinder in the mesh's local matrix.
+  const sharedRef = useRef<{
+    strutGeo: THREE.CylinderGeometry;
+    cableGeo: THREE.CylinderGeometry;
+    nodeGeo: THREE.SphereGeometry;
+    strutMat: THREE.MeshStandardMaterial;
+    cableMat: THREE.MeshStandardMaterial;
+    nodeMat: THREE.MeshStandardMaterial;
+    selectedMat: THREE.MeshStandardMaterial;
+  } | null>(null);
+
   // Initialize Three.js
   useEffect(() => {
     const container = containerRef.current;
@@ -43,6 +61,24 @@ export function Viewer3D() {
     dir.position.set(5, 10, 7); dir.castShadow = true;
     scene.add(dir);
     scene.add(new THREE.DirectionalLight(0xffffff, 0.3).translateX(-3).translateY(5).translateZ(-5));
+
+    // Create shared geometries and materials once. We use
+    // unit-length cylinders (length 1 along X) and scale per
+    // member via the mesh matrix to avoid allocating a new
+    // geometry for every bar.
+    const strutGeo = new THREE.CylinderGeometry(0.04, 0.04, 1, 8);
+    strutGeo.rotateZ(Math.PI / 2);
+    const cableGeo = new THREE.CylinderGeometry(0.012, 0.012, 1, 4);
+    cableGeo.rotateZ(Math.PI / 2);
+    sharedRef.current = {
+      strutGeo,
+      cableGeo,
+      nodeGeo: new THREE.SphereGeometry(0.06, 12, 8),
+      strutMat: new THREE.MeshStandardMaterial({ color: 0x607d8b, roughness: 0.4, metalness: 0.3 }),
+      cableMat: new THREE.MeshStandardMaterial({ color: 0xff5722, roughness: 0.3, metalness: 0.1 }),
+      nodeMat: new THREE.MeshStandardMaterial({ color: 0x333333, roughness: 0.5 }),
+      selectedMat: new THREE.MeshStandardMaterial({ color: 0xffeb3b, roughness: 0.3, emissive: 0x333300 }),
+    };
 
     // Ground
     const ground = new THREE.Mesh(
@@ -71,20 +107,47 @@ export function Viewer3D() {
     };
     animate();
 
-    return () => { cancelAnimationFrame(frameRef.current); ro.disconnect(); renderer.dispose(); container.removeChild(renderer.domElement); };
+    return () => {
+      cancelAnimationFrame(frameRef.current);
+      ro.disconnect();
+      renderer.dispose();
+      container.removeChild(renderer.domElement);
+      const s = sharedRef.current;
+      if (s) {
+        s.strutGeo.dispose();
+        s.cableGeo.dispose();
+        s.nodeGeo.dispose();
+        s.strutMat.dispose();
+        s.cableMat.dispose();
+        s.nodeMat.dispose();
+        s.selectedMat.dispose();
+        sharedRef.current = null;
+      }
+    };
   }, []);
 
-  // Rebuild scene from morpho state
+  // Rebuild scene from morpho state. We reuse shared geometries and
+  // materials stashed in `sharedRef` so a tick only allocates Mesh
+  // instances + userData objects — no new GPU buffers, no new
+  // materials. The old structure meshes get removed from the scene
+  // but we do NOT dispose their (shared) geometry/material.
   useEffect(() => {
     const scene = sceneRef.current;
-    if (!scene) return;
+    const shared = sharedRef.current;
+    if (!scene || !shared) return;
 
-    // Remove old structure objects
+    // Remove old structure objects (without disposing shared resources).
     const toRemove: THREE.Object3D[] = [];
     scene.traverse(obj => { if (obj.userData.isStructure) toRemove.push(obj); });
     toRemove.forEach(obj => {
       obj.parent?.remove(obj);
-      if (obj instanceof THREE.Mesh) { obj.geometry.dispose(); if (Array.isArray(obj.material)) obj.material.forEach(m => m.dispose()); else obj.material.dispose(); }
+      // Only dispose the per-mesh material when it was a unique
+      // `selectedMat.clone()` — every other material comes from the
+      // shared pool and must survive across rebuilds.
+      if (obj instanceof THREE.Mesh && obj.userData.ownsMaterial) {
+        const m = obj.material as THREE.Material;
+        m.dispose();
+      }
     });
 
     const morpho = state.morpho;
@@ -92,69 +155,58 @@ export function Viewer3D() {
     const selectedNodes = new Set(state.selectedNodeIds);
     const selectedEdges = new Set(state.selectedMemberIds);
 
-    // Materials
-    const strutMat = new THREE.MeshStandardMaterial({ color: 0x607d8b, roughness: 0.4, metalness: 0.3 });
-    const cableMat = new THREE.MeshStandardMaterial({ color: 0xff5722, roughness: 0.3, metalness: 0.1 });
-    const selectedMat = new THREE.MeshStandardMaterial({ color: 0xffeb3b, roughness: 0.3, emissive: 0x333300 });
-
     // Members
     for (const member of morpho.members) {
       // Skip candidate members — they have force_density ≈ 0 and
-      // are neither a strut nor a cable yet. Drawing them as thin
-      // cables while the LP is still running mis-represents the
-      // structure, and they disappear from the viewer as soon as
-      // applyAlpha classifies them based on sign(w*).
+      // are neither a strut nor a cable yet.
       if (member.type === 'candidate') continue;
 
       const a = nodeMap.get(member.node_a), b = nodeMap.get(member.node_b);
       if (!a || !b) continue;
 
-      const start = new THREE.Vector3(a.x, a.z, -a.y); // y→z, z→y
-      const end = new THREE.Vector3(b.x, b.z, -b.y);
-      const mid = new THREE.Vector3().addVectors(start, end).multiplyScalar(0.5);
-      const dir = new THREE.Vector3().subVectors(end, start);
-      const len = dir.length();
+      const sx = a.x, sy = a.z, sz = -a.y;
+      const ex = b.x, ey = b.z, ez = -b.y;
+      const dx = ex - sx, dy = ey - sy, dz = ez - sz;
+      const len = Math.hypot(dx, dy, dz);
       if (len < 1e-6) continue;
 
       const isSelected = selectedEdges.has(member.member_id);
-      const mat = isSelected ? selectedMat.clone() : (member.type === 'strut' ? strutMat.clone() : cableMat.clone());
+      const baseMat = member.type === 'strut' ? shared.strutMat : shared.cableMat;
+      const mat = isSelected ? shared.selectedMat.clone() : baseMat;
+      const geo = member.type === 'strut' ? shared.strutGeo : shared.cableGeo;
 
-      if (member.type === 'strut') {
-        // Thick cylinder for struts
-        const geo = new THREE.CylinderGeometry(0.04, 0.04, len, 8);
-        geo.rotateZ(Math.PI / 2);
-        const mesh = new THREE.Mesh(geo, mat);
-        mesh.position.copy(mid);
-        const q = new THREE.Quaternion();
-        q.setFromUnitVectors(new THREE.Vector3(1, 0, 0), dir.clone().normalize());
-        mesh.quaternion.copy(q);
-        mesh.castShadow = true;
-        mesh.userData = { isStructure: true, memberId: member.member_id };
-        scene.add(mesh);
-      } else {
-        // Thin line for cables
-        const geo = new THREE.CylinderGeometry(0.012, 0.012, len, 4);
-        geo.rotateZ(Math.PI / 2);
-        const mesh = new THREE.Mesh(geo, mat);
-        mesh.position.copy(mid);
-        const q = new THREE.Quaternion();
-        q.setFromUnitVectors(new THREE.Vector3(1, 0, 0), dir.clone().normalize());
-        mesh.quaternion.copy(q);
-        mesh.userData = { isStructure: true, memberId: member.member_id };
-        scene.add(mesh);
-      }
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.position.set((sx + ex) * 0.5, (sy + ey) * 0.5, (sz + ez) * 0.5);
+      const q = new THREE.Quaternion();
+      q.setFromUnitVectors(
+        new THREE.Vector3(1, 0, 0),
+        new THREE.Vector3(dx, dy, dz).normalize(),
+      );
+      mesh.quaternion.copy(q);
+      // Scale the unit-length cylinder along its local X (post-
+      // rotate-Z that maps Y→X, so the tube now lies along local X).
+      mesh.scale.set(len, 1, 1);
+      mesh.castShadow = true;
+      mesh.userData = {
+        isStructure: true,
+        memberId: member.member_id,
+        ownsMaterial: isSelected,
+      };
+      scene.add(mesh);
     }
 
     // Nodes
-    const nodeGeo = new THREE.SphereGeometry(0.06, 12, 8);
     for (const node of morpho.nodes) {
       const isSelected = selectedNodes.has(node.node_id);
-      const mesh = new THREE.Mesh(nodeGeo,
-        isSelected ? selectedMat.clone() : new THREE.MeshStandardMaterial({ color: 0x333333, roughness: 0.5 })
-      );
+      const mat = isSelected ? shared.selectedMat.clone() : shared.nodeMat;
+      const mesh = new THREE.Mesh(shared.nodeGeo, mat);
       mesh.position.set(node.x, node.z, -node.y);
       mesh.castShadow = true;
-      mesh.userData = { isStructure: true, nodeId: node.node_id };
+      mesh.userData = {
+        isStructure: true,
+        nodeId: node.node_id,
+        ownsMaterial: isSelected,
+      };
       scene.add(mesh);
     }
 
