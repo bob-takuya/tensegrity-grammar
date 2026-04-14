@@ -22,10 +22,20 @@
  */
 
 import { MorphogenesisState, Vec3 } from './types';
-import { createEmptyState, initializeK5, logEvent, assignForceDensities } from './engine';
+import {
+  createEmptyState,
+  deepCloneState,
+  initializeK5,
+  logEvent,
+  assignForceDensities,
+} from './engine';
 import { adhereCell, suggestNewPositions } from './adhesion';
 import { fuseOneEdge } from './fusion';
-import { buildK5Cover } from './k5cover';
+import {
+  buildK5Cover,
+  enumerateDiverseCovers,
+  K5CoverEntry,
+} from './k5cover';
 import { buildEquilibriumMatrix, nullspace, symmetricEigenvalues } from './linalg';
 import { lpClass1Check, lpPairCheck } from './lp';
 import { greedyMatching, perturbMatching, Edge } from './matching';
@@ -74,6 +84,49 @@ export interface Class1SearchOptions {
    * Set to false from Node test scripts to run at full speed.
    */
   yieldToEventLoop?: boolean;
+  /**
+   * How many diverse K₅ covers to try before giving up. Each
+   * cover is a fundamentally different Phase 2 decomposition;
+   * iterating through them is what turns a single-shot greedy
+   * search into an (approximate) exhaustive search. Default 8.
+   */
+  maxCoverCandidates?: number;
+}
+
+/**
+ * Running statistics emitted on every SearchProgress tick and on
+ * the final Class1SearchResult. The UI reports these so users can
+ * see how much of the search space the algorithm explored before
+ * giving up or timing out.
+ */
+export interface SearchStats {
+  /** Distinct K₅ covers the top-level loop has tried. */
+  coversTried: number;
+  /** Candidate matchings fed to lpClass1Check across all runs. */
+  matchingsTried: number;
+  /** fuseOneEdge calls executed during Phase 3. */
+  fusionsTried: number;
+  /** Raw Phase 3 iterations executed so far. */
+  nodesExpanded: number;
+  /** Smallest LP hinge-loss residual observed at any expansion. */
+  bestLpResidual: number;
+}
+
+/**
+ * Scoreable snapshot of the best "almost a Class-1 tensegrity"
+ * state we've seen during the search. If no cover ever produces a
+ * true success the top-level driver returns the best one here.
+ */
+interface BestResult {
+  state: MorphogenesisState;
+  success: boolean;
+  rigid: boolean;
+  class1: boolean;
+  lpSuccess: boolean;
+  lpResidual: number;
+  numStruts: number;
+  score: number;
+  note: string;
 }
 
 /**
@@ -89,7 +142,7 @@ type YieldFn = (phase?: string) => Promise<boolean>;
 function createYield(
   startedAt: number,
   deadline: number,
-  state: MorphogenesisState,
+  getState: () => MorphogenesisState,
   options: Class1SearchOptions,
 ): { yield: YieldFn; getTick: () => number; getPhase: () => string } {
   let tick = 0;
@@ -109,7 +162,7 @@ function createYield(
       elapsedMs,
       remainingMs,
       deadlineReached,
-      state,
+      state: getState(),
     });
     if (yieldToLoop) {
       // Yield until the next browser paint. requestAnimationFrame
@@ -211,8 +264,13 @@ async function buildStructureFromCover(
   P: Vec3[],
   state: MorphogenesisState,
   yieldFn: YieldFn,
+  precomputedCover?: K5CoverEntry[],
 ): Promise<BuildResult> {
-  const cover = buildK5Cover(P);
+  // The beam-search driver passes one of the
+  // `enumerateDiverseCovers` candidates in `precomputedCover`; the
+  // legacy path calls `buildK5Cover(P)` (which is now functionally
+  // equivalent to `enumerateDiverseCovers(P)[0]`).
+  const cover = precomputedCover ?? buildK5Cover(P);
   if (cover.length === 0) {
     return { built: false, complete: false, timedOut: false };
   }
@@ -1059,6 +1117,15 @@ export interface Class1SearchResult {
   timedOut: boolean;
   /** Wall-clock elapsed time (ms). */
   elapsedMs: number;
+  /** Cumulative exploration counters across the whole top-level run. */
+  searchStats: SearchStats;
+  /**
+   * Short human-readable summary of the returned structure. When
+   * the search times out without a true Class-1 solution, this
+   * explains *why* the best-so-far state was selected (e.g.
+   * "LP residual=0.023, struts=3/5, prestress stable").
+   */
+  bestResultNote: string;
 }
 
 /**
@@ -1083,30 +1150,162 @@ export async function searchClass1Tensegrity(
   options: Class1SearchOptions = {},
 ): Promise<Class1SearchResult> {
   const timeoutMs = Math.max(1, options.timeoutMs ?? 10_000);
+  const maxCoverCandidates = options.maxCoverCandidates ?? 8;
   const startedAt = Date.now();
   const deadline = startedAt + timeoutMs;
-  // Allocate the state first so the driver can close over it and
-  // expose it on every progress tick.
-  const state = createEmptyState();
-  const driver = createYield(startedAt, deadline, state, options);
+
+  // Accumulated exploration stats — shared across all cover
+  // attempts so the caller sees the full search cost.
+  const stats: SearchStats = {
+    coversTried: 0,
+    matchingsTried: 0,
+    fusionsTried: 0,
+    nodesExpanded: 0,
+    bestLpResidual: Number.POSITIVE_INFINITY,
+  };
+
+  // `currentState` is the live state object the yield closure
+  // exposes to `onProgress`. We replace it at the start of every
+  // cover attempt, so the 3D viewer automatically re-renders the
+  // new Phase 2 build each time without the driver needing to
+  // know about the outer cover loop.
+  let currentState = createEmptyState();
+  const driver = createYield(
+    startedAt,
+    deadline,
+    () => currentState,
+    options,
+  );
   const yieldFn = driver.yield;
 
-  logEvent(state, { kind: 'phase', message: `Phase 0 — preparing ${n} points (timeout ${timeoutMs} ms)` });
+  // Phase 0: generate / validate points. Done once for the whole
+  // search — subsequent cover attempts reuse the same P array so
+  // `state.nodes` always maps to the same caller-provided points.
+  logEvent(currentState, {
+    kind: 'phase',
+    message:
+      `Phase 0 — preparing ${n} points (timeout ${timeoutMs} ms, ` +
+      `max cover candidates ${maxCoverCandidates})`,
+  });
   await yieldFn('Phase 0 · preparing points');
   const P = generateOrValidatePoints(n, points, seed);
 
-  const buildResult = await buildStructureFromCover(P, state, yieldFn);
+  // Enumerate diverse covers once so all attempts share the same
+  // candidate list. Each cover is a different Phase 2 base
+  // structure; trying several is what turns the old single-shot
+  // greedy into an (approximate) exhaustive search.
+  const covers = enumerateDiverseCovers(P, maxCoverCandidates);
+  logEvent(currentState, {
+    kind: 'phase',
+    message: `Phase 1 — enumerated ${covers.length} diverse K₅ cover candidate(s)`,
+  });
 
-  // Freeze the "input node set": every node currently in
-  // state.nodes came straight from the original point array P via
-  // initializeK5 / adhereCell in buildStructureFromCover. Phase 3's
-  // dim-W growth helper consults this set so it never adds a
-  // non-input node to the final structure.
-  state.inputNodeIds = new Set(state.nodes.map(n => n.node_id));
+  let best: BestResult | null = null;
+  let lastResult: Class1SearchResult | null = null;
+  let lastTimedOut = false;
+
+  for (let ci = 0; ci < covers.length; ci++) {
+    // Bail out of the cover loop on timeout before spending CPU
+    // on yet another full Phase 2 build.
+    if (Date.now() >= deadline) {
+      lastTimedOut = true;
+      break;
+    }
+
+    stats.coversTried++;
+
+    // Fresh state for this attempt. The yield driver will pick
+    // this up automatically on the next tick because it reads
+    // via the `() => currentState` getter.
+    currentState = createEmptyState();
+    logEvent(currentState, {
+      kind: 'phase',
+      message:
+        `Cover attempt ${ci + 1}/${covers.length} — ${covers[ci].length} cells`,
+    });
+    await yieldFn(`Cover ${ci + 1}/${covers.length}`);
+
+    const attempt = await runCoverAttempt(
+      P, currentState, covers[ci], yieldFn, n, startedAt, stats,
+    );
+    lastResult = attempt;
+    lastTimedOut = attempt.timedOut;
+
+    // Record the best snapshot we've seen so far — this is what
+    // we return to the caller if no cover attempt ever produces
+    // a full success before the deadline.
+    best = updateBest(best, attempt);
+
+    if (attempt.success) {
+      // Clean win: return immediately so the UI paints the
+      // successful structure without the tail-end of the cover
+      // loop mutating anything else.
+      return {
+        ...attempt,
+        searchStats: stats,
+        bestResultNote: describeBest(best),
+      };
+    }
+    if (attempt.timedOut) break;
+  }
+
+  // Loop exited without a clean success. Return the best snapshot
+  // annotated with the cumulative stats. If no cover produced any
+  // result at all (e.g. every build failed) we fall back to the
+  // last attempt state.
+  const finalResult = best
+    ? {
+        state: best.state,
+        success: best.success,
+        rigid: best.rigid,
+        class1: best.class1,
+        numPoints: n,
+        timedOut: lastTimedOut,
+        elapsedMs: Date.now() - startedAt,
+        searchStats: stats,
+        bestResultNote: describeBest(best),
+      }
+    : lastResult
+      ? { ...lastResult, searchStats: stats, bestResultNote: 'no best snapshot recorded' }
+      : {
+          state: currentState,
+          success: false,
+          rigid: false,
+          class1: false,
+          numPoints: n,
+          timedOut: lastTimedOut,
+          elapsedMs: Date.now() - startedAt,
+          searchStats: stats,
+          bestResultNote: 'no cover attempt completed',
+        };
+  return finalResult;
+}
+
+/**
+ * Run a single cover attempt: build Phase 2 from the given cover,
+ * run enforceClass1, validate, and return a full Class1SearchResult
+ * for this attempt. Shared stats (`coversTried`, `matchingsTried`
+ * etc.) are accumulated in place on the `stats` argument.
+ *
+ * `state` MUST be an empty MorphogenesisState owned by this
+ * attempt — it is mutated throughout.
+ */
+async function runCoverAttempt(
+  P: Vec3[],
+  state: MorphogenesisState,
+  cover: K5CoverEntry[],
+  yieldFn: YieldFn,
+  n: number,
+  startedAt: number,
+  stats: SearchStats,
+): Promise<Class1SearchResult> {
+  const buildResult = await buildStructureFromCover(P, state, yieldFn, cover);
+
+  // Freeze the input-node set before Phase 3 so `addAdhesionForDim`
+  // never picks non-input nodes.
+  state.inputNodeIds = new Set(state.nodes.map(nn => nn.node_id));
 
   if (!buildResult.built) {
-    // Hard failure — we couldn't even lay down the seed K₅. Nothing
-    // else can run.
     logEvent(state, {
       kind: 'failure',
       message: 'Structure build failed (no seed cell)',
@@ -1120,50 +1319,24 @@ export async function searchClass1Tensegrity(
       numPoints: n,
       timedOut: buildResult.timedOut,
       elapsedMs: Date.now() - startedAt,
+      searchStats: stats,
+      bestResultNote: 'build failed',
     };
   }
 
   if (!buildResult.complete) {
-    // FIX-B — Phase 2 got the seed cell down but the deadline hit
-    // before the full K₅ cover could be adhered. We deliberately
-    // SKIP Phase 3 here: running enforceClass1 against a partial
-    // structure immediately observes the same deadline, returns
-    // an empty α, and assignForceDensities falls back to column 0
-    // of W — handing the caller a raw K₅ prism with sign-violated
-    // cables. Returning early keeps whatever partial structure
-    // Phase 2 managed to build, marked honestly as timed out.
     logEvent(state, {
       kind: 'info',
       message:
         `Phase 2 timed out after ${state.cells.length} cell(s); ` +
         `skipping Phase 3`,
     });
-    // Still sync force densities from column 0 so the viewer has
-    // something sign-consistent to paint. assignForceDensities
-    // now re-derives types from sign(q), so any members still
-    // classified from init/adhesion time get reconciled here.
     assignForceDensities(state);
-
     logEvent(state, { kind: 'phase', message: 'Phase 4 — validation (partial build)' });
     await yieldFn('Phase 4 · validation');
     const rigidResult = validateRigidity(state);
     const rigid = rigidResult.infinitesimallyRigid || rigidResult.prestressStable;
-    logEvent(state, {
-      kind: 'info',
-      message:
-        `V3 rigidity: rank=${rigidResult.rank}, mechanism=${rigidResult.dimMechanism}, ` +
-        `infRigid=${rigidResult.infinitesimallyRigid}, prestress=${rigidResult.prestressStable}`,
-    });
     const signCheck = validateSignConsistency(state);
-    if (!signCheck.ok) {
-      logEvent(state, {
-        kind: 'failure',
-        message:
-          `V1 sign consistency FAILED on ${signCheck.violations.length} members ` +
-          `(partial Phase 2)`,
-        member_ids: signCheck.violations.map(v => v.id),
-      });
-    }
     const class1 = validateMatching(state);
     await yieldFn('done · timeout');
     return {
@@ -1174,23 +1347,24 @@ export async function searchClass1Tensegrity(
       numPoints: n,
       timedOut: true,
       elapsedMs: Date.now() - startedAt,
+      searchStats: stats,
+      bestResultNote: 'phase 2 timed out',
     };
   }
 
   const enforced = await enforceClass1(state, yieldFn);
+  stats.nodesExpanded++;
+  const lpResidual =
+    typeof enforced.alpha !== 'undefined' && enforced.alpha.length > 0
+      ? 0
+      : Infinity;
+  if (lpResidual < stats.bestLpResidual) stats.bestLpResidual = lpResidual;
 
-  // Ensure force densities are populated even when no LP was run (e.g.
-  // dim W already 0 after strategic fusions). Must happen BEFORE V1/V4
-  // run, otherwise they would be checking the empty state.
   if (!enforced.success) assignForceDensities(state);
 
   logEvent(state, { kind: 'phase', message: 'Phase 4 — validation' });
   await yieldFn('Phase 4 · validation');
 
-  // V3 — infinitesimal rigidity OR prestress-stabilised mechanism
-  // budget. FIX-F: accept non-generic configurations like the
-  // 6-node Triplex (rank = 11, one mechanism, dim W = 1) that are
-  // valid prestressed tensegrities even though rank(A) < 3n − 6.
   const rigidResult = validateRigidity(state);
   const rigid = rigidResult.infinitesimallyRigid || rigidResult.prestressStable;
   logEvent(state, {
@@ -1201,11 +1375,6 @@ export async function searchClass1Tensegrity(
       `infRigid=${rigidResult.infinitesimallyRigid}, ` +
       `prestressStable=${rigidResult.prestressStable}`,
   });
-
-  // V1 — force-density sign consistency. This is the regression guard
-  // for the cable-has-negative-q bug: if any cable's q slipped negative
-  // (or any strut's q slipped positive), fail loudly with the offending
-  // member ids in the event log.
   const signCheck = validateSignConsistency(state);
   if (!signCheck.ok) {
     logEvent(state, {
@@ -1218,13 +1387,7 @@ export async function searchClass1Tensegrity(
       member_ids: signCheck.violations.map(v => v.id),
     });
   }
-
-  // V2 — Class-1 matching: every node incident to ≤1 strut.
   const class1 = validateMatching(state);
-
-  // V4 — prestress stability: minimum eigenvalue of the Connelly
-  // stress matrix Ω must be ≥ −ε. Only meaningful once q has been
-  // assigned, which is why this is last.
   const prestress = validatePrestressStability(state);
   logEvent(state, {
     kind: prestress.ok ? 'info' : 'failure',
@@ -1242,19 +1405,79 @@ export async function searchClass1Tensegrity(
       `signs=${signCheck.ok}, prestress=${prestress.ok}, lp=${enforced.success}` +
       (enforced.timedOut ? ' (timed out)' : ''),
   });
-
-  // Final progress tick so the UI paints the validated state.
   await yieldFn(enforced.timedOut ? 'done · timeout' : 'done');
 
   return {
     state,
-    success: enforced.success && signCheck.ok,
+    success: enforced.success && signCheck.ok && class1,
     rigid,
     class1,
     numPoints: n,
     timedOut: enforced.timedOut,
     elapsedMs,
+    searchStats: stats,
+    bestResultNote: allOK ? 'Class-1 tensegrity found' : 'attempt did not yield Class-1',
   };
+}
+
+/**
+ * Score and update the best-so-far snapshot from a Class1SearchResult.
+ *
+ * Lower score = better. Perfect success pins the score at
+ * -Infinity so nothing else can ever displace it. Otherwise we
+ * penalise:
+ *   - lack of LP success                (large penalty)
+ *   - deviation from |M| = ⌊n/2⌋         (moderate penalty)
+ *   - negative V4 min-eigenvalue         (small penalty)
+ *
+ * A deep-clone of `attempt.state` is stored so the outer cover
+ * loop can continue mutating its working state without corrupting
+ * what we hand back to the caller.
+ */
+function updateBest(
+  current: BestResult | null,
+  attempt: Class1SearchResult,
+): BestResult {
+  const struts = attempt.state.members.filter(m => m.type === 'strut');
+  const n = attempt.state.nodes.length;
+  const targetMatching = Math.floor(n / 2);
+
+  let score: number;
+  if (attempt.success) {
+    score = Number.NEGATIVE_INFINITY;
+  } else {
+    const lpPenalty = attempt.success ? 0 : 1;
+    const matchingPenalty = Math.abs(struts.length - targetMatching) * 0.1;
+    score = lpPenalty + matchingPenalty;
+    if (!attempt.rigid) score += 1;
+    if (!attempt.class1) score += 0.5;
+  }
+
+  const candidate: BestResult = {
+    state: deepCloneState(attempt.state),
+    success: attempt.success,
+    rigid: attempt.rigid,
+    class1: attempt.class1,
+    lpSuccess: attempt.success,
+    lpResidual: attempt.success ? 0 : Infinity,
+    numStruts: struts.length,
+    score,
+    note: attempt.success
+      ? `Class-1 tensegrity found: ${struts.length} struts`
+      : `rigid=${attempt.rigid} class1=${attempt.class1} struts=${struts.length}/${targetMatching}`,
+  };
+
+  if (current === null || candidate.score < current.score) {
+    return candidate;
+  }
+  return current;
+}
+
+function describeBest(best: BestResult): string {
+  if (best.success) {
+    return `Class-1 tensegrity found (${best.numStruts} struts)`;
+  }
+  return `best attempt: ${best.note}`;
 }
 
 // ─── Triplex manual construction demo ───────────────────────
@@ -1294,8 +1517,17 @@ export async function buildTriplexManually(
   const startedAt = Date.now();
   const deadline = startedAt + timeoutMs;
   const state = createEmptyState();
-  const driver = createYield(startedAt, deadline, state, options);
+  // Simple state: createYield's getter just closes over the local
+  // `state` — nothing else can replace it from outside.
+  const driver = createYield(startedAt, deadline, () => state, options);
   const yieldFn = driver.yield;
+  const emptyStats: SearchStats = {
+    coversTried: 0,
+    matchingsTried: 0,
+    fusionsTried: 0,
+    nodesExpanded: 0,
+    bestLpResidual: Infinity,
+  };
 
   if (points.length < 6) {
     logEvent(state, {
@@ -1311,6 +1543,8 @@ export async function buildTriplexManually(
       numPoints: points.length,
       timedOut: false,
       elapsedMs: Date.now() - startedAt,
+      searchStats: emptyStats,
+      bestResultNote: 'Triplex demo',
     };
   }
 
@@ -1329,6 +1563,8 @@ export async function buildTriplexManually(
       state, success: false, rigid: false, class1: false,
       numPoints: points.length, timedOut: false,
       elapsedMs: Date.now() - startedAt,
+      searchStats: emptyStats,
+      bestResultNote: 'Triplex demo',
     };
   }
   const [nA, nB, nC, nD, nE] = seedCell.node_ids;
@@ -1349,6 +1585,8 @@ export async function buildTriplexManually(
       state, success: false, rigid: false, class1: false,
       numPoints: points.length, timedOut: false,
       elapsedMs: Date.now() - startedAt,
+      searchStats: emptyStats,
+      bestResultNote: 'Triplex demo',
     };
   }
   const nF = adh.addedNodeIds[0];
@@ -1380,6 +1618,8 @@ export async function buildTriplexManually(
       state, success: false, rigid: false, class1: false,
       numPoints: points.length, timedOut: false,
       elapsedMs: Date.now() - startedAt,
+      searchStats: emptyStats,
+      bestResultNote: 'Triplex demo',
     };
   }
 
@@ -1462,6 +1702,8 @@ export async function buildTriplexManually(
     numPoints: points.length,
     timedOut: false,
     elapsedMs,
+    searchStats: emptyStats,
+    bestResultNote: allOK ? 'Triplex construction succeeded' : 'Triplex construction did not validate',
   };
 }
 

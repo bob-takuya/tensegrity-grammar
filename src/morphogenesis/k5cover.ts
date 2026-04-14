@@ -84,6 +84,15 @@ export interface K5CoverOptions {
    * one that admits a general-position cell. Default [4, 3].
    */
   preferredShareCounts?: number[];
+  /**
+   * Which entry in the strutness-ranked pair list to use as the
+   * seed's first edge. `0` = longest pair (default; matches
+   * canonical Aloui behaviour). `1` = second-longest, etc. The
+   * beam-search driver in `searchClass1.ts` uses higher values to
+   * enumerate *different* covers when the first one fails to
+   * yield a Class-1 tensegrity.
+   */
+  seedRank?: number;
 }
 
 // ─── Geometric helpers ────────────────────────────────────────
@@ -224,19 +233,28 @@ function scoreEntry(
 // ─── Seed selection ───────────────────────────────────────────
 
 /**
- * Seed selection. Start from the longest pair (a, b) and greedily
- * add three more points, each time picking the covered-space point
- * that is farthest from both a and b (maximises distance-sum) while
- * preserving general position of the growing seed.
+ * Seed selection. Start from the longest pair at `seedRank` in the
+ * strutness-ordered list and greedily add three more points, each
+ * time picking the covered-space point that is farthest from both
+ * a and b (maximises distance-sum) while preserving general
+ * position of the growing seed.
+ *
+ * `seedRank = 0` uses the canonical longest pair; higher values
+ * let `enumerateDiverseCovers` generate covers starting from
+ * alternative first edges so the outer beam search can try
+ * several fundamentally different W-column spans.
  */
-function findSeed(P: Vec3[], rank: StrutRank, volTol: number): number[] {
+function findSeed(
+  P: Vec3[],
+  rank: StrutRank,
+  volTol: number,
+  seedRank: number = 0,
+): number[] {
   const n = P.length;
   if (n < 5) throw new Error('K₅ cover requires n ≥ 5');
 
-  // The first pair (a, b) is guaranteed to be the strutness-maximal
-  // pair, which will become the first strut candidate the LP tries
-  // to enforce in Phase 3.
-  const first = rank.ordered[0];
+  const idx = Math.max(0, Math.min(seedRank, rank.ordered.length - 1));
+  const first = rank.ordered[idx];
   const seed: number[] = [first.i, first.j];
 
   // Ranked pool of the remaining points by distance-from-{a,b}.
@@ -381,7 +399,7 @@ export function buildK5Cover(
   };
 
   // Step 1 + 2: seed.
-  const seed = findSeed(P, rank, volTol);
+  const seed = findSeed(P, rank, volTol, options.seedRank ?? 0);
   const seedCell: K5CoverEntry = { sharedIdx: [], newIdx: seed };
   const cover: K5CoverEntry[] = [seedCell];
   const covered = new Set<number>(seed);
@@ -439,4 +457,72 @@ export function buildK5Cover(
   }
 
   return cover;
+}
+
+// ─── Diverse cover enumeration ────────────────────────────────
+
+/**
+ * Build a collection of *diverse* K₅ covers for the same input
+ * points. The beam-search driver in `searchClass1.ts` iterates
+ * through these in order, trying each one as the Phase 2 base
+ * before giving up. Diversity comes from two sources:
+ *
+ *   1. `seedRank = 0, 1, 2, ...` — the first edge of the seed
+ *      is pulled from successively lower positions in the
+ *      strutness ranking, which generally steers the incremental
+ *      attachment toward different 5-subsets.
+ *   2. Signature-based de-duplication — two covers that produce
+ *      the same *edge set* (as a sorted list of `i-j` keys) are
+ *      treated as identical and only one copy is kept. This
+ *      prevents the enumeration from wasting time on cosmetic
+ *      permutations of the same cover.
+ *
+ * Returns at most `maxCandidates` entries; stops early if the
+ * seed-rank loop has exhausted every pair in the strutness list.
+ */
+export function enumerateDiverseCovers(
+  P: Vec3[],
+  maxCandidates: number = 8,
+  options: Omit<K5CoverOptions, 'seedRank'> = {},
+): K5CoverEntry[][] {
+  const out: K5CoverEntry[][] = [];
+  const seen = new Set<string>();
+
+  const n = P.length;
+  const totalPairs = (n * (n - 1)) / 2;
+  const maxSeedRank = Math.min(totalPairs, maxCandidates * 3);
+
+  for (let r = 0; r < maxSeedRank && out.length < maxCandidates; r++) {
+    let cover: K5CoverEntry[];
+    try {
+      cover = buildK5Cover(P, { ...options, seedRank: r });
+    } catch {
+      continue;
+    }
+    const sig = coverSignature(cover);
+    if (seen.has(sig)) continue;
+    seen.add(sig);
+    out.push(cover);
+  }
+
+  if (out.length === 0) {
+    // Last-ditch: at least one cover, however bad.
+    out.push(buildK5Cover(P, { ...options, seedRank: 0 }));
+  }
+
+  return out;
+}
+
+function coverSignature(cover: K5CoverEntry[]): string {
+  const edges: string[] = [];
+  for (const cell of cover) {
+    const nodes = [...cell.sharedIdx, ...cell.newIdx].sort((a, b) => a - b);
+    for (let i = 0; i < nodes.length; i++) {
+      for (let j = i + 1; j < nodes.length; j++) {
+        edges.push(`${nodes[i]}-${nodes[j]}`);
+      }
+    }
+  }
+  edges.sort();
+  return edges.join(',');
 }
