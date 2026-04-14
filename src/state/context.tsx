@@ -75,6 +75,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         rigid: result.rigid,
         class1: result.class1,
         lpSuccess: result.success,
+        bestClassK: result.bestClassK,
+        allConnected: result.allConnected,
+        bestResultNote: result.bestResultNote,
       });
     } catch (err) {
       // A thrown error during the search shouldn't crash the app.
@@ -90,6 +93,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         rigid: false,
         class1: false,
         lpSuccess: false,
+        bestClassK: 0,
+        allConnected: false,
+        bestResultNote: '',
       });
     }
   }, [state.morpho]);
@@ -130,6 +136,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         rigid: result.rigid,
         class1: result.class1,
         lpSuccess: result.success,
+        bestClassK: result.bestClassK,
+        allConnected: result.allConnected,
+        bestResultNote: result.bestResultNote,
       });
     } catch (err) {
       // eslint-disable-next-line no-console
@@ -142,6 +151,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         rigid: false,
         class1: false,
         lpSuccess: false,
+        bestClassK: 0,
+        allConnected: false,
+        bestResultNote: '',
       });
     }
   }, [state.morpho]);
