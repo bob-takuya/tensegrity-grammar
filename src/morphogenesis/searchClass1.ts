@@ -115,6 +115,9 @@ export interface SearchStats {
   nodesExpanded: number;
   /** Smallest LP hinge-loss residual observed at any expansion. */
   bestLpResidual: number;
+  /** Covers skipped because the pre-flight W check ruled Phase 3
+   * structurally infeasible. */
+  preflightSkips: number;
 }
 
 /**
@@ -1660,6 +1663,7 @@ export async function searchClass1Tensegrity(
     fusionsTried: 0,
     nodesExpanded: 0,
     bestLpResidual: Number.POSITIVE_INFINITY,
+    preflightSkips: 0,
   };
 
   // `currentState` is the live state object the yield closure
@@ -1804,6 +1808,69 @@ export async function searchClass1Tensegrity(
 }
 
 /**
+ * Phase-3 pre-flight: detect covers whose W matrix makes it
+ * *structurally* impossible for the LP to satisfy the Class-1
+ * strut constraints, so we can skip the expensive enforceClass1
+ * loop altogether and move on to the next cover.
+ *
+ * The LP's strut constraint is `Wα · e ≤ -ε` for every `e` in the
+ * matching. If W[e] has no negative component (i.e. every
+ * self-stress basis vector gives this edge a non-negative force),
+ * then *no* choice of α can drive `Wα` negative — the edge can
+ * never be a strut in any self-stress direction.
+ *
+ * We score this pathology on the top ⌊n/2⌋ "likely strut"
+ * candidates — the longest physical edges — because a Class-1
+ * matching is of size ⌊n/2⌋ and will tend to grab the long bars
+ * first (they're the natural compression members in a
+ * tensegrity). If more than half of those candidates are
+ * structurally stuck, the LP has almost no room to choose and
+ * Phase 3 devolves into the trivial-α loop we observed on n = 8
+ * seed 0 (55 % of all covers, ~28 iterations each, all wasted).
+ *
+ * Returns the number of "LP-infeasible as strut" edges among the
+ * top-⌊n/2⌋ longest members currently in `state`.
+ */
+function countInfeasibleStrutEdges(
+  state: MorphogenesisState,
+  W: number[][],
+  memberIdx: Map<number, number>,
+  eps: number = 1e-8,
+): number {
+  const n = state.nodes.length;
+  const topK = Math.floor(n / 2);
+  if (topK === 0 || W.length === 0 || W[0].length === 0) return 0;
+
+  const nodeById = new Map(state.nodes.map(nn => [nn.node_id, nn]));
+  const lengths: { id: number; dist: number }[] = [];
+  for (const m of state.members) {
+    const a = nodeById.get(m.node_a);
+    const b = nodeById.get(m.node_b);
+    if (!a || !b) continue;
+    const dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z;
+    lengths.push({ id: m.member_id, dist: Math.hypot(dx, dy, dz) });
+  }
+  lengths.sort((x, y) => y.dist - x.dist);
+
+  let infeasible = 0;
+  const scanN = Math.min(topK, lengths.length);
+  for (let i = 0; i < scanN; i++) {
+    const rowIdx = memberIdx.get(lengths[i].id);
+    if (rowIdx === undefined) continue;
+    const row = W[rowIdx];
+    // Row is "stuck as strut" iff no component is meaningfully
+    // negative. We use `< -eps` (not `< 0`) so tiny LP noise
+    // floor values don't spuriously count as "can be negative".
+    let canBeStrut = false;
+    for (let j = 0; j < row.length; j++) {
+      if (row[j] < -eps) { canBeStrut = true; break; }
+    }
+    if (!canBeStrut) infeasible++;
+  }
+  return infeasible;
+}
+
+/**
  * Run a single cover attempt: build Phase 2 from the given cover,
  * run enforceClass1, validate, and return a full Class1SearchResult
  * for this attempt. Shared stats (`coversTried`, `matchingsTried`
@@ -1877,6 +1944,53 @@ async function runCoverAttempt(
       searchStats: stats,
       bestResultNote: 'phase 2 timed out',
     };
+  }
+
+  // Pre-flight check — detect covers whose W matrix makes Phase 3
+  // structurally infeasible and skip them without burning through
+  // the iteration budget. See `countInfeasibleStrutEdges` for the
+  // pathology this catches.
+  {
+    const { W: W0, memberIdx: idx0 } = denseW(state);
+    if (W0.length > 0 && W0[0].length > 0) {
+      const infeasible = countInfeasibleStrutEdges(state, W0, idx0);
+      const topK = Math.floor(state.nodes.length / 2);
+      const skipThreshold = Math.ceil(topK / 2);
+      if (topK > 0 && infeasible >= skipThreshold) {
+        stats.preflightSkips++;
+        logEvent(state, {
+          kind: 'info',
+          message:
+            `Pre-flight: ${infeasible}/${topK} top-length edges have ` +
+            `all-non-negative W rows (structurally cannot be struts); ` +
+            `skipping Phase 3 for this cover`,
+        });
+        assignForceDensities(state);
+        // Still run a quick bestHolder update so the snapshot
+        // for this cover participates in best-result tracking.
+        bestHolder.value = updateBestFromState(
+          bestHolder.value,
+          state,
+          Infinity,
+          false,
+        );
+        await yieldFn('Phase 3 skipped · pre-flight');
+        return {
+          state,
+          success: false,
+          rigid: false,
+          class1: false,
+          numPoints: n,
+          bestClassK: 0,
+          allConnected: false,
+          timedOut: false,
+          elapsedMs: Date.now() - startedAt,
+          searchStats: stats,
+          bestResultNote:
+            'cover skipped: top strut candidates are LP-infeasible in W',
+        };
+      }
+    }
   }
 
   const enforced = await enforceClass1(state, yieldFn, bestHolder);
@@ -2148,6 +2262,7 @@ export async function buildTriplexManually(
     fusionsTried: 0,
     nodesExpanded: 0,
     bestLpResidual: Infinity,
+    preflightSkips: 0,
   };
 
   if (points.length < 6) {
