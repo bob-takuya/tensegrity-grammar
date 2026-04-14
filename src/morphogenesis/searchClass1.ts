@@ -520,15 +520,32 @@ async function enforceClass1(
     }));
 
     // Step D1: choose a candidate strut set = maximum matching on G.
-    // Priority: edges with the largest absolute first-basis value.
-    const firstBasis = (e: Edge) => {
+    //
+    // Priority = "strutness" = max over self-stresses of -W[e,j],
+    // i.e. the most-negative value any self-stress assigns to e.
+    // An edge that already carries a strong compressive (negative)
+    // force in SOME basis self-stress is a natural strut, and LP
+    // feasibility is overwhelmingly driven by whether the matching
+    // aligns with the natural sign structure of the basis.
+    //
+    // Total |W[e,j]| (the original priority) biases toward edges
+    // that appear in multiple cells with large magnitude — exactly
+    // the diagonals that the Triplex construction wants to fuse
+    // out, not keep as struts. On n = 6 the old priority produced
+    // the matching {AB, CF, DE} (all cables in Aloui §5), while
+    // strutness produces {A-E, C-D, B-F} — the correct Triplex
+    // strut set — by picking BF (1.0), AE (0.667), CD (0.5)
+    // in that order from a simple greedy.
+    const strutness = (e: Edge) => {
       const i = memberIdx.get(e.id);
       if (i === undefined) return 0;
-      let s = 0;
-      for (let j = 0; j < W[0].length; j++) s += Math.abs(W[i][j]);
-      return s;
+      let mostNegative = 0;
+      for (let j = 0; j < W[0].length; j++) {
+        if (W[i][j] < mostNegative) mostNegative = W[i][j];
+      }
+      return -mostNegative;
     };
-    const matching = greedyMatching(edges, firstBasis, 12);
+    const matching = greedyMatching(edges, strutness, 12);
     logEvent(state, {
       kind: 'matching',
       message: `Iter ${iter + 1}: matching size ${matching.length} / ⌊n/2⌋=${Math.floor(state.nodes.length / 2)}`,
@@ -617,12 +634,77 @@ async function enforceClass1(
         m.type = savedTypes[i];
         m.force_density = savedFD[i];
       });
+      const violatingMaxComp = (() => {
+        const perNode = new Map<number, number>();
+        let maxN = 0;
+        for (const s of struts) {
+          const na = (perNode.get(s.node_a) ?? 0) + 1;
+          const nb = (perNode.get(s.node_b) ?? 0) + 1;
+          perNode.set(s.node_a, na);
+          perNode.set(s.node_b, nb);
+          if (na > maxN) maxN = na;
+          if (nb > maxN) maxN = nb;
+        }
+        return maxN;
+      })();
       logEvent(state, {
         kind: 'info',
         message:
-          `sign(Wα) yields Class-${Math.max(1, struts.length)} (not matching); ` +
-          'falling through to conflict resolution',
+          `sign(Wα) yields ${struts.length} struts, max ${violatingMaxComp}/node ` +
+          `(not a valid matching); falling through to conflict resolution`,
       });
+    }
+
+    // Kernel-driven fusion. The Triplex case (n = 6) illustrates why
+    // this is necessary: after the two-cell adhesion, dim W = 2 and
+    // the LP's α for the Triplex matching {A-E, C-D, B-F} happens to
+    // zero BOTH diagonal members BD and CE exactly. BD's row and
+    // CE's row in W are parallel ((-0.333, +0.500) vs (+0.333,
+    // -0.500)), so the unique α giving the Triplex strut signs also
+    // lies in their common kernel. Those members can't be cables in
+    // THIS structure — they need to be *fused out* so the surviving
+    // α becomes the Triplex self-stress. findConflicts only reports
+    // pairwise rank collisions and never flags BD/CE against a
+    // single strut, so the greedy conflict loop would go in circles.
+    //
+    // The fix: right after the LP runs, look at Wα on every member
+    // that is NOT in the current matching. Any with |Wα| below the
+    // ε margin is a "kernel member" — stuck at zero under the LP's
+    // preferred direction. Fusing such a member drops dim W by at
+    // most one and cannot hurt the LP sign structure, since the
+    // member contributed nothing to the constraints anyway. We fuse
+    // at most one per iteration so dim W shrinks monotonically.
+    const matchingSetLocal = new Set(matching);
+    const kernelMembers: number[] = [];
+    {
+      const alpha = lp.alpha;
+      for (let i = 0; i < state.members.length; i++) {
+        const m = state.members[i];
+        if (matchingSetLocal.has(m.member_id)) continue;
+        // Raw Wα (not normalised — we want to detect true kernel).
+        let wa = 0;
+        for (let j = 0; j < W[0].length; j++) wa += W[i][j] * alpha[j];
+        // Also skip members whose row is already all-zero (the LP's
+        // zero-row filter handles those separately).
+        let rowNorm = 0;
+        for (let j = 0; j < W[0].length; j++) rowNorm += W[i][j] * W[i][j];
+        if (rowNorm < 1e-18) continue;
+        if (Math.abs(wa) < 1e-6) kernelMembers.push(m.member_id);
+      }
+    }
+
+    if (kernelMembers.length > 0 && dimW > 1) {
+      const kid = kernelMembers[0];
+      logEvent(state, {
+        kind: 'strategic_fusion',
+        message:
+          `Kernel-fusion: member #${kid} has Wα ≈ 0 ` +
+          `(${kernelMembers.length} such member(s)); fusing to remove from the problem`,
+        member_ids: [kid],
+        dim_W_before: dimW,
+      });
+      fuseOneEdge(state, kid);
+      continue;
     }
 
     // Step D3: find conflicts
