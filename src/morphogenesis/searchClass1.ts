@@ -781,12 +781,63 @@ async function enforceClass1(
 
 // ─── Phase 4: validation ───────────────────────────────────
 
-function validateRigidity(state: MorphogenesisState): boolean {
-  if (state.nodes.length === 0) return false;
+/**
+ * V3 — infinitesimal rigidity + prestress stability support.
+ *
+ * Generically, a rigid pin-jointed structure in 3D satisfies
+ *     rank(A) = 3|V| − 6
+ * (every mechanism is a rigid-body motion). But non-generic cases
+ * like the 6-node Triplex have Maxwell excess B = 0 with dim W = 1
+ * and one true internal mechanism, giving rank(A) = 11 instead of
+ * 12 for |V| = 6. The old "rank ≥ 3n − 6" test flunked those
+ * structures even though they are perfectly valid prestress-
+ * stabilised tensegrities.
+ *
+ * FIX-F returns a structured diagnosis so the caller can accept a
+ * structure when EITHER:
+ *   - it is infinitesimally rigid (no mechanism at all), OR
+ *   - it carries a non-trivial self-stress basis and the number of
+ *     mechanisms does not exceed dim W (a necessary — though not
+ *     sufficient — condition for prestress stability; V4 then
+ *     confirms the sufficient condition via Ω eigenvalues).
+ */
+interface RigidityResult {
+  infinitesimallyRigid: boolean;
+  prestressStable: boolean;
+  rank: number;
+  dimMechanism: number;
+  dimW: number;
+}
+
+function validateRigidity(state: MorphogenesisState): RigidityResult {
+  if (state.nodes.length === 0) {
+    return {
+      infinitesimallyRigid: false,
+      prestressStable: false,
+      rank: 0,
+      dimMechanism: 0,
+      dimW: 0,
+    };
+  }
   const { A } = buildEquilibriumMatrix(state.nodes, state.members);
   const ker = nullspace(A);
   const rank = state.members.length - ker.length;
-  return rank >= 3 * state.nodes.length - 6;
+  const expectedGenericRank = 3 * state.nodes.length - 6;
+  const dimW = state.selfStressStates.length;
+  // Number of internal mechanisms = generic-rank shortfall.
+  const dimMechanism = Math.max(0, expectedGenericRank - rank);
+  const infinitesimallyRigid = dimMechanism === 0;
+  // A self-stress can stabilise at most dim W mechanisms. V4
+  // confirms the sufficient sign condition via eigenvalues of Ω;
+  // here we only rule out the obviously-hopeless cases.
+  const prestressStable = dimW > 0 && dimMechanism <= dimW;
+  return {
+    infinitesimallyRigid,
+    prestressStable,
+    rank,
+    dimMechanism,
+    dimW,
+  };
 }
 
 /**
@@ -974,7 +1025,14 @@ export async function searchClass1Tensegrity(
 
     logEvent(state, { kind: 'phase', message: 'Phase 4 — validation (partial build)' });
     await yieldFn('Phase 4 · validation');
-    const rigid = validateRigidity(state);
+    const rigidResult = validateRigidity(state);
+    const rigid = rigidResult.infinitesimallyRigid || rigidResult.prestressStable;
+    logEvent(state, {
+      kind: 'info',
+      message:
+        `V3 rigidity: rank=${rigidResult.rank}, mechanism=${rigidResult.dimMechanism}, ` +
+        `infRigid=${rigidResult.infinitesimallyRigid}, prestress=${rigidResult.prestressStable}`,
+    });
     const signCheck = validateSignConsistency(state);
     if (!signCheck.ok) {
       logEvent(state, {
@@ -1008,8 +1066,20 @@ export async function searchClass1Tensegrity(
   logEvent(state, { kind: 'phase', message: 'Phase 4 — validation' });
   await yieldFn('Phase 4 · validation');
 
-  // V3 — infinitesimal rigidity: rank(A) = 3|V| − 6.
-  const rigid = validateRigidity(state);
+  // V3 — infinitesimal rigidity OR prestress-stabilised mechanism
+  // budget. FIX-F: accept non-generic configurations like the
+  // 6-node Triplex (rank = 11, one mechanism, dim W = 1) that are
+  // valid prestressed tensegrities even though rank(A) < 3n − 6.
+  const rigidResult = validateRigidity(state);
+  const rigid = rigidResult.infinitesimallyRigid || rigidResult.prestressStable;
+  logEvent(state, {
+    kind: rigid ? 'info' : 'failure',
+    message:
+      `V3 rigidity: rank=${rigidResult.rank} / ${3 * state.nodes.length - 6}, ` +
+      `mechanisms=${rigidResult.dimMechanism}, dim W=${rigidResult.dimW}, ` +
+      `infRigid=${rigidResult.infinitesimallyRigid}, ` +
+      `prestressStable=${rigidResult.prestressStable}`,
+  });
 
   // V1 — force-density sign consistency. This is the regression guard
   // for the cable-has-negative-q bug: if any cable's q slipped negative
