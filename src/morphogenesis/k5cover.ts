@@ -1,84 +1,92 @@
 /**
- * Sub.B — BUILD_K5_COVER (incremental attachment)
+ * Sub.B — BUILD_K5_COVER (strutness-driven incremental attachment)
  *
- * Given a point set P we need an ordered list of K₅ cell definitions
+ * Given a point set P, return an ordered list of K₅ cell definitions
  * such that every point is in at least one cell and every cell
  * (except the seed) shares 3 or 4 nodes with the union of the cells
  * that precede it. The output drives `buildStructureFromCover` in
  * `searchClass1.ts`.
  *
- * Why not Delaunay / centroid-distance greedy
- * ──────────────────────────────────────────
- * An earlier version seeded the cover with "the 5 points closest
- * to the centroid" and attached each uncovered point via "the 4
- * closest covered points". That heuristic solves a different
- * problem — minimise edge length — and produces covers that
- * accidentally OMIT the longest edges. In a tensegrity the
- * long edges are the struts, so omitting them makes canonical
- * Class-1 structures unreachable.
+ * Design history:
+ *   spec v1 — Delaunay tetrahedralisation. Optimises edge length
+ *             (outer sphere minimisation) which is the wrong
+ *             objective for tensegrity: it preferentially omits
+ *             the LONGEST edges, i.e. the natural strut candidates.
+ *             Triplex lost the C-D strut and canonical Class-1
+ *             became unreachable.
+ *   spec v2 — Auxiliary K₅ cells to inject arbitrary strut edges.
+ *             Abandoned after an empirical test showed aux-point
+ *             adhesion + fusion is an identity operation on
+ *             existing edges: the aux self-stress column is the
+ *             only one that touches the aux edges, so the first
+ *             fuseSelfStress drops it as pivot and the "strut
+ *             signature" the scheme tried to inject disappears
+ *             together with the aux column.
+ *   spec v3 — this file. Keep the K₅ cover on input points only,
+ *             but change the *selection rule* from "nearest to
+ *             centroid / nearest to covered" to "most strut-like
+ *             edges first". Simple greedy wins because strut
+ *             candidates are long edges and a Delaunay-style
+ *             short-edge-first objective actively works against
+ *             us.
  *
- * Concrete failure on the Triplex 6-point layout:
- *   - Canonical Aloui §5 cover:  {A,B,C,D,E} + {B,C,D,E,F},
- *     omitted edge A-F (a medium "90° diagonal", not a strut).
- *   - Distance greedy:           {A,B,D,E,F} + {A,B,C,E,F},
- *     omitted edge C-D (the LONGEST edge — a canonical strut).
- *   The second cover has no C-D member at all, so the algorithm
- *   literally cannot produce the canonical Triplex {A-E, C-D, B-F}
- *   strut set no matter how smart the Phase 3 LP becomes.
+ * Algorithm (this file):
  *
- * New strategy: strut-preserving incremental cover
- * ────────────────────────────────────────────────
- * 1. Compute every pair distance. The top ⌊n/2⌋ longest pairs are
- *    our "strut candidates" — any of them might end up as a strut
- *    in the final tensegrity.
- * 2. Seed = 5 nodes that contain as many strut-candidate endpoints
- *    as possible, ties broken by total pairwise distance and
- *    general-position feasibility.
- * 3. Attachment = find an uncovered point v and a 4-subset of
- *    already-covered nodes such that
- *      (a) the 5-tuple (subset ∪ {v}) is in general position, AND
- *      (b) the "omitted pair" — the covered node EXCLUDED from the
- *          subset, paired with v — is NOT a strut candidate.
- *    Condition (b) guarantees no strut is ever split between
- *    different cells during the incremental build, because the
- *    only bottom-top pair the attachment could "cut" is that
- *    omitted pair.
- * 4. Fall back to "share-3" (2 new nodes) when share-4 can't be
- *    satisfied.
- *
- * For the Triplex 6-point layout this yields the canonical cover
- * {A,B,C,D,E} + {B,C,D,E,F} automatically; the greedy LP phase
- * can then discover the A-E / C-D / B-F strut set the paper
- * describes.
+ *   1. Rank every pair (i, j) by strutness (default: pair distance).
+ *      The top ⌊n/2⌋ pairs are the "strut candidates" — edges the
+ *      downstream Phase 3 LP will try to mark as struts.
+ *   2. Seed the cover starting from the longest pair (guaranteed to
+ *      be a strut candidate) and greedily add three more input
+ *      points. Each addition maximises distance-from-{a,b} so the
+ *      seed covers as much of the point cloud as possible while
+ *      staying in general position.
+ *   3. Iteratively attach the remaining uncovered points. For each
+ *      uncovered v, try share-4 attachment first, then share-3. For
+ *      every candidate cell we compute SCORE(cell) = Σ 1/(rank+1)
+ *      over the 10 K₅ edges and keep the globally best attachment
+ *      across all uncovered v's. This rewards cells that contain
+ *      many strut candidates without needing an explicit "omit
+ *      strut" filter.
  */
 
 import { Vec3 } from './types';
 import { vol } from './geometry';
 
-export interface CoverCell {
-  sharedIdx: number[]; // indices into the original point array
+export interface K5CoverEntry {
+  /** Indices into the original point array that are shared with
+   *  the union of previously-placed cells. Empty for the seed. */
+  sharedIdx: number[];
+  /** Indices into the original point array that are introduced
+   *  for the first time by this cell. For the seed, this is the
+   *  5-point K₅. For share-4 adhesions, exactly one index; for
+   *  share-3 adhesions, two. */
   newIdx: number[];
 }
 
+/** Legacy alias for the internal cover-cell shape. */
+export type CoverCell = K5CoverEntry;
+
 export interface K5CoverOptions {
   /**
-   * Share-count preference order when growing the cover. The
-   * builder tries each count left-to-right and accepts the first
-   * one that admits a general-position, strut-preserving cell.
-   * Default [4, 3].
+   * Strutness function used to rank candidate strut edges. The
+   * default is straight Euclidean distance — long edges rank high
+   * and the greedy attachment prefers cells that contain them. If
+   * the caller has a current W matrix they can pass a custom
+   * function that uses max_j(-W[e,j]), i.e. the most negative
+   * self-stress assignment to that edge.
    */
-  preferredShareCounts?: number[];
+  strutnessFn?: (i: number, j: number, P: Vec3[]) => number;
   /** General-position tolerance on |vol(P_i,P_j,P_k,P_l)|. */
   volTol?: number;
   /**
-   * Fraction of the longest pairs marked as strut candidates.
-   * With n = 6 and default `strutFraction = 0.5` we get ⌊6/2⌋ = 3
-   * strut candidates — exactly the three 150°-offset bottom-top
-   * diagonals in the Triplex layout. Larger fractions keep more
-   * edges "off-limits" for cutting.
+   * Share-count preference order when growing the cover. The
+   * builder tries each count left-to-right and accepts the first
+   * one that admits a general-position cell. Default [4, 3].
    */
-  strutFraction?: number;
+  preferredShareCounts?: number[];
 }
+
+// ─── Geometric helpers ────────────────────────────────────────
 
 function dist(a: Vec3, b: Vec3): number {
   const dx = a[0] - b[0], dy = a[1] - b[1], dz = a[2] - b[2];
@@ -89,6 +97,11 @@ function pairKey(a: number, b: number): string {
   return a < b ? `${a}-${b}` : `${b}-${a}`;
 }
 
+/**
+ * Check that every 4-subset of `idxs` has non-zero tetrahedral
+ * volume (|vol| > `tol`). A K₅ cell needs this property for the
+ * engine's self-stress construction to be well-conditioned.
+ */
 function inGeneralPosition(P: Vec3[], idxs: number[], tol: number): boolean {
   for (let i = 0; i < idxs.length; i++) {
     for (let j = i + 1; j < idxs.length; j++) {
@@ -122,231 +135,308 @@ function combinations<T>(arr: T[], r: number): T[][] {
   return out;
 }
 
-/**
- * Rank all unordered pairs by distance descending. Returns both
- * the sorted list and a `Set<string>` of the top-k pair keys, so
- * callers can check strut membership in O(1).
- */
-function computeStrutCandidates(
+// ─── Strut ranking ────────────────────────────────────────────
+
+interface StrutRank {
+  /** Pairs sorted by strutness descending. */
+  ordered: Array<{ i: number; j: number; score: number }>;
+  /** Rank lookup: pairKey → 0-based position in `ordered`. */
+  rankOf: Map<string, number>;
+}
+
+function buildStrutRank(
   P: Vec3[],
-  fraction: number,
-): { pairOrder: Array<{ i: number; j: number; d: number }>; strutSet: Set<string> } {
+  strutnessFn: (i: number, j: number, P: Vec3[]) => number,
+): StrutRank {
   const n = P.length;
-  const pairOrder: Array<{ i: number; j: number; d: number }> = [];
+  const ordered: Array<{ i: number; j: number; score: number }> = [];
   for (let i = 0; i < n; i++) {
     for (let j = i + 1; j < n; j++) {
-      pairOrder.push({ i, j, d: dist(P[i], P[j]) });
+      ordered.push({ i, j, score: strutnessFn(i, j, P) });
     }
   }
-  pairOrder.sort((a, b) => b.d - a.d);
-
-  const k = Math.max(1, Math.floor(n * fraction));
-  const strutSet = new Set<string>();
-  for (let i = 0; i < Math.min(k, pairOrder.length); i++) {
-    strutSet.add(pairKey(pairOrder[i].i, pairOrder[i].j));
-  }
-  return { pairOrder, strutSet };
+  // Sort descending by strutness, with an explicit index-based
+  // tiebreak so the strictly-symmetric Triplex (where three pairs
+  // have algebraically identical distances but differ by a single
+  // ULP in IEEE float) always yields the same cover.
+  ordered.sort((a, b) => {
+    const diff = b.score - a.score;
+    if (Math.abs(diff) > 1e-9) return diff;
+    if (a.i !== b.i) return a.i - b.i;
+    return a.j - b.j;
+  });
+  const rankOf = new Map<string, number>();
+  ordered.forEach((entry, idx) => rankOf.set(pairKey(entry.i, entry.j), idx));
+  return { ordered, rankOf };
 }
 
 /**
- * Seed selection: pick 5 nodes that contain as many strut-candidate
- * endpoints as possible, with general-position ties broken by the
- * strutness-weighted priority defined inside.
+ * SCORE(entry) weights two signals:
+ *   (1) number of strut candidates contained, i.e. edges whose
+ *       rank is in the top ⌊n/2⌋, and
+ *   (2) Σ 1/(rank+1) over all 10 K₅ edges.
  *
- * We start from the longest pair (guaranteed to be a strut
- * candidate) and greedily add nodes that maximise the number of
- * strut candidates whose BOTH endpoints end up in the seed.
+ * The strut-candidate count dominates (×1000) so two cells with
+ * different numbers of struts are always separable, and the
+ * 1/(rank+1) sum is a secondary tiebreaker that still prefers
+ * cells containing longer non-strut edges.
+ *
+ * The pure inverse-rank sum on its own is too coarse to separate
+ * two cells that contain the same number of struts at similar
+ * ranks — on the 6-point Triplex the two candidate last cells
+ *   {A,B,C,D,E}   (contains A-E, C-D)
+ *   {B,C,D,E,F}   (contains B-F, C-D)
+ * scored within 0.5% of each other, and a stable-sort tiebreaker
+ * was arbitrarily picking the second even though both options
+ * miss exactly one of the three canonical struts — we needed an
+ * outside-of-cell "did any strut get left behind" signal too,
+ * which the caller supplies via `strutsNotYetCovered`.
  */
-function findSeedK5(
-  P: Vec3[],
-  pairOrder: Array<{ i: number; j: number; d: number }>,
-  strutSet: Set<string>,
-  volTol: number,
-): number[] {
+function scoreEntry(
+  entry: K5CoverEntry,
+  rank: StrutRank,
+  topK: number,
+  strutsNotYetCovered: Set<string>,
+): number {
+  const pts = [...entry.sharedIdx, ...entry.newIdx];
+  let strutCount = 0;
+  let newStrutCount = 0;
+  let inverseRankSum = 0;
+  for (let i = 0; i < pts.length; i++) {
+    for (let j = i + 1; j < pts.length; j++) {
+      const key = pairKey(pts[i], pts[j]);
+      const r = rank.rankOf.get(key);
+      if (r !== undefined) {
+        inverseRankSum += 1 / (r + 1);
+        if (r < topK) {
+          strutCount++;
+          // Struts still missing from the cover union score
+          // EXTRA — adding a brand-new strut is worth more than
+          // repeating one that's already been covered.
+          if (strutsNotYetCovered.has(key)) newStrutCount++;
+        }
+      }
+    }
+  }
+  return newStrutCount * 1e6 + strutCount * 1e3 + inverseRankSum;
+}
+
+// ─── Seed selection ───────────────────────────────────────────
+
+/**
+ * Seed selection. Start from the longest pair (a, b) and greedily
+ * add three more points, each time picking the covered-space point
+ * that is farthest from both a and b (maximises distance-sum) while
+ * preserving general position of the growing seed.
+ */
+function findSeed(P: Vec3[], rank: StrutRank, volTol: number): number[] {
   const n = P.length;
   if (n < 5) throw new Error('K₅ cover requires n ≥ 5');
 
-  // Start from the longest edge; that pair is a strut candidate.
-  const first = pairOrder[0];
+  // The first pair (a, b) is guaranteed to be the strutness-maximal
+  // pair, which will become the first strut candidate the LP tries
+  // to enforce in Phase 3.
+  const first = rank.ordered[0];
   const seed: number[] = [first.i, first.j];
 
-  const scoreAddition = (v: number): number => {
-    // Count how many strut-candidate edges would become intra-seed
-    // after adding `v` (each needs its other endpoint already in
-    // the seed). Tiebreak by total distance from seed.
-    let strutGain = 0;
-    let distSum = 0;
-    for (const s of seed) {
-      if (strutSet.has(pairKey(v, s))) strutGain++;
-      distSum += dist(P[v], P[s]);
-    }
-    return strutGain * 1e6 + distSum;
-  };
+  // Ranked pool of the remaining points by distance-from-{a,b}.
+  const pool = [...Array(n).keys()]
+    .filter(k => k !== first.i && k !== first.j)
+    .map(k => ({
+      k,
+      d: dist(P[k], P[first.i]) + dist(P[k], P[first.j]),
+    }))
+    .sort((a, b) => b.d - a.d)
+    .map(x => x.k);
 
-  while (seed.length < 5) {
-    let bestV = -1;
-    let bestScore = -Infinity;
-    for (let v = 0; v < n; v++) {
-      if (seed.includes(v)) continue;
-      const trial = [...seed, v];
-      if (trial.length >= 4 && !inGeneralPosition(P, trial, volTol)) continue;
-      const s = scoreAddition(v);
-      if (s > bestScore) { bestScore = s; bestV = v; }
+  for (const c of pool) {
+    const trial = [...seed, c];
+    if (trial.length >= 4 && !inGeneralPosition(P, trial, volTol)) continue;
+    seed.push(c);
+    if (seed.length === 5) break;
+  }
+
+  if (seed.length < 5) {
+    // Last-ditch: some point fails general position for every
+    // prefix; walk through the full pool again without the guard
+    // and accept whatever we get. For reasonable inputs this
+    // branch is unreachable.
+    for (const c of pool) {
+      if (seed.includes(c)) continue;
+      seed.push(c);
+      if (seed.length === 5) break;
     }
-    if (bestV < 0) {
-      // Fall back to any valid point even if it breaks general
-      // position so we can at least return a seed.
-      for (let v = 0; v < n; v++) {
-        if (!seed.includes(v)) { bestV = v; break; }
-      }
-      if (bestV < 0) break;
-    }
-    seed.push(bestV);
+  }
+  if (seed.length < 5) {
+    throw new Error('cannot find 5-point general-position seed');
   }
   return seed;
 }
 
+// ─── Attachment ───────────────────────────────────────────────
+
 /**
- * Find one K₅ attachment for uncovered node `v`. `covered` is the
- * full set of already-covered nodes. `shareCount` is 4 (add 1 new)
- * or 3 (add 2 new). We require general position on the resulting
- * 5-tuple AND that the "omitted pair" — the covered node NOT
- * selected as a shared neighbour, paired with v — is not one of
- * the strut candidates. Falling back to share-3 we relax the
- * strut-preservation rule because 2 new nodes are added together
- * and the omitted-pair analysis no longer applies cleanly.
+ * Find one K₅ attachment for uncovered node `v` that shares exactly
+ * `nShared` points with the current covered set. Returns `null` if
+ * no general-position cell exists for the requested share count.
+ *
+ * The inner loop enumerates candidate shared subsets in an order
+ * that biases toward subsets containing strut-rank-high edges,
+ * which lets the outer SCORE-based selection converge quickly.
  */
 function findAttachment(
   P: Vec3[],
   v: number,
   covered: number[],
   uncovered: number[],
-  strutSet: Set<string>,
-  shareCount: number,
+  nShared: number,
+  rank: StrutRank,
+  topK: number,
+  strutsLeft: Set<string>,
   volTol: number,
-): CoverCell | null {
-  if (shareCount === 4) {
-    // Order covered nodes by proximity to v — try "natural" 4-subsets
-    // first so simple cases don't need to enumerate the whole space.
-    const ordered = [...covered].sort((a, b) =>
-      dist(P[v], P[a]) - dist(P[v], P[b]),
-    );
+): K5CoverEntry | null {
+  const nNewExtras = 5 - nShared - 1; // 5-point cell minus shared minus v
 
-    for (const subset of combinations(ordered, 4)) {
-      const trial = [...subset, v];
+  if (nNewExtras === 0) {
+    // share-4: shared subset + v, no extra new points.
+    // Rank covered subsets by how many strut-candidate edges the
+    // resulting K₅ would contain, so the outer SCORE-max finds a
+    // high-quality cell on its first accepted candidate.
+    const subsets = combinations(covered, nShared);
+    const scored = subsets.map(sub => {
+      const cell = { sharedIdx: sub, newIdx: [v] };
+      return { sub, s: scoreEntry(cell, rank, topK, strutsLeft) };
+    });
+    scored.sort((a, b) => b.s - a.s);
+    for (const { sub } of scored) {
+      const trial = [...sub, v];
       if (!inGeneralPosition(P, trial, volTol)) continue;
-      // Check: the covered node EXCLUDED from the subset is the
-      // seed's "unique partner" of v in the new cell pair. If that
-      // pair is a strut candidate, we'd be omitting a strut from
-      // the union — skip.
-      const cutVertices = covered.filter(c => !subset.includes(c));
-      const anyCut = cutVertices.some(c => strutSet.has(pairKey(v, c)));
-      if (anyCut) continue;
-      return { sharedIdx: subset, newIdx: [v] };
-    }
-    // If strut preservation made everything impossible, relax and
-    // take any valid share-4 attachment.
-    for (const subset of combinations(ordered, 4)) {
-      const trial = [...subset, v];
-      if (!inGeneralPosition(P, trial, volTol)) continue;
-      return { sharedIdx: subset, newIdx: [v] };
+      return { sharedIdx: sub, newIdx: [v] };
     }
     return null;
   }
 
-  if (shareCount === 3) {
-    // share-3 = 3 shared + 2 new. We pick `v` plus one other
-    // uncovered partner w and search for 3 shared nodes.
-    for (const w of uncovered) {
-      if (w === v) continue;
-      const pair = [v, w];
-      const ordered = [...covered].sort((a, b) =>
-        dist(P[v], P[a]) - dist(P[v], P[b]),
-      );
-      for (const subset of combinations(ordered, 3)) {
-        const trial = [...subset, ...pair];
-        if (!inGeneralPosition(P, trial, volTol)) continue;
-        return { sharedIdx: subset, newIdx: pair };
+  // share-3 (nNewExtras = 1): shared subset of 3 + v + one more
+  // uncovered input point. The extra uncovered point is chosen
+  // from the current uncovered pool; each combination is scored
+  // and the highest-scoring general-position cell wins.
+  const pool = uncovered.filter(u => u !== v);
+  const sharedSubsets = combinations(covered, nShared);
+
+  let bestCell: K5CoverEntry | null = null;
+  let bestScore = -Infinity;
+  for (const sub of sharedSubsets) {
+    for (const extras of combinations(pool, nNewExtras)) {
+      const trial = [...sub, ...extras, v];
+      if (!inGeneralPosition(P, trial, volTol)) continue;
+      const cell: K5CoverEntry = {
+        sharedIdx: sub,
+        newIdx: [...extras, v],
+      };
+      const s = scoreEntry(cell, rank, topK, strutsLeft);
+      if (s > bestScore) {
+        bestScore = s;
+        bestCell = cell;
       }
     }
-    return null;
   }
-
-  return null;
+  return bestCell;
 }
 
-/**
- * Build an ordered K₅ cover using the strut-preserving incremental
- * algorithm described at the top of the file.
- */
+// ─── Public entry point ───────────────────────────────────────
+
 export function buildK5Cover(
   P: Vec3[],
   options: K5CoverOptions = {},
-): CoverCell[] {
+): K5CoverEntry[] {
   const n = P.length;
   if (n < 5) throw new Error('K₅ cover requires n ≥ 5');
 
-  const preferredShareCounts = options.preferredShareCounts ?? [4, 3];
   const volTol = options.volTol ?? 1e-9;
-  const strutFraction = options.strutFraction ?? 0.5;
+  const preferredShareCounts = options.preferredShareCounts ?? [4, 3];
+  const strutnessFn = options.strutnessFn
+    ?? ((i, j, Pts) => dist(Pts[i], Pts[j]));
 
-  const { pairOrder, strutSet } = computeStrutCandidates(P, strutFraction);
+  const rank = buildStrutRank(P, strutnessFn);
+  // Top ⌊n/2⌋ pairs are the "strut candidates". We maintain the
+  // set of strut candidates NOT YET covered by any placed cell so
+  // the SCORE function can reward cells that add a brand-new
+  // strut over cells that only duplicate an already-covered one.
+  const topK = Math.max(1, Math.floor(n / 2));
+  const strutsLeft = new Set<string>();
+  for (let i = 0; i < topK && i < rank.ordered.length; i++) {
+    const p = rank.ordered[i];
+    strutsLeft.add(pairKey(p.i, p.j));
+  }
 
-  // Step 1: seed
-  const seed = findSeedK5(P, pairOrder, strutSet, volTol);
-  const cells: CoverCell[] = [{ sharedIdx: [], newIdx: seed }];
+  // Helper: mark every strut contained in `cell` as covered.
+  const markStrutsCovered = (cell: K5CoverEntry): void => {
+    const pts = [...cell.sharedIdx, ...cell.newIdx];
+    for (let i = 0; i < pts.length; i++) {
+      for (let j = i + 1; j < pts.length; j++) {
+        const k = pairKey(pts[i], pts[j]);
+        if (strutsLeft.has(k)) strutsLeft.delete(k);
+      }
+    }
+  };
+
+  // Step 1 + 2: seed.
+  const seed = findSeed(P, rank, volTol);
+  const seedCell: K5CoverEntry = { sharedIdx: [], newIdx: seed };
+  const cover: K5CoverEntry[] = [seedCell];
   const covered = new Set<number>(seed);
+  markStrutsCovered(seedCell);
 
-  // Step 2: iterate until every node is covered
+  // Step 3: grow the cover one attachment at a time. At every step
+  // we pick the attachment with the highest strut-sensitive score
+  // across all possible (uncovered vertex, share count) pairs.
   while (covered.size < n) {
     const coveredArr = [...covered];
     const uncovered: number[] = [];
     for (let i = 0; i < n; i++) if (!covered.has(i)) uncovered.push(i);
 
-    // Try every uncovered node against every preferred share count.
-    // Uncovered nodes are ordered by how many strut candidates they
-    // would bring in — the more struts they unlock, the earlier we
-    // want to attach them.
-    const strutIncidence = (v: number): number => {
-      let c = 0;
-      for (let i = 0; i < n; i++) {
-        if (i === v) continue;
-        if (strutSet.has(pairKey(v, i))) c++;
-      }
-      return c;
-    };
-    uncovered.sort((a, b) => strutIncidence(b) - strutIncidence(a));
-
-    let attached: CoverCell | null = null;
-    let attachedVs: number[] = [];
-    outer: for (const share of preferredShareCounts) {
-      for (const v of uncovered) {
-        const cell = findAttachment(P, v, coveredArr, uncovered, strutSet, share, volTol);
+    let bestCell: K5CoverEntry | null = null;
+    let bestScore = -Infinity;
+    for (const v of uncovered) {
+      for (const share of preferredShareCounts) {
+        const cell = findAttachment(
+          P, v, coveredArr, uncovered, share, rank, topK, strutsLeft, volTol,
+        );
         if (cell) {
-          attached = cell;
-          attachedVs = cell.newIdx;
-          break outer;
+          const s = scoreEntry(cell, rank, topK, strutsLeft);
+          if (s > bestScore) {
+            bestScore = s;
+            bestCell = cell;
+          }
+          // Once share-4 returned something for this v we stop
+          // trying share-3: share-4 always has a higher Δ(dim W)
+          // / cost ratio, so we never want to prefer share-3 over
+          // share-4 for the same v.
+          break;
         }
       }
     }
 
-    if (!attached) {
-      // Last-ditch: share the 4 closest-by-distance covered nodes to
-      // the first uncovered point, ignoring the strut rule.
+    if (!bestCell) {
+      // No attachment possible within the preferred share counts.
+      // Fall back to "attach the first uncovered point via the
+      // 4 covered points closest to it, ignoring general position"
+      // — same last-ditch as the previous implementation.
       const v = uncovered[0];
-      const ordered = [...coveredArr].sort(
-        (a, b) => dist(P[v], P[a]) - dist(P[v], P[b]),
-      );
-      attached = {
+      const ordered = coveredArr
+        .map(c => ({ c, d: dist(P[v], P[c]) }))
+        .sort((a, b) => a.d - b.d)
+        .map(x => x.c);
+      bestCell = {
         sharedIdx: ordered.slice(0, 4),
         newIdx: [v],
       };
-      attachedVs = [v];
     }
 
-    cells.push(attached);
-    for (const v of attachedVs) covered.add(v);
+    cover.push(bestCell);
+    markStrutsCovered(bestCell);
+    for (const x of bestCell.newIdx) covered.add(x);
   }
 
-  return cells;
+  return cover;
 }
