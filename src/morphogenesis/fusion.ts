@@ -19,6 +19,7 @@
 
 import { MorphogenesisState, Vec3, MemberRow } from './types';
 import { vsub, vcross, vlength, vnormalize, vdot } from './geometry';
+import { assignForceDensities } from './engine';
 
 // ─── Small table-level helpers ─────────────────────────────────
 
@@ -257,13 +258,42 @@ export function projectOntoQuadric(p0: Vec3, T: number[][]): Vec3 {
 /**
  * One-edge fusion: always possible (scalar β-adjustment in W).
  * Keeps MemberRow → force_density consistent with the surviving basis.
+ *
+ * FIX-D — after `fuseSelfStress` rewrites the self-stress entries,
+ * every MemberRow still carries its pre-fusion `type` and
+ * `force_density`. A BC edge that was typed as a "strut" at adhesion
+ * time (because the original K₅'s self-stress had a negative q there)
+ * can become a cable after fusion, but the MemberRow keeps saying
+ * "strut" and q = −0.1925. The next LP iteration then feeds the LP
+ * the WRONG strut / cable split, enforceClass1 happily reports
+ * Class-1 "reached", and the viewer draws a tensegrity whose cable
+ * has negative force density.
+ *
+ * The fix is to re-derive `force_density` and `type` from the
+ * surviving W column 0 right after every fusion. `syncMembers =
+ * false` is an escape hatch for callers that want to chain several
+ * fuse operations and re-sync once at the end (e.g. fuseTwoEdges
+ * below) — but the DEFAULT is `true` because any code path that
+ * forgets to sync will silently reintroduce the regression.
  */
-export function fuseOneEdge(state: MorphogenesisState, memberId: number): boolean {
+export function fuseOneEdge(
+  state: MorphogenesisState,
+  memberId: number,
+  syncMembers: boolean = true,
+): boolean {
   const stepId = state.nextStepId++;
   const dimBefore = state.selfStressStates.length;
 
   fuseSelfStress(state, memberId);
   state.removedMembers.push({ step_id: stepId, member_id: memberId });
+
+  // FIX-D: sync every MemberRow's type + force_density with the
+  // rewritten self-stress basis. The new column-0 snapshot drives
+  // classification via sign(q) in assignForceDensities, so cables
+  // and struts always match the W entries the LP will see next.
+  if (syncMembers) {
+    assignForceDensities(state);
+  }
 
   state.morphogenesisSteps.push({
     step_id: stepId,
@@ -288,12 +318,16 @@ export function fuseOneEdge(state: MorphogenesisState, memberId: number): boolea
 /**
  * Two-edge fusion: solve the geometric locus (plane/quadric), move one
  * endpoint onto it if a candidate is available, then fuse both edges.
+ *
+ * FIX-D applies here too: after both edges are removed we re-sync
+ * MemberRow.force_density / type from the surviving W column 0.
  */
 export function fuseTwoEdges(
   state: MorphogenesisState,
   memberId1: number,
   memberId2: number,
   relocateNodeId?: number,
+  syncMembers: boolean = true,
 ): boolean {
   const locus = solveGeometry(state, [memberId1, memberId2]);
 
@@ -325,6 +359,12 @@ export function fuseTwoEdges(
     delta_dim_W_predicted: -2,
     delta_dim_W_actual: -2,
   });
+
+  // FIX-D: sync after BOTH fuseSelfStress calls so the intermediate
+  // (one-edge-removed) state never leaks into MemberRow.
+  if (syncMembers) {
+    assignForceDensities(state);
+  }
   return true;
 }
 
