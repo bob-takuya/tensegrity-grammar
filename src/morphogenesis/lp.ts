@@ -291,7 +291,12 @@ export async function lpClass1CheckAsync(
   cableIds: number[],
   yieldFn: () => Promise<boolean>,
   eps: number = 1e-6,
-  chunkSize: number = 100,
+  // Raised 100 → 200: the per-start descent does ≤ 400 iterations
+  // and a chunkSize of 200 means at most two yields per start
+  // instead of four, halving the rAF overhead on the LP hot path
+  // while still keeping yields frequent enough that the viewer
+  // repaints during a long LP call.
+  chunkSize: number = 200,
 ): Promise<LPCheckResult> {
   const E = W.length;
   if (E === 0) return { feasible: false, alpha: [], residual: Infinity };
@@ -382,6 +387,15 @@ export async function lpClass1CheckAsync(
   let bestF = Infinity;
   const MAX_ITERS = 400;
 
+  // The degenerate α = 0 solution has hinge loss
+  //     trivialLoss = (|strutRows| + |cableRows|) · ε²
+  // (every constraint has slack = ε on its soft side). Any α that
+  // is below `trivialLoss * 0.01` has escaped the degenerate basin
+  // by at least 2 orders of magnitude and is almost certainly
+  // feasible; we can short-circuit the remaining starts there.
+  const trivialLoss = (strutRows.length + cableRows.length) * eps * eps;
+  const escapedBasinThreshold = trivialLoss * 0.01;
+
   for (let si = 0; si < starts.length; si++) {
     let alpha = [...starts[si]];
     for (let iterBase = 0; iterBase < MAX_ITERS; iterBase += chunkSize) {
@@ -424,6 +438,11 @@ export async function lpClass1CheckAsync(
     if (finalLoss < bestF) { bestF = finalLoss; best = alpha; }
     // Early exit once we've found a clean zero of the hinge loss.
     if (bestF < 1e-14) break;
+    // Early exit once we've escaped the degenerate α ≈ 0 basin by
+    // two orders of magnitude. At that point the hard feasibility
+    // check below will very likely pass and the remaining starts
+    // are just burning rAF frames.
+    if (bestF < escapedBasinThreshold) break;
   }
 
   // Per-constraint feasibility check on the raw (un-normalised) α.
