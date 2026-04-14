@@ -1136,6 +1136,214 @@ export async function searchClass1Tensegrity(
   };
 }
 
+// ─── Triplex manual construction demo ───────────────────────
+//
+// The algorithmic search (`searchClass1Tensegrity`) drives a
+// greedy maximum-matching + LP feasibility + strategic-fusion loop
+// that cannot reliably discover the specific fusion sequence that
+// turns two K₅ cells sharing four nodes into a Triplex
+// (seed K₅ {A,B,C,D,E} → adhere K₅ {B,C,D,E,F} → fuse BD → fuse CE).
+// That sequence is a hand-crafted construction from Aloui et al.
+// §5, not something the greedy enforcement phase is guaranteed to
+// find.
+//
+// `buildTriplexManually` replays the hand-crafted sequence directly
+// on the same async + yield + event machinery as the main search
+// entry point, so the UI sees live ticks for seed placement, the
+// adhesion, each fusion, and Phase 4 validation. Requires exactly
+// 6 points in the canonical Triplex layout (two triangles with a
+// 30° twist); the caller is expected to have provided them via the
+// "Load Triplex preset" button.
+
+/**
+ * Run the Aloui §5 Triplex construction explicitly on the given
+ * 6 points. The point order is expected to be
+ *     [A, B, C]  bottom triangle
+ *     [D, E, F]  top triangle (30° twist)
+ * but the function is tolerant of any labeling — it just uses
+ * points 0..4 for the seed K₅ and introduces point 5 on the
+ * adhesion, then fuses the two diagonals that cross the rotation
+ * axis (BD and CE in canonical labeling).
+ */
+export async function buildTriplexManually(
+  points: Vec3[],
+  options: Class1SearchOptions = {},
+): Promise<Class1SearchResult> {
+  const timeoutMs = Math.max(1, options.timeoutMs ?? 10_000);
+  const startedAt = Date.now();
+  const deadline = startedAt + timeoutMs;
+  const state = createEmptyState();
+  const driver = createYield(startedAt, deadline, state, options);
+  const yieldFn = driver.yield;
+
+  if (points.length < 6) {
+    logEvent(state, {
+      kind: 'failure',
+      message: `Triplex needs 6 points, got ${points.length}`,
+    });
+    await yieldFn('aborted · need 6 points');
+    return {
+      state,
+      success: false,
+      rigid: false,
+      class1: false,
+      numPoints: points.length,
+      timedOut: false,
+      elapsedMs: Date.now() - startedAt,
+    };
+  }
+
+  logEvent(state, {
+    kind: 'phase',
+    message: `Phase 0 — Triplex demo (6 canonical points, timeout ${timeoutMs} ms)`,
+  });
+  await yieldFn('Phase 0 · Triplex preset');
+
+  // Step 1: seed K₅ on points 0..4  (canonical label {A, B, C, D, E}).
+  const seedCell = initializeK5(state, points.slice(0, 5));
+  if (!seedCell) {
+    logEvent(state, { kind: 'failure', message: 'initializeK5 failed' });
+    await yieldFn('aborted · seed failed');
+    return {
+      state, success: false, rigid: false, class1: false,
+      numPoints: points.length, timedOut: false,
+      elapsedMs: Date.now() - startedAt,
+    };
+  }
+  const [nA, nB, nC, nD, nE] = seedCell.node_ids;
+  logEvent(state, {
+    kind: 'init',
+    message: `Seed K₅ {A,B,C,D,E} placed (dim W → ${state.selfStressStates.length})`,
+    cell_id: seedCell.cell_id,
+    node_ids: seedCell.node_ids,
+  });
+  await yieldFn('Triplex · seed K₅');
+
+  // Step 2: adhere the second K₅ on shared {B, C, D, E}, new node = F.
+  const adh = adhereCell(state, [nB, nC, nD, nE], [points[5]]);
+  if (!adh) {
+    logEvent(state, { kind: 'failure', message: 'adhereCell for BCDEF failed' });
+    await yieldFn('aborted · adhesion failed');
+    return {
+      state, success: false, rigid: false, class1: false,
+      numPoints: points.length, timedOut: false,
+      elapsedMs: Date.now() - startedAt,
+    };
+  }
+  const nF = adh.addedNodeIds[0];
+  logEvent(state, {
+    kind: 'adhesion',
+    message:
+      `Adhered K₅ {B,C,D,E,F} (shared 4, new 1), ` +
+      `dim W → ${state.selfStressStates.length}`,
+    cell_id: adh.cellId,
+    member_ids: adh.addedMemberIds,
+    dim_W_after: state.selfStressStates.length,
+  });
+  await yieldFn('Triplex · adhere BCDEF');
+
+  // Step 3: find and fuse the BD and CE diagonal members.
+  const findMember = (a: number, b: number) => {
+    const lo = Math.min(a, b), hi = Math.max(a, b);
+    return state.members.find(m => m.node_a === lo && m.node_b === hi);
+  };
+  const mBD = findMember(nB, nD);
+  const mCE = findMember(nC, nE);
+  if (!mBD || !mCE) {
+    logEvent(state, {
+      kind: 'failure',
+      message: `Could not locate both BD (${mBD ? 'ok' : 'missing'}) and CE (${mCE ? 'ok' : 'missing'}) members`,
+    });
+    await yieldFn('aborted · missing fuse targets');
+    return {
+      state, success: false, rigid: false, class1: false,
+      numPoints: points.length, timedOut: false,
+      elapsedMs: Date.now() - startedAt,
+    };
+  }
+
+  fuseOneEdge(state, mBD.member_id);
+  logEvent(state, {
+    kind: 'fusion',
+    message: `Fused BD → dim W ${state.selfStressStates.length}`,
+    member_ids: [mBD.member_id],
+    dim_W_after: state.selfStressStates.length,
+  });
+  await yieldFn('Triplex · fuse BD');
+
+  fuseOneEdge(state, mCE.member_id);
+  logEvent(state, {
+    kind: 'fusion',
+    message: `Fused CE → dim W ${state.selfStressStates.length}`,
+    member_ids: [mCE.member_id],
+    dim_W_after: state.selfStressStates.length,
+  });
+  await yieldFn('Triplex · fuse CE');
+
+  // Phase 4 validation reusing the same helpers as the main flow.
+  logEvent(state, { kind: 'phase', message: 'Phase 4 — validation' });
+  await yieldFn('Phase 4 · validation');
+
+  const rigidResult = validateRigidity(state);
+  const rigid = rigidResult.infinitesimallyRigid || rigidResult.prestressStable;
+  logEvent(state, {
+    kind: rigid ? 'info' : 'failure',
+    message:
+      `V3 rigidity: rank=${rigidResult.rank} / ${3 * state.nodes.length - 6}, ` +
+      `mechanisms=${rigidResult.dimMechanism}, dim W=${rigidResult.dimW}, ` +
+      `infRigid=${rigidResult.infinitesimallyRigid}, ` +
+      `prestressStable=${rigidResult.prestressStable}`,
+  });
+
+  const signCheck = validateSignConsistency(state);
+  if (!signCheck.ok) {
+    logEvent(state, {
+      kind: 'failure',
+      message:
+        `V1 sign consistency FAILED on ${signCheck.violations.length} members: ` +
+        signCheck.violations.slice(0, 5)
+          .map(v => `#${v.id}(${v.type}, q=${v.q.toExponential(2)})`)
+          .join(', '),
+      member_ids: signCheck.violations.map(v => v.id),
+    });
+  }
+
+  const class1 = validateMatching(state);
+  const prestress = validatePrestressStability(state);
+  logEvent(state, {
+    kind: prestress.ok ? 'info' : 'failure',
+    message:
+      `V4 prestress stability: min eig(Ω) = ${prestress.minEig.toExponential(2)} ` +
+      `(${prestress.ok ? 'OK' : 'FAIL'})`,
+  });
+
+  // Record the final matching as state.matching so the UI's
+  // inspector highlight works the same as after a normal search.
+  state.matching = state.members
+    .filter(m => m.type === 'strut')
+    .map(m => m.member_id);
+
+  const elapsedMs = Date.now() - startedAt;
+  const allOK = rigid && class1 && signCheck.ok;
+  logEvent(state, {
+    kind: allOK ? 'success' : 'info',
+    message:
+      `Triplex demo done — struts=${state.matching.length}, ` +
+      `rigid=${rigid}, class1=${class1}, signs=${signCheck.ok}`,
+  });
+  await yieldFn('done · Triplex demo');
+
+  return {
+    state,
+    success: allOK,
+    rigid,
+    class1,
+    numPoints: points.length,
+    timedOut: false,
+    elapsedMs,
+  };
+}
+
 // ─── helpers ───────────────────────────────────────────────
 
 function mulberry32(seed: number): () => number {

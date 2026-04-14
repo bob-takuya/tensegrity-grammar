@@ -1,7 +1,8 @@
 import React, { createContext, useContext, useReducer, useRef, useCallback } from 'react';
 import { AppState, AppAction, SearchRequest } from '../types';
 import { appReducer, createInitialState } from './reducer';
-import { searchClass1Tensegrity } from '../morphogenesis/searchClass1';
+import { searchClass1Tensegrity, buildTriplexManually } from '../morphogenesis/searchClass1';
+import type { Vec3 } from '../morphogenesis/types';
 
 interface AppContextType {
   state: AppState;
@@ -12,6 +13,14 @@ interface AppContextType {
    * search is already running it is aborted first.
    */
   runSearch: (req: SearchRequest) => Promise<void>;
+  /**
+   * Run the hand-crafted Triplex construction (seed K₅ → adhere →
+   * fuse BD → fuse CE) on the provided 6 points. Bypasses the
+   * greedy search entirely so the user always gets the canonical
+   * Aloui §5 result. Uses the same progress / tick plumbing as
+   * runSearch, so Viewer3D and the event log update live.
+   */
+  runTriplex: (points: Vec3[], timeoutMs: number) => Promise<void>;
   /** Abort the currently running search, if any. */
   stopSearch: () => void;
 }
@@ -85,12 +94,64 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     }
   }, [state.morpho]);
 
+  const runTriplex = useCallback(async (points: Vec3[], timeoutMs: number) => {
+    controllerRef.current?.abort();
+    const ctrl = new AbortController();
+    controllerRef.current = ctrl;
+
+    dispatch({ type: 'SEARCH_START', timeoutMs });
+
+    try {
+      const result = await buildTriplexManually(points, {
+        timeoutMs,
+        signal: ctrl.signal,
+        yieldToEventLoop: true,
+        onProgress: (progress) => {
+          dispatch({
+            type: 'SEARCH_TICK',
+            morpho: progress.state,
+            phase: progress.phase,
+            tick: progress.tick,
+            elapsedMs: progress.elapsedMs,
+            remainingMs: progress.remainingMs,
+          });
+        },
+      });
+
+      dispatch({
+        type: 'SEARCH_DONE',
+        morpho: result.state,
+        status: ctrl.signal.aborted
+          ? 'aborted'
+          : result.timedOut
+            ? 'timeout'
+            : 'done',
+        elapsedMs: result.elapsedMs,
+        rigid: result.rigid,
+        class1: result.class1,
+        lpSuccess: result.success,
+      });
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error('buildTriplexManually failed:', err);
+      dispatch({
+        type: 'SEARCH_DONE',
+        morpho: state.morpho,
+        status: 'aborted',
+        elapsedMs: 0,
+        rigid: false,
+        class1: false,
+        lpSuccess: false,
+      });
+    }
+  }, [state.morpho]);
+
   const stopSearch = useCallback(() => {
     controllerRef.current?.abort();
   }, []);
 
   return (
-    <AppContext.Provider value={{ state, dispatch, runSearch, stopSearch }}>
+    <AppContext.Provider value={{ state, dispatch, runSearch, runTriplex, stopSearch }}>
       {children}
     </AppContext.Provider>
   );
