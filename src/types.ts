@@ -36,6 +36,15 @@ export interface SearchLiveInfo {
   rigid: boolean;
   class1: boolean;
   lpSuccess: boolean;
+  /**
+   * Class-k of the returned structure (1 = ideal Class-1,
+   * higher = worse). 0 means the structure has no struts at all.
+   */
+  bestClassK: number;
+  /** True iff every input node has at least one incident member. */
+  allConnected: boolean;
+  /** Human-readable summary from the search driver. */
+  bestResultNote: string;
 }
 
 export interface AppState {
@@ -63,6 +72,9 @@ export type AppAction =
       rigid: boolean;
       class1: boolean;
       lpSuccess: boolean;
+      bestClassK: number;
+      allConnected: boolean;
+      bestResultNote: string;
     }
   | { type: 'CLEAR' }
   | { type: 'SELECT_NODES'; ids: number[] }

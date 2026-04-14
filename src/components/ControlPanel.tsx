@@ -370,15 +370,18 @@ export function ControlPanel() {
             } else if (valid) {
               icon = '✓';
               label = 'Class-1 tensegrity found';
+            } else if (search.bestClassK > 0 && search.allConnected) {
+              // Spec v6: expose the search driver's best Class-k
+              // snapshot — a settled-but-non-success run that at
+              // least produced a fully-connected Class-k > 1
+              // structure is still useful to visualise.
+              icon = '◈';
+              label = `Class-${search.bestClassK} (best of search)`;
             } else {
               icon = '✗';
               const reasons: string[] = [];
+              if (!search.allConnected) reasons.push('unconnected nodes');
               if (!search.lpSuccess) reasons.push('LP failed');
-              // Only label a Class-N violation when there ARE struts
-              // but they share a node. "no struts" handles the empty
-              // case below, and we don't want to print "Class-1" as a
-              // failure reason (the old Math.max(1, 0) produced that
-              // misleading string for zero-strut structures).
               if (!search.class1 && nStruts > 0 && actualMaxComp >= 2) {
                 reasons.push(`Class-${actualMaxComp}`);
               }
@@ -401,17 +404,32 @@ export function ControlPanel() {
           })()}
 
           {search.status !== 'idle' && search.status !== 'running' && (
-            <div
-              style={{
-                marginTop: 6,
-                fontSize: 10,
-                fontFamily: 'monospace',
-                color: '#666',
-              }}
-            >
-              rigid={String(search.rigid)} · class1={String(search.class1)} ·
-              lp={String(search.lpSuccess)}
-            </div>
+            <>
+              <div
+                style={{
+                  marginTop: 6,
+                  fontSize: 10,
+                  fontFamily: 'monospace',
+                  color: '#666',
+                }}
+              >
+                rigid={String(search.rigid)} · class1={String(search.class1)} ·
+                lp={String(search.lpSuccess)} ·
+                connected={String(search.allConnected)}
+              </div>
+              {search.bestResultNote && (
+                <div
+                  style={{
+                    marginTop: 4,
+                    fontSize: 10,
+                    color: '#888',
+                    lineHeight: 1.4,
+                  }}
+                >
+                  {search.bestResultNote}
+                </div>
+              )}
+            </>
           )}
         </div>
       )}

@@ -261,3 +261,187 @@ export function lpPairCheck(
   const det = aa * bb - ab * ab;
   return det > eps;
 }
+
+// ─── Async LP check (chunked, for UI responsiveness) ──────
+
+/**
+ * Async counterpart to `lpClass1Check` that yields control back
+ * to the event loop every `chunkSize` gradient-descent
+ * iterations. Used by the search driver so the 3D viewer can
+ * actually repaint while a long LP solve is in progress — a
+ * synchronous 400-iter × 8-seed × k-dim LP on n = 20 can
+ * otherwise lock up the main thread for hundreds of
+ * milliseconds per Phase 3 iteration.
+ *
+ * The `yieldFn` argument should return `true` when the caller
+ * wants us to stop early (e.g. wall-clock deadline reached or
+ * AbortController aborted). When that happens we return the
+ * best-so-far α and residual — the caller must tolerate a
+ * partial answer.
+ *
+ * Semantics are otherwise identical to `lpClass1Check`:
+ * multi-start, analytical LS seed, signed-indicator seed,
+ * back-tracking line search, hard feasibility check on the raw
+ * Wα with ε/2 margin.
+ */
+export async function lpClass1CheckAsync(
+  W: number[][],
+  memberIdx: Map<number, number>,
+  strutIds: number[],
+  cableIds: number[],
+  yieldFn: () => Promise<boolean>,
+  eps: number = 1e-6,
+  chunkSize: number = 100,
+): Promise<LPCheckResult> {
+  const E = W.length;
+  if (E === 0) return { feasible: false, alpha: [], residual: Infinity };
+  const k = W[0].length;
+  if (k === 0) return { feasible: false, alpha: [], residual: Infinity };
+
+  const rowIsZero = (row: number[]): boolean => {
+    let s = 0;
+    for (let j = 0; j < k; j++) s += row[j] * row[j];
+    return s < 1e-18;
+  };
+  const resolveRow = (id: number): number | null => {
+    const r = memberIdx.get(id);
+    if (r === undefined) return null;
+    if (rowIsZero(W[r])) return null;
+    return r;
+  };
+  const strutRows = strutIds.map(resolveRow).filter((r): r is number => r !== null);
+  const cableRows = cableIds.map(resolveRow).filter((r): r is number => r !== null);
+
+  const evalWalpha = (alpha: number[]): number[] => {
+    const out = new Array(E).fill(0);
+    for (let e = 0; e < E; e++) {
+      let s = 0;
+      for (let j = 0; j < k; j++) s += W[e][j] * alpha[j];
+      out[e] = s;
+    }
+    return out;
+  };
+
+  const lossAndGrad = (alpha: number[]): { f: number; g: number[] } => {
+    const w = evalWalpha(alpha);
+    let f = 0;
+    const g = new Array(k).fill(0);
+    for (const e of strutRows) {
+      const v = eps + w[e];
+      if (v > 0) {
+        f += v * v;
+        for (let j = 0; j < k; j++) g[j] += 2 * v * W[e][j];
+      }
+    }
+    for (const e of cableRows) {
+      const v = eps - w[e];
+      if (v > 0) {
+        f += v * v;
+        for (let j = 0; j < k; j++) g[j] -= 2 * v * W[e][j];
+      }
+    }
+    return { f, g };
+  };
+
+  // Multi-start (identical seeds to the sync version).
+  const starts: number[][] = [];
+  const target = Math.max(10 * eps, 0.1);
+  {
+    const b = new Array(E).fill(0);
+    for (const e of strutRows) b[e] = -target;
+    for (const e of cableRows) b[e] = +target;
+    const ls = solve(W, b);
+    if (ls && ls.every(v => Number.isFinite(v))) starts.push(ls);
+  }
+  for (let j = 0; j < Math.min(k, 5); j++) {
+    const s = new Array(k).fill(0);
+    s[j] = 1;
+    starts.push(s);
+  }
+  {
+    const s = new Array(k).fill(0);
+    for (const e of strutRows) {
+      for (let j = 0; j < k; j++) s[j] -= W[e][j];
+    }
+    for (const e of cableRows) {
+      for (let j = 0; j < k; j++) s[j] += W[e][j];
+    }
+    let norm = 0;
+    for (const v of s) norm += v * v;
+    norm = Math.sqrt(norm);
+    if (norm > 1e-12) {
+      for (let j = 0; j < k; j++) s[j] /= norm;
+    }
+    starts.push(s);
+    starts.push(s.map(x => -x));
+  }
+  starts.push(new Array(k).fill(0).map(() => Math.random() * 2 - 1));
+  starts.push(new Array(k).fill(1));
+
+  let best: number[] = starts[0];
+  let bestF = Infinity;
+  const MAX_ITERS = 400;
+
+  for (let si = 0; si < starts.length; si++) {
+    let alpha = [...starts[si]];
+    for (let iterBase = 0; iterBase < MAX_ITERS; iterBase += chunkSize) {
+      // Yield to the event loop before every chunk. The caller
+      // returns `true` here when the wall-clock deadline has
+      // been reached; we commit the current α as the
+      // best-so-far result and give up.
+      if (await yieldFn()) {
+        const finalLoss = lossAndGrad(alpha).f;
+        if (finalLoss < bestF) { bestF = finalLoss; best = alpha; }
+        // Jump to result assembly.
+        si = starts.length;
+        break;
+      }
+
+      const end = Math.min(iterBase + chunkSize, MAX_ITERS);
+      let didImprove = true;
+      for (let iter = iterBase; iter < end; iter++) {
+        const { f, g } = lossAndGrad(alpha);
+        if (f < 1e-14) { didImprove = false; break; }
+        const gl = Math.sqrt(g.reduce((s, x) => s + x * x, 0));
+        if (gl < 1e-14) { didImprove = false; break; }
+        let step = 1.0;
+        let stepImproved = false;
+        for (let ls = 0; ls < 20; ls++) {
+          const trial = alpha.map((a, i) => a - step * g[i]);
+          const ft = lossAndGrad(trial).f;
+          if (ft < f - 1e-10 * step * gl * gl * 0.1) {
+            alpha = trial;
+            stepImproved = true;
+            break;
+          }
+          step *= 0.5;
+        }
+        if (!stepImproved) { didImprove = false; break; }
+      }
+      if (!didImprove) break;
+    }
+    const finalLoss = lossAndGrad(alpha).f;
+    if (finalLoss < bestF) { bestF = finalLoss; best = alpha; }
+    // Early exit once we've found a clean zero of the hinge loss.
+    if (bestF < 1e-14) break;
+  }
+
+  // Per-constraint feasibility check on the raw (un-normalised) α.
+  const wRaw = evalWalpha(best);
+  let hardFeasible = true;
+  const margin = eps * 0.5;
+  for (const e of strutRows) {
+    if (!(wRaw[e] <= -margin)) { hardFeasible = false; break; }
+  }
+  if (hardFeasible) {
+    for (const e of cableRows) {
+      if (!(wRaw[e] >= +margin)) { hardFeasible = false; break; }
+    }
+  }
+
+  return {
+    feasible: hardFeasible,
+    alpha: best,
+    residual: bestF,
+  };
+}

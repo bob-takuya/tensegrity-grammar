@@ -37,7 +37,7 @@ import {
   K5CoverEntry,
 } from './k5cover';
 import { buildEquilibriumMatrix, nullspace, symmetricEigenvalues } from './linalg';
-import { lpClass1Check, lpPairCheck } from './lp';
+import { lpClass1Check, lpClass1CheckAsync, lpPairCheck } from './lp';
 import { greedyMatching, perturbMatching, Edge } from './matching';
 import { vol } from './geometry';
 
@@ -114,19 +114,50 @@ export interface SearchStats {
 
 /**
  * Scoreable snapshot of the best "almost a Class-1 tensegrity"
- * state we've seen during the search. If no cover ever produces a
- * true success the top-level driver returns the best one here.
+ * state we've seen during the search.
+ *
+ * Class-k is the maximum number of struts incident to any single
+ * node: k = 1 is a true matching (ideal Class-1 tensegrity), k = 2
+ * means some node carries two struts, etc. Lower is always better.
+ * We prefer structures whose every input node is connected to at
+ * least one member, because a disconnected node is an obvious
+ * failure mode that the LP can "satisfy" trivially.
+ *
+ * Ranking priority (from `scoreBestResult`):
+ *   1. allConnected  (every node touches ≥ 1 member)
+ *   2. classK        (smaller = closer to canonical Class-1)
+ *   3. numMembers    (smaller = cleaner graph)
+ *   4. lpResidual    (smaller = better self-stress quality)
+ *
+ * The BestResult is the single "most presentable" snapshot across
+ * the entire search: beam-search branches, cover attempts, and
+ * individual Phase 3 iterations all call `updateBest` so the
+ * final return value of `searchClass1Tensegrity` always reflects
+ * the highest-quality state the algorithm ever saw — even if no
+ * cover attempt ever produced a true Class-1 success.
  */
 interface BestResult {
   state: MorphogenesisState;
-  success: boolean;
-  rigid: boolean;
-  class1: boolean;
-  lpSuccess: boolean;
-  lpResidual: number;
+  matching: number[];
+  classK: number;
+  numMembers: number;
   numStruts: number;
-  score: number;
-  note: string;
+  allConnected: boolean;
+  lpResidual: number;
+  success: boolean;
+}
+
+/**
+ * Lower score = better; `Infinity` = completely unusable.
+ */
+function scoreBestResult(r: BestResult): number {
+  if (r.success) return Number.NEGATIVE_INFINITY;
+  if (!r.allConnected) return Number.POSITIVE_INFINITY;
+  return (
+    r.classK * 1000 +
+    r.numMembers * 1 +
+    (Number.isFinite(r.lpResidual) ? r.lpResidual * 0.1 : 1e6)
+  );
 }
 
 /**
@@ -534,6 +565,7 @@ function addAdhesionForDim(
 async function enforceClass1(
   state: MorphogenesisState,
   yieldFn: YieldFn,
+  bestHolder: { value: BestResult | null },
 ): Promise<{
   success: boolean;
   alpha: number[];
@@ -644,10 +676,23 @@ async function enforceClass1(
 
     const dimW = state.selfStressStates.length;
 
-    // Step D2: LP feasibility check
+    // Step D2: LP feasibility check.
+    //
+    // We use the ASYNC variant here so the gradient descent
+    // yields control to the event loop every ~100 iterations,
+    // letting the 3D viewer repaint while the solver runs. On
+    // n = 20 a single synchronous LP call used to block the
+    // main thread for hundreds of milliseconds — long enough
+    // that users saw the viewer "freeze" mid-search. The
+    // asynchronous version passes the search's top-level
+    // yieldFn through, so the LP obeys the same wall-clock
+    // deadline and abort signal as the rest of Phase 3.
     const strutIds = matching;
     const cableIds = edges.filter(e => !matching.includes(e.id)).map(e => e.id);
-    const lp = lpClass1Check(W, memberIdx, strutIds, cableIds);
+    const lp = await lpClass1CheckAsync(
+      W, memberIdx, strutIds, cableIds,
+      async () => yieldFn(),
+    );
 
     logEvent(state, {
       kind: 'lp_check',
@@ -655,6 +700,33 @@ async function enforceClass1(
       dim_W_before: dimW,
       dim_W_after: dimW,
     });
+
+    // Per-iteration best-result update. Captures the CURRENT
+    // Phase-3 snapshot (with its newly-computed force densities
+    // if applyAlpha would classify them) even if we end up
+    // rolling back the types on a matching-failure. We track the
+    // lpResidual so structures that are closer to feasibility
+    // out-score those stuck at the degenerate α=0 origin.
+    {
+      const savedTypes = state.members.map(m => m.type);
+      const savedFD = state.members.map(m => m.force_density);
+      // Try the sign-derived types without committing.
+      if (lp.alpha.some(v => Math.abs(v) > 1e-12)) {
+        applyAlpha(state, W, lp.alpha, SIGN_EPS);
+      }
+      bestHolder.value = updateBestFromState(
+        bestHolder.value,
+        state,
+        lp.residual,
+        false, // provisional; real success path still sets it below
+      );
+      // Roll back: the actual success / fall-through logic below
+      // re-applies α if it wants to.
+      state.members.forEach((m, i) => {
+        m.type = savedTypes[i];
+        m.force_density = savedFD[i];
+      });
+    }
 
     // Sign-pattern verification (C2 correction). Even when the LP
     // reports feasibility we double-check that w* = W·α really does
@@ -1113,6 +1185,20 @@ export interface Class1SearchResult {
   rigid: boolean;
   class1: boolean;
   numPoints: number;
+  /**
+   * Class number of the returned structure:
+   *   1 = canonical Class-1 tensegrity (every node ≤ 1 strut)
+   *   k = some node carries k struts; lower is always better
+   *   0 = structure has no struts at all (the empty-matching
+   *       failure case — not a tensegrity)
+   */
+  bestClassK: number;
+  /**
+   * True iff every input node is incident to at least one member
+   * in the returned structure. A run that leaves a node isolated
+   * is considered unusable regardless of how good Class-k looks.
+   */
+  allConnected: boolean;
   /** True if the search was stopped by the wall-clock deadline. */
   timedOut: boolean;
   /** Wall-clock elapsed time (ms). */
@@ -1123,7 +1209,7 @@ export interface Class1SearchResult {
    * Short human-readable summary of the returned structure. When
    * the search times out without a true Class-1 solution, this
    * explains *why* the best-so-far state was selected (e.g.
-   * "LP residual=0.023, struts=3/5, prestress stable").
+   * "best: Class-2, 28 members, 3 struts, LP residual=1.2e-02").
    */
   bestResultNote: string;
 }
@@ -1200,7 +1286,12 @@ export async function searchClass1Tensegrity(
     message: `Phase 1 — enumerated ${covers.length} diverse K₅ cover candidate(s)`,
   });
 
-  let best: BestResult | null = null;
+  // Shared best-result holder: threaded into `runCoverAttempt`
+  // and further down into `enforceClass1` so EVERY Phase 3
+  // iteration across EVERY cover attempt can contribute a
+  // candidate snapshot. The final return value is selected from
+  // this holder, not from the last cover's terminal state.
+  const bestHolder: { value: BestResult | null } = { value: null };
   let lastResult: Class1SearchResult | null = null;
   let lastTimedOut = false;
 
@@ -1226,15 +1317,14 @@ export async function searchClass1Tensegrity(
     await yieldFn(`Cover ${ci + 1}/${covers.length}`);
 
     const attempt = await runCoverAttempt(
-      P, currentState, covers[ci], yieldFn, n, startedAt, stats,
+      P, currentState, covers[ci], yieldFn, n, startedAt, stats, bestHolder,
     );
     lastResult = attempt;
     lastTimedOut = attempt.timedOut;
 
-    // Record the best snapshot we've seen so far — this is what
-    // we return to the caller if no cover attempt ever produces
-    // a full success before the deadline.
-    best = updateBest(best, attempt);
+    // Also update best from the terminal state (in case the
+    // enforceClass1 iteration-level tracking missed something).
+    bestHolder.value = updateBest(bestHolder.value, attempt);
 
     if (attempt.success) {
       // Clean win: return immediately so the UI paints the
@@ -1242,8 +1332,10 @@ export async function searchClass1Tensegrity(
       // loop mutating anything else.
       return {
         ...attempt,
+        bestClassK: 1,
+        allConnected: true,
         searchStats: stats,
-        bestResultNote: describeBest(best),
+        bestResultNote: describeBest(bestHolder.value ?? updateBest(null, attempt)),
       };
     }
     if (attempt.timedOut) break;
@@ -1253,31 +1345,49 @@ export async function searchClass1Tensegrity(
   // annotated with the cumulative stats. If no cover produced any
   // result at all (e.g. every build failed) we fall back to the
   // last attempt state.
-  const finalResult = best
+  const best = bestHolder.value;
+  const finalResult: Class1SearchResult = best
     ? {
         state: best.state,
         success: best.success,
-        rigid: best.rigid,
-        class1: best.class1,
+        rigid: false,
+        class1: best.classK <= 1 && best.numStruts > 0,
         numPoints: n,
+        bestClassK: Number.isFinite(best.classK) ? best.classK : 0,
+        allConnected: best.allConnected,
         timedOut: lastTimedOut,
         elapsedMs: Date.now() - startedAt,
         searchStats: stats,
         bestResultNote: describeBest(best),
       }
     : lastResult
-      ? { ...lastResult, searchStats: stats, bestResultNote: 'no best snapshot recorded' }
+      ? {
+          ...lastResult,
+          bestClassK: 0,
+          allConnected: false,
+          searchStats: stats,
+          bestResultNote: 'no best snapshot recorded',
+        }
       : {
           state: currentState,
           success: false,
           rigid: false,
           class1: false,
           numPoints: n,
+          bestClassK: 0,
+          allConnected: false,
           timedOut: lastTimedOut,
           elapsedMs: Date.now() - startedAt,
           searchStats: stats,
           bestResultNote: 'no cover attempt completed',
         };
+  // Re-run Phase 4 validation on the best snapshot so its rigid
+  // flag reflects the actual structure.
+  if (best) {
+    const rigidResult = validateRigidity(best.state);
+    finalResult.rigid =
+      rigidResult.infinitesimallyRigid || rigidResult.prestressStable;
+  }
   return finalResult;
 }
 
@@ -1298,6 +1408,7 @@ async function runCoverAttempt(
   n: number,
   startedAt: number,
   stats: SearchStats,
+  bestHolder: { value: BestResult | null },
 ): Promise<Class1SearchResult> {
   const buildResult = await buildStructureFromCover(P, state, yieldFn, cover);
 
@@ -1317,6 +1428,8 @@ async function runCoverAttempt(
       rigid: false,
       class1: false,
       numPoints: n,
+      bestClassK: 0,
+      allConnected: false,
       timedOut: buildResult.timedOut,
       elapsedMs: Date.now() - startedAt,
       searchStats: stats,
@@ -1345,6 +1458,8 @@ async function runCoverAttempt(
       rigid,
       class1,
       numPoints: n,
+      bestClassK: 0,
+      allConnected: false,
       timedOut: true,
       elapsedMs: Date.now() - startedAt,
       searchStats: stats,
@@ -1352,7 +1467,7 @@ async function runCoverAttempt(
     };
   }
 
-  const enforced = await enforceClass1(state, yieldFn);
+  const enforced = await enforceClass1(state, yieldFn, bestHolder);
   stats.nodesExpanded++;
   const lpResidual =
     typeof enforced.alpha !== 'undefined' && enforced.alpha.length > 0
@@ -1407,12 +1522,29 @@ async function runCoverAttempt(
   });
   await yieldFn(enforced.timedOut ? 'done · timeout' : 'done');
 
+  // Class-k of the attempt's terminal state
+  const strutCount = new Map<number, number>();
+  for (const m of state.members.filter(m => m.type === 'strut')) {
+    strutCount.set(m.node_a, (strutCount.get(m.node_a) ?? 0) + 1);
+    strutCount.set(m.node_b, (strutCount.get(m.node_b) ?? 0) + 1);
+  }
+  let classK = 0;
+  for (const c of strutCount.values()) if (c > classK) classK = c;
+  const connected = new Set<number>();
+  for (const m of state.members) {
+    connected.add(m.node_a);
+    connected.add(m.node_b);
+  }
+  const allConnected = state.nodes.every(nd => connected.has(nd.node_id));
+
   return {
     state,
     success: enforced.success && signCheck.ok && class1,
     rigid,
     class1,
     numPoints: n,
+    bestClassK: classK,
+    allConnected,
     timedOut: enforced.timedOut,
     elapsedMs,
     searchStats: stats,
@@ -1434,50 +1566,94 @@ async function runCoverAttempt(
  * loop can continue mutating its working state without corrupting
  * what we hand back to the caller.
  */
+/**
+ * Snapshot the current state as a BestResult candidate and return
+ * whichever of the incoming/current pair scores lower. Called from
+ *  - every Phase 3 iteration inside `enforceClass1`
+ *  - every cover attempt in `searchClass1Tensegrity`
+ * so the returned `best` always reflects the highest-quality state
+ * the algorithm has *ever* produced, not just the last one to
+ * terminate. Cloning is deep so later mutations of `state` cannot
+ * corrupt the stored snapshot.
+ */
+function updateBestFromState(
+  current: BestResult | null,
+  state: MorphogenesisState,
+  lpResidual: number,
+  success: boolean,
+): BestResult {
+  const nMembers = state.members.length;
+
+  // Connected-node check.
+  const connected = new Set<number>();
+  for (const m of state.members) {
+    connected.add(m.node_a);
+    connected.add(m.node_b);
+  }
+  const allConnected = state.nodes.every(n => connected.has(n.node_id));
+
+  // Class-k = max struts per node.
+  const strutCount = new Map<number, number>();
+  const struts = state.members.filter(m => m.type === 'strut');
+  for (const m of struts) {
+    strutCount.set(m.node_a, (strutCount.get(m.node_a) ?? 0) + 1);
+    strutCount.set(m.node_b, (strutCount.get(m.node_b) ?? 0) + 1);
+  }
+  let classK = 0;
+  for (const c of strutCount.values()) if (c > classK) classK = c;
+  // If there are no struts at all, classK is 0. A no-strut structure
+  // is technically "Class-0" but it is not a tensegrity, so we treat
+  // it as having infinite classK for scoring purposes so it never
+  // wins over a real structure.
+  const effectiveClassK = struts.length > 0 ? classK : Number.POSITIVE_INFINITY;
+
+  const candidate: BestResult = {
+    state: deepCloneState(state),
+    matching: [...state.matching],
+    classK: effectiveClassK,
+    numMembers: nMembers,
+    numStruts: struts.length,
+    allConnected,
+    lpResidual,
+    success,
+  };
+
+  if (current === null) return candidate;
+  return scoreBestResult(candidate) < scoreBestResult(current)
+    ? candidate
+    : current;
+}
+
+/** Shim: cover-level updateBest that wraps a Class1SearchResult. */
 function updateBest(
   current: BestResult | null,
   attempt: Class1SearchResult,
 ): BestResult {
-  const struts = attempt.state.members.filter(m => m.type === 'strut');
-  const n = attempt.state.nodes.length;
-  const targetMatching = Math.floor(n / 2);
-
-  let score: number;
-  if (attempt.success) {
-    score = Number.NEGATIVE_INFINITY;
-  } else {
-    const lpPenalty = attempt.success ? 0 : 1;
-    const matchingPenalty = Math.abs(struts.length - targetMatching) * 0.1;
-    score = lpPenalty + matchingPenalty;
-    if (!attempt.rigid) score += 1;
-    if (!attempt.class1) score += 0.5;
-  }
-
-  const candidate: BestResult = {
-    state: deepCloneState(attempt.state),
-    success: attempt.success,
-    rigid: attempt.rigid,
-    class1: attempt.class1,
-    lpSuccess: attempt.success,
-    lpResidual: attempt.success ? 0 : Infinity,
-    numStruts: struts.length,
-    score,
-    note: attempt.success
-      ? `Class-1 tensegrity found: ${struts.length} struts`
-      : `rigid=${attempt.rigid} class1=${attempt.class1} struts=${struts.length}/${targetMatching}`,
-  };
-
-  if (current === null || candidate.score < current.score) {
-    return candidate;
-  }
-  return current;
+  return updateBestFromState(
+    current,
+    attempt.state,
+    attempt.success ? 0 : Number.POSITIVE_INFINITY,
+    attempt.success,
+  );
 }
 
 function describeBest(best: BestResult): string {
   if (best.success) {
     return `Class-1 tensegrity found (${best.numStruts} struts)`;
   }
-  return `best attempt: ${best.note}`;
+  const parts: string[] = [];
+  if (!best.allConnected) parts.push('unconnected nodes');
+  if (Number.isFinite(best.classK)) {
+    parts.push(`Class-${best.classK}`);
+  } else {
+    parts.push('no struts');
+  }
+  parts.push(`${best.numMembers} members`);
+  parts.push(`${best.numStruts} struts`);
+  if (Number.isFinite(best.lpResidual)) {
+    parts.push(`LP residual=${best.lpResidual.toExponential(2)}`);
+  }
+  return `best: ${parts.join(', ')}`;
 }
 
 // ─── Triplex manual construction demo ───────────────────────
@@ -1542,6 +1718,8 @@ export async function buildTriplexManually(
       class1: false,
       numPoints: points.length,
       timedOut: false,
+      bestClassK: 0,
+      allConnected: false,
       elapsedMs: Date.now() - startedAt,
       searchStats: emptyStats,
       bestResultNote: 'Triplex demo',
@@ -1562,6 +1740,8 @@ export async function buildTriplexManually(
     return {
       state, success: false, rigid: false, class1: false,
       numPoints: points.length, timedOut: false,
+      bestClassK: 0,
+      allConnected: false,
       elapsedMs: Date.now() - startedAt,
       searchStats: emptyStats,
       bestResultNote: 'Triplex demo',
@@ -1584,6 +1764,8 @@ export async function buildTriplexManually(
     return {
       state, success: false, rigid: false, class1: false,
       numPoints: points.length, timedOut: false,
+      bestClassK: 0,
+      allConnected: false,
       elapsedMs: Date.now() - startedAt,
       searchStats: emptyStats,
       bestResultNote: 'Triplex demo',
@@ -1617,6 +1799,8 @@ export async function buildTriplexManually(
     return {
       state, success: false, rigid: false, class1: false,
       numPoints: points.length, timedOut: false,
+      bestClassK: 0,
+      allConnected: false,
       elapsedMs: Date.now() - startedAt,
       searchStats: emptyStats,
       bestResultNote: 'Triplex demo',
@@ -1694,12 +1878,26 @@ export async function buildTriplexManually(
   });
   await yieldFn('done · Triplex demo');
 
+  // Class-k of the final Triplex state
+  const strutCount = new Map<number, number>();
+  for (const m of state.members.filter(m => m.type === 'strut')) {
+    strutCount.set(m.node_a, (strutCount.get(m.node_a) ?? 0) + 1);
+    strutCount.set(m.node_b, (strutCount.get(m.node_b) ?? 0) + 1);
+  }
+  let classK = 0;
+  for (const c of strutCount.values()) if (c > classK) classK = c;
+  const connected = new Set<number>();
+  for (const m of state.members) { connected.add(m.node_a); connected.add(m.node_b); }
+  const allConnectedTri = state.nodes.every(nn => connected.has(nn.node_id));
+
   return {
     state,
     success: allOK,
     rigid,
     class1,
     numPoints: points.length,
+    bestClassK: classK,
+    allConnected: allConnectedTri,
     timedOut: false,
     elapsedMs,
     searchStats: emptyStats,

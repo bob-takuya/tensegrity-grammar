@@ -12,6 +12,9 @@ function initialSearchInfo(): SearchLiveInfo {
     rigid: false,
     class1: false,
     lpSuccess: false,
+    bestClassK: 0,
+    allConnected: false,
+    bestResultNote: '',
   };
 }
 
@@ -71,6 +74,9 @@ export function appReducer(state: AppState, action: AppAction): AppState {
           rigid: false,
           class1: false,
           lpSuccess: false,
+          bestClassK: 0,
+          allConnected: false,
+          bestResultNote: '',
         },
       };
 
@@ -100,6 +106,9 @@ export function appReducer(state: AppState, action: AppAction): AppState {
           rigid: action.rigid,
           class1: action.class1,
           lpSuccess: action.lpSuccess,
+          bestClassK: action.bestClassK,
+          allConnected: action.allConnected,
+          bestResultNote: action.bestResultNote,
         },
       };
 
