@@ -1065,24 +1065,58 @@ async function enforceClass1(
     // most one and cannot hurt the LP sign structure, since the
     // member contributed nothing to the constraints anyway. We fuse
     // at most one per iteration so dim W shrinks monotonically.
+    //
+    // spec-v8 guard — skip kernel fusion on trivial α.
+    //
+    // When the LP's descent lands on the degenerate α ≈ 0 minimum
+    // (residual ≈ |E|·ε²) every member trivially has |Wα| below
+    // the 1e-6 threshold, so the naive code above flagged ALL
+    // non-matching members as "kernel" and single-stepped through
+    // them, monotonically eroding dim W from 8 → 7 → ... → 1
+    // without ever making real progress toward feasibility. The
+    // guard computes max|Wα| over the full member set and skips
+    // the kernel detection entirely when it's below a threshold
+    // 1000× larger than ε — any real self-stress direction has at
+    // least one member whose Wα is far above the noise floor, so
+    // the threshold catches trivial α while leaving real kernel
+    // detection (like the Triplex BD/CE case) untouched.
     const matchingSetLocal = new Set(matching);
     const kernelMembers: number[] = [];
+    const TRIVIAL_ALPHA_THRESHOLD = 1e-3;
+    let maxAbsWalpha = 0;
     {
       const alpha = lp.alpha;
       for (let i = 0; i < state.members.length; i++) {
-        const m = state.members[i];
-        if (matchingSetLocal.has(m.member_id)) continue;
-        // Raw Wα (not normalised — we want to detect true kernel).
         let wa = 0;
         for (let j = 0; j < W[0].length; j++) wa += W[i][j] * alpha[j];
-        // Also skip members whose row is already all-zero (the LP's
-        // zero-row filter handles those separately).
-        let rowNorm = 0;
-        for (let j = 0; j < W[0].length; j++) rowNorm += W[i][j] * W[i][j];
-        if (rowNorm < 1e-18) continue;
-        if (Math.abs(wa) < 1e-6) kernelMembers.push(m.member_id);
+        if (Math.abs(wa) > maxAbsWalpha) maxAbsWalpha = Math.abs(wa);
+      }
+      const alphaIsTrivial = maxAbsWalpha < TRIVIAL_ALPHA_THRESHOLD;
+      if (alphaIsTrivial) {
+        logEvent(state, {
+          kind: 'info',
+          message:
+            `Kernel-fusion skipped: α is trivial ` +
+            `(max|Wα|=${maxAbsWalpha.toExponential(2)} ` +
+            `< threshold ${TRIVIAL_ALPHA_THRESHOLD})`,
+        });
+      } else {
+        for (let i = 0; i < state.members.length; i++) {
+          const m = state.members[i];
+          if (matchingSetLocal.has(m.member_id)) continue;
+          // Raw Wα (not normalised — we want to detect true kernel).
+          let wa = 0;
+          for (let j = 0; j < W[0].length; j++) wa += W[i][j] * alpha[j];
+          // Also skip members whose row is already all-zero (the LP's
+          // zero-row filter handles those separately).
+          let rowNorm = 0;
+          for (let j = 0; j < W[0].length; j++) rowNorm += W[i][j] * W[i][j];
+          if (rowNorm < 1e-18) continue;
+          if (Math.abs(wa) < 1e-6) kernelMembers.push(m.member_id);
+        }
       }
     }
+    const alphaIsTrivial = maxAbsWalpha < TRIVIAL_ALPHA_THRESHOLD;
 
     if (kernelMembers.length > 0 && dimW > 1) {
       const kid = kernelMembers[0];
@@ -1154,6 +1188,31 @@ async function enforceClass1(
         }
       } else {
         highOrderTrapStreak = 0;
+      }
+
+      // spec-v8 — trivial-α escape. If the LP is parked at the
+      // α≈0 minimum (residual ≈ |E|·ε²) AND there are no
+      // pairwise conflicts, growing dim W by adhesion doesn't
+      // help — a bigger W wouldn't change the fact that the
+      // hinge-loss descent is stuck at the trivial origin.
+      // Perturbing the matching at least forces the LP to
+      // redraw its target half-spaces and gives it a new
+      // starting-basin hint, which is the only thing that can
+      // actually push descent out of the degenerate minimum.
+      if (alphaIsTrivial) {
+        logEvent(state, {
+          kind: 'info',
+          message:
+            'Trivial α with 0 conflicts: perturbing matching to escape LP dead-zone',
+        });
+        const altTrivial = perturbMatching(edges, matching, ++perturbSeed);
+        if (altTrivial.join(',') !== matching.join(',')) {
+          forcedMatching = altTrivial;
+          continue;
+        }
+        // Perturbation exhausted on the trivial-α path — fall
+        // through to the generic adhesion/perturbation branch
+        // below so the usual termination logic kicks in.
       }
 
       // No PAIRWISE conflict — each individual (strut, cable) pair
