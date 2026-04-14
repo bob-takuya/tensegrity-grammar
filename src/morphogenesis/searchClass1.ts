@@ -37,7 +37,12 @@ import {
   K5CoverEntry,
 } from './k5cover';
 import { buildEquilibriumMatrix, nullspace, symmetricEigenvalues } from './linalg';
-import { lpClass1Check, lpClass1CheckAsync, lpPairCheck } from './lp';
+import {
+  lpClass1Check,
+  lpClass1CheckAsync,
+  lpPairCheck,
+  LPCheckResult,
+} from './lp';
 import { greedyMatching, perturbMatching, Edge } from './matching';
 import { vol } from './geometry';
 
@@ -562,6 +567,207 @@ function addAdhesionForDim(
   return false;
 }
 
+// ─── High-order conflict trap detection & escape ────────────
+//
+// A "high-order conflict trap" is the pathological case where:
+//   (a) LP residual is almost zero (≈1e-7): the hinge-loss
+//       minimiser sits just outside the feasible polytope, and
+//   (b) applyAlpha(lp.alpha) produces FAR more strut-signed
+//       members than the matching size: typical observation was
+//       "13 struts, max 5/node" on an n = 10 input, and
+//   (c) `findConflicts` reports zero pairwise conflicts: every
+//       (strut, cable) pair is individually separable even
+//       though the full constraint system is not jointly
+//       feasible — this is what "high-order" means.
+//
+// When those three conditions fire together the existing
+// conflict loop spins forever: there is no pairwise conflict to
+// fuse, and `perturbMatching` can't change W so the next
+// iteration produces the exact same readings. The only way out
+// is to force a change in W (fuse an overloaded member, reduce
+// the matching size, or grow dim W via adhesion).
+//
+// These helpers diagnose the trap and carry out the escape
+// manoeuvre described in the v7 spec:
+//   1. force-fuse the "most overloaded" non-matching member
+//   2. drop the weakest edge from the current matching
+//   3. grow dim W via the input-point-only adhesion helper
+// If all three fail the caller returns its bestResult snapshot
+// rather than continuing to thrash.
+
+interface TrapEscapeResult {
+  strategy: 'force_fuse' | 'reduce_matching' | 'grow_dim' | 'none';
+  success: boolean;
+  reducedMatching?: number[];
+}
+
+/**
+ * True when the current LP state looks like a high-order
+ * conflict trap: near-zero residual, massive strut overflow,
+ * and zero pairwise conflicts. Callers accumulate consecutive
+ * true reads before declaring a trap so a single misdiagnosis
+ * can't derail the search.
+ */
+function isHighOrderConflictTrap(
+  lp: LPCheckResult,
+  matching: number[],
+  W: number[][],
+  alpha: number[],
+  conflictsLen: number,
+  strutEps: number = 1e-8,
+  residualEps: number = 1e-5,
+): boolean {
+  if (lp.residual >= residualEps) return false;
+  if (conflictsLen !== 0) return false;
+  if (W.length === 0 || alpha.length === 0) return false;
+
+  let numActualStruts = 0;
+  for (let i = 0; i < W.length; i++) {
+    let v = 0;
+    for (let j = 0; j < W[0].length; j++) v += W[i][j] * alpha[j];
+    if (v < -strutEps) numActualStruts++;
+  }
+  // "Far more" = strictly more than 2×|M|. The factor 2 gives
+  // some slack for healthy LP solutions where sign(Wα) produces
+  // a few extra struts that are still compatible with a valid
+  // matching — the trap signature requires a much wider margin.
+  return numActualStruts > matching.length * 2;
+}
+
+/**
+ * Find the non-matching member whose Wα is most negative and
+ * which sits on the busiest node (the "most overloaded" member).
+ * Fusing this member is the strongest single edit to W: it
+ * removes the member from the structure entirely, dropping its
+ * row from W, and breaking the sign coupling that was trapping
+ * the LP.
+ */
+function findMostOverloadedMember(
+  state: MorphogenesisState,
+  W: number[][],
+  alpha: number[],
+  matching: number[],
+): number | null {
+  if (W.length === 0 || alpha.length === 0) return null;
+  const wStar = W.map(row =>
+    row.reduce((s, v, j) => s + v * alpha[j], 0),
+  );
+
+  const nodeStrutCount = new Map<number, number>();
+  for (let i = 0; i < state.members.length; i++) {
+    if (wStar[i] < -1e-8) {
+      const m = state.members[i];
+      nodeStrutCount.set(m.node_a, (nodeStrutCount.get(m.node_a) ?? 0) + 1);
+      nodeStrutCount.set(m.node_b, (nodeStrutCount.get(m.node_b) ?? 0) + 1);
+    }
+  }
+
+  let maxLoad = 0;
+  let overloadedNode = -1;
+  for (const [nodeId, count] of nodeStrutCount) {
+    if (count > maxLoad) { maxLoad = count; overloadedNode = nodeId; }
+  }
+  if (maxLoad <= 1 || overloadedNode === -1) return null;
+
+  const matchingSet = new Set(matching);
+  let bestId: number | null = null;
+  let bestW = 0;
+  for (let i = 0; i < state.members.length; i++) {
+    const m = state.members[i];
+    if (matchingSet.has(m.member_id)) continue;
+    if (m.node_a !== overloadedNode && m.node_b !== overloadedNode) continue;
+    if (wStar[i] < bestW) {
+      bestW = wStar[i];
+      bestId = m.member_id;
+    }
+  }
+  return bestId;
+}
+
+/**
+ * Drop the "weakest" member from the matching — the one whose
+ * Wα is closest to zero — shrinking the LP's constraint set by
+ * one. This gives the LP more slack to satisfy the remaining
+ * constraints on the same W.
+ */
+function reduceMatching(
+  matching: number[],
+  memberIdx: Map<number, number>,
+  W: number[][],
+  alpha: number[],
+): number[] {
+  if (matching.length <= 1) return matching;
+  const wStar = W.map(row =>
+    row.reduce((s, v, j) => s + v * alpha[j], 0),
+  );
+  let weakestId = matching[0];
+  let weakestAbs = Infinity;
+  for (const id of matching) {
+    const row = memberIdx.get(id);
+    if (row === undefined) continue;
+    const abs = Math.abs(wStar[row]);
+    if (abs < weakestAbs) { weakestAbs = abs; weakestId = id; }
+  }
+  return matching.filter(id => id !== weakestId);
+}
+
+/**
+ * Try the three escape strategies in order. Returns
+ * `success = true` on the first strategy that changes the
+ * state, along with the strategy name for logging. On
+ * `reduce_matching` the caller is expected to replace its
+ * working matching with `result.reducedMatching` on the next
+ * iteration.
+ */
+function executeTrapEscape(
+  state: MorphogenesisState,
+  matching: number[],
+  memberIdx: Map<number, number>,
+  W: number[][],
+  alpha: number[],
+  dimW: number,
+): TrapEscapeResult {
+  // Strategy 1: force-fuse the overloaded member.
+  if (dimW > 1) {
+    const overloadedId = findMostOverloadedMember(state, W, alpha, matching);
+    if (overloadedId !== null) {
+      logEvent(state, {
+        kind: 'strategic_fusion',
+        message:
+          `High-order trap escape: force-fusing overloaded member #${overloadedId}`,
+        member_ids: [overloadedId],
+      });
+      fuseOneEdge(state, overloadedId);
+      return { strategy: 'force_fuse', success: true };
+    }
+  }
+
+  // Strategy 2: reduce matching size.
+  if (matching.length > 1) {
+    const reduced = reduceMatching(matching, memberIdx, W, alpha);
+    if (reduced.length < matching.length) {
+      logEvent(state, {
+        kind: 'info',
+        message:
+          `High-order trap escape: reducing matching ${matching.length} → ${reduced.length}`,
+      });
+      return { strategy: 'reduce_matching', success: true, reducedMatching: reduced };
+    }
+  }
+
+  // Strategy 3: force dim-W growth.
+  const grew = addAdhesionForDim(state);
+  if (grew) {
+    logEvent(state, {
+      kind: 'info',
+      message: `High-order trap escape: forced dim(W) growth`,
+    });
+    return { strategy: 'grow_dim', success: true };
+  }
+
+  return { strategy: 'none', success: false };
+}
+
 async function enforceClass1(
   state: MorphogenesisState,
   yieldFn: YieldFn,
@@ -607,6 +813,18 @@ async function enforceClass1(
 
   let perturbSeed = 0;
   let adhesionGrowCount = 0;
+  // High-order trap detection: we only declare the loop stuck
+  // after it matches the trap signature HIGH_ORDER_TRAP_LIMIT
+  // consecutive times. Single-iteration coincidences are
+  // expected (e.g. a legitimately near-feasible α with a
+  // small strut overflow) and should not trigger the escape
+  // manoeuvre.
+  const HIGH_ORDER_TRAP_LIMIT = 3;
+  let highOrderTrapStreak = 0;
+  // When the escape dispatcher chooses `reduce_matching`, the
+  // new shrunken matching lands here so the next iteration
+  // skips greedyMatching and uses it directly.
+  let forcedMatching: number[] | null = null;
 
   for (let iter = 0; iter < HARD_ITER_CAP; iter++) {
     // Deadline check at the top of every iteration so we always
@@ -667,7 +885,18 @@ async function enforceClass1(
       }
       return -mostNegative;
     };
-    const matching = greedyMatching(edges, strutness, 12);
+    // Use the matching handed to us by a previous iteration's
+    // trap-escape (strategy = `reduce_matching`) if one is
+    // pending; otherwise recompute a fresh strutness-ranked
+    // maximum matching. The `forcedMatching` override is one-
+    // shot: we clear it after consuming it.
+    let matching: number[];
+    if (forcedMatching !== null) {
+      matching = forcedMatching;
+      forcedMatching = null;
+    } else {
+      matching = greedyMatching(edges, strutness, 12);
+    }
     logEvent(state, {
       kind: 'matching',
       message: `Iter ${iter + 1}: matching size ${matching.length} / ⌊n/2⌋=${Math.floor(state.nodes.length / 2)}`,
@@ -878,6 +1107,55 @@ async function enforceClass1(
     });
 
     if (conflicts.length === 0) {
+      // High-order conflict trap detection (spec v7).
+      //
+      // Three consecutive iterations where LP residual is
+      // near-zero, sign(Wα) produces far more struts than
+      // |M|, AND findConflicts reports zero pairwise
+      // conflicts mean we're stuck in a fixed point that
+      // perturbMatching cannot escape (it doesn't change W).
+      // The escape dispatcher tries force-fusing, matching
+      // reduction, and dim-W growth in order; one of them
+      // must succeed or we give up and return the best
+      // snapshot we've seen so far.
+      if (isHighOrderConflictTrap(lp, matching, W, lp.alpha, conflicts.length)) {
+        highOrderTrapStreak++;
+        logEvent(state, {
+          kind: 'info',
+          message:
+            `High-order conflict trap detected ` +
+            `(streak ${highOrderTrapStreak}/${HIGH_ORDER_TRAP_LIMIT}, ` +
+            `residual=${lp.residual.toExponential(2)})`,
+        });
+        if (highOrderTrapStreak >= HIGH_ORDER_TRAP_LIMIT) {
+          highOrderTrapStreak = 0;
+          const escape = executeTrapEscape(
+            state, matching, memberIdx, W, lp.alpha, dimW,
+          );
+          if (!escape.success) {
+            logEvent(state, {
+              kind: 'failure',
+              message: 'High-order trap: all escape strategies exhausted',
+            });
+            assignForceDensities(state);
+            state.matching = state.members
+              .filter(m => m.type === 'strut').map(m => m.member_id);
+            return {
+              success: false,
+              alpha: lp.alpha,
+              matching: state.matching,
+              timedOut: false,
+            };
+          }
+          if (escape.strategy === 'reduce_matching' && escape.reducedMatching) {
+            forcedMatching = escape.reducedMatching;
+          }
+          continue;
+        }
+      } else {
+        highOrderTrapStreak = 0;
+      }
+
       // No PAIRWISE conflict — each individual (strut, cable) pair
       // is linearly independent in W, so no fusion target is
       // diagnosable. But LP infeasibility with 0 conflicts means

@@ -108,7 +108,12 @@ export function ControlPanel() {
   }
 
   const makeNPlex = (n: number, r: number, h: number): Vec3[] => {
-    const twist = Math.PI / n;
+    // Canonical n-prism tensegrity twist = (n − 2) · π / (2n).
+    //   n=3 → π/6   = 30° (Triplex, Aloui §5.1)
+    //   n=4 → π/4   = 45° (Quadruplex)
+    //   n=5 → 3π/10 = 54°
+    //   n=6 → π/3   = 60°
+    const twist = ((n - 2) * Math.PI) / (2 * n);
     const pts: Vec3[] = [];
     for (let i = 0; i < n; i++) {
       const a = (2 * Math.PI * i) / n;
@@ -140,25 +145,25 @@ export function ControlPanel() {
     {
       id: 'triplex',
       name: 'Triplex (n=6)',
-      description: '3-strut twisted triangular prism (Aloui §5.1)',
+      description: '3-strut twisted triangular prism, 30° twist (Aloui §5.1)',
       points: makeNPlex(3, 1.0, 1.2),
     },
     {
       id: 'quadruplex',
       name: 'Quadruplex (n=8)',
-      description: '4-strut twisted square prism (45° twist)',
+      description: '4-strut twisted square prism, 45° twist',
       points: makeNPlex(4, 1.0, 1.3),
     },
     {
       id: 'pentaplex',
       name: 'Pentaplex (n=10)',
-      description: '5-strut twisted pentagonal prism (36° twist)',
+      description: '5-strut twisted pentagonal prism, 54° twist',
       points: makeNPlex(5, 1.0, 1.4),
     },
     {
       id: 'hexaplex',
       name: 'Hexaplex (n=12)',
-      description: '6-strut twisted hexagonal prism (30° twist)',
+      description: '6-strut twisted hexagonal prism, 60° twist',
       points: makeNPlex(6, 1.0, 1.5),
     },
     {
