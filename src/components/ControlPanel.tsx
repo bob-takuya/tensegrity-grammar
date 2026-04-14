@@ -15,7 +15,7 @@ import type { Vec3 } from '../morphogenesis/types';
  * Stop button aborts the current run via AbortController.
  */
 export function ControlPanel() {
-  const { state, runSearch, runTriplex, stopSearch, dispatch } = useAppState();
+  const { state, runSearch, stopSearch, dispatch } = useAppState();
   const [n, setN] = useState(12);
   const [timeoutSec, setTimeoutSec] = useState(10);
   const [customMode, setCustomMode] = useState(false);
@@ -80,57 +80,126 @@ export function ControlPanel() {
     aborted: 'aborted',
   }[search.status];
 
-  /**
-   * Return the 6 canonical Triplex points. Bottom triangle
-   * {A, B, C} sits at z = 0 on angles 0°, 120°, 240°; top triangle
-   * {D, E, F} at z = h on angles 30°, 150°, 270° (a 30° / π/6 twist
-   * from the bottom).
+  /* ── Known tensegrity configurations (presets) ───────────────
+   *
+   * Each preset is just a point cloud — NO pre-computed
+   * structure, NO hand-crafted cover or fusion sequence. The
+   * search algorithm is expected to discover a valid Class-k
+   * tensegrity on these configurations unassisted. This lets the
+   * user verify end-to-end: "if I give the algorithm the Triplex
+   * / Icosahedron / Quadruplex points, does it actually find a
+   * Class-1 tensegrity the way the paper describes?".
+   *
+   * Coordinates are in a unit-scale coordinate frame. Bottom
+   * layers sit at z = 0, top layers at z = h. Twist angles
+   * match the canonical Aloui §5 values:
+   *   n-plex twist = 180° − (180° × (n−2)/n)  (geodesic prism)
+   * For regular n = 3, 4, 5, 6 this gives 60°, 45°, 36°, 30°.
+   *
+   * The icosahedron preset uses the standard 12-vertex
+   * coordinates (φ-scaled octahedron) — a classical Class-1
+   * tensegrity with 6 struts connecting antipodal pairs.
    */
-  const triplexPoints = (): Vec3[] => {
-    const r = 1.0;
-    const h = 1.2;
-    const twist = Math.PI / 6;
+  interface Preset {
+    id: string;
+    name: string;
+    description: string;
+    points: Vec3[];
+  }
+
+  const makeNPlex = (n: number, r: number, h: number): Vec3[] => {
+    const twist = Math.PI / n;
+    const pts: Vec3[] = [];
+    for (let i = 0; i < n; i++) {
+      const a = (2 * Math.PI * i) / n;
+      pts.push([r * Math.cos(a), r * Math.sin(a), 0]);
+    }
+    for (let i = 0; i < n; i++) {
+      const a = twist + (2 * Math.PI * i) / n;
+      pts.push([r * Math.cos(a), r * Math.sin(a), h]);
+    }
+    return pts;
+  };
+
+  const icosahedronPoints = (): Vec3[] => {
+    // Regular icosahedron — 12 vertices at the 4-cyclic positions
+    // (0, ±1, ±φ), (±1, ±φ, 0), (±φ, 0, ±1) with φ = (1 + √5)/2.
+    // Normalised so |v| = 1 for every vertex.
+    const phi = (1 + Math.sqrt(5)) / 2;
+    const n = Math.sqrt(1 + phi * phi);
+    const a = 1 / n;
+    const b = phi / n;
     return [
-      [r * Math.cos(0),                     r * Math.sin(0),                     0],
-      [r * Math.cos((2 * Math.PI) / 3),     r * Math.sin((2 * Math.PI) / 3),     0],
-      [r * Math.cos((4 * Math.PI) / 3),     r * Math.sin((4 * Math.PI) / 3),     0],
-      [r * Math.cos(twist),                 r * Math.sin(twist),                 h],
-      [r * Math.cos(twist + (2 * Math.PI) / 3), r * Math.sin(twist + (2 * Math.PI) / 3), h],
-      [r * Math.cos(twist + (4 * Math.PI) / 3), r * Math.sin(twist + (4 * Math.PI) / 3), h],
+      [ 0, -a, -b], [ 0, -a,  b], [ 0,  a, -b], [ 0,  a,  b],
+      [-a, -b,  0], [-a,  b,  0], [ a, -b,  0], [ a,  b,  0],
+      [-b,  0, -a], [-b,  0,  a], [ b,  0, -a], [ b,  0,  a],
     ];
   };
 
-  /**
-   * Button handler: run the hand-crafted Triplex construction (seed
-   * K₅ → adhere K₅ {BCDEF} → fuse BD → fuse CE → validate) on the
-   * 6 preset points. Bypasses the greedy search because the specific
-   * fusion sequence Aloui §5 requires is not something greedy LP
-   * enforcement can discover on its own — feeding random Triplex
-   * points through searchClass1Tensegrity consistently produces
-   * "LP failed, no struts", hence this dedicated entry point.
-   *
-   * We also populate the custom textarea with the same coordinates
-   * so the user can inspect them and switch to the normal search
-   * afterwards if they want to compare.
-   */
-  const loadTriplexPreset = () => {
-    const pts = triplexPoints();
+  const presets: Preset[] = [
+    {
+      id: 'triplex',
+      name: 'Triplex (n=6)',
+      description: '3-strut twisted triangular prism (Aloui §5.1)',
+      points: makeNPlex(3, 1.0, 1.2),
+    },
+    {
+      id: 'quadruplex',
+      name: 'Quadruplex (n=8)',
+      description: '4-strut twisted square prism (45° twist)',
+      points: makeNPlex(4, 1.0, 1.3),
+    },
+    {
+      id: 'pentaplex',
+      name: 'Pentaplex (n=10)',
+      description: '5-strut twisted pentagonal prism (36° twist)',
+      points: makeNPlex(5, 1.0, 1.4),
+    },
+    {
+      id: 'hexaplex',
+      name: 'Hexaplex (n=12)',
+      description: '6-strut twisted hexagonal prism (30° twist)',
+      points: makeNPlex(6, 1.0, 1.5),
+    },
+    {
+      id: 'icosahedron',
+      name: 'Icosahedron (n=12)',
+      description: '12-vertex regular icosahedron (6 antipodal struts)',
+      points: icosahedronPoints(),
+    },
+  ];
+
+  const formatPreset = (preset: Preset): string => {
     const fmt = (v: number) => v.toFixed(4);
-    const lines = [
-      '# Triplex canonical configuration (Aloui et al. §5)',
-      '# Bottom triangle  A, B, C at z=0, angles 0° 120° 240°',
-      ...pts.slice(0, 3).map(p => `${fmt(p[0])} ${fmt(p[1])} ${fmt(p[2])}`),
-      '# Top triangle     D, E, F at z=h, twisted by 30°',
-      ...pts.slice(3).map(p => `${fmt(p[0])} ${fmt(p[1])} ${fmt(p[2])}`),
-    ];
-    setCustomText(lines.join('\n'));
+    return [
+      `# ${preset.name} — ${preset.description}`,
+      `# ${preset.points.length} points, generated by the client`,
+      ...preset.points.map(p => `${fmt(p[0])} ${fmt(p[1])} ${fmt(p[2])}`),
+    ].join('\n');
+  };
+
+  /**
+   * Load a preset's points into the custom textarea and fire
+   * a normal `runSearch` with those points as the input. The
+   * search then runs through the same K₅ cover → Phase 3
+   * pipeline as any random-point run — no hand-crafted cover,
+   * no hand-crafted fusion sequence. This is the UX the user
+   * asked for: "just input the points, let the algorithm find
+   * the structure on its own".
+   */
+  const loadPreset = (id: string) => {
+    const p = presets.find(x => x.id === id);
+    if (!p) return;
+    setCustomText(formatPreset(p));
     setCustomMode(true);
-    setN(6);
+    setN(p.points.length);
     setSeed('');
-    // Fire the manual Triplex construction immediately so the
-    // viewer shows the correct result (3 struts A-E, C-D, B-F,
-    // 9 cables) without the user having to also click Search.
-    runTriplex(pts, Math.max(100, Math.round(timeoutSec * 1000)));
+    runSearch({
+      n: p.points.length,
+      points: p.points,
+      seed: undefined,
+      timeoutMs: Math.max(100, Math.round(timeoutSec * 1000)),
+    });
   };
 
   return (
@@ -199,28 +268,40 @@ export function ControlPanel() {
         </div>
 
         <div className="param-group">
-          <button
-            type="button"
-            onClick={loadTriplexPreset}
+          <label>Known tensegrity preset</label>
+          <select
+            onChange={e => {
+              const v = e.target.value;
+              if (v) loadPreset(v);
+              // Reset the dropdown so the user can re-trigger
+              // the same preset without first picking something
+              // else.
+              e.target.value = '';
+            }}
             disabled={isRunning}
             style={{
               width: '100%',
-              padding: '6px 10px',
+              padding: 6,
+              border: '1px solid #ddd',
+              borderRadius: 4,
               fontSize: 11,
               fontFamily: 'inherit',
               background: '#eef3fa',
               color: '#1565c0',
-              border: '1px solid #bcd2ea',
-              borderRadius: 4,
               cursor: isRunning ? 'not-allowed' : 'pointer',
             }}
+            value=""
           >
-            Load Triplex preset (6 points)
-          </button>
+            <option value="" disabled>— select a preset —</option>
+            {presets.map(p => (
+              <option key={p.id} value={p.id}>{p.name}</option>
+            ))}
+          </select>
           <div className="param-hint">
-            Loads the canonical 6-node Triplex configuration: two
-            triangles of radius 1 separated by height 1.2 with a 30°
-            twist. Expected result is 3 struts (A–E, C–D, B–F).
+            Loads a known tensegrity point configuration and runs
+            the normal search pipeline on it. The algorithm is
+            expected to discover the structure unaided — no
+            hand-crafted cover or fusion sequence is injected.
           </div>
         </div>
 
