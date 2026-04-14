@@ -814,6 +814,243 @@ async function enforceClass1(
     return { success: false, alpha: [], matching: [], timedOut: true };
   }
 
+  // ── Early matching scan ───────────────────────────────────
+  //
+  // Before falling into the iterative greedy-then-fuse loop,
+  // probe several "natural" priority-based maximum matchings
+  // and run LP on each. For symmetric tensegrity inputs (the
+  // n-plex presets, icosahedron, …) the canonical strut set is
+  // the longest-length matching and the LP nails it on the
+  // first try — but the iterative loop's `strutness` priority
+  // (max -W[e,j]) can pick a *different* maximum matching that
+  // happens to be LP-infeasible, after which strategic fusion
+  // erodes dim W in circles for hundreds of iterations.
+  //
+  // The scan is cheap: at most ~5 LP calls of ~1 ms each. If
+  // any candidate matching produces a non-trivial feasible α
+  // with the right sign structure, commit it via applyAlpha
+  // and return success directly. Otherwise fall through to the
+  // existing iterative enforcement.
+  {
+    const { W: W0, memberIdx: idx0 } = denseW(state);
+    if (W0.length > 0 && W0[0].length > 0) {
+      const edges0: Edge[] = state.members.map(m => ({
+        id: m.member_id, node_a: m.node_a, node_b: m.node_b,
+      }));
+
+      // Build a node-position lookup so the length priority is fast.
+      const posById = new Map<number, { x: number; y: number; z: number }>();
+      for (const nd of state.nodes) {
+        posById.set(nd.node_id, { x: nd.x, y: nd.y, z: nd.z });
+      }
+      const edgeLen = (e: Edge): number => {
+        const a = posById.get(e.node_a);
+        const b = posById.get(e.node_b);
+        if (!a || !b) return 0;
+        return Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
+      };
+      const strutnessW = (e: Edge): number => {
+        const i = idx0.get(e.id);
+        if (i === undefined) return 0;
+        let mostNeg = 0;
+        for (let j = 0; j < W0[0].length; j++) {
+          if (W0[i][j] < mostNeg) mostNeg = W0[i][j];
+        }
+        return -mostNeg;
+      };
+      const sumAbsW = (e: Edge): number => {
+        const i = idx0.get(e.id);
+        if (i === undefined) return 0;
+        let s = 0;
+        for (let j = 0; j < W0[0].length; j++) s += Math.abs(W0[i][j]);
+        return s;
+      };
+      const maxAbsW = (e: Edge): number => {
+        const i = idx0.get(e.id);
+        if (i === undefined) return 0;
+        let m = 0;
+        for (let j = 0; j < W0[0].length; j++) {
+          const v = Math.abs(W0[i][j]);
+          if (v > m) m = v;
+        }
+        return m;
+      };
+
+      // Centroid of the input nodes — used by the "bridging"
+      // priority below. A strut in a tensegrity tends to PASS
+      // THROUGH the central region (it spans the structure),
+      // while a peripheral / ring edge sits far from the centre.
+      // For an n-plex this is the difference between an antipodal
+      // top-top ring edge (long but circumferential, midpoint far
+      // from centre on the top plane) and a diagonal top↔bottom
+      // strut (slightly shorter but its midpoint sits at the
+      // centre). The pure length priority picks the ring edge,
+      // bridging picks the strut.
+      let cx = 0, cy = 0, cz = 0;
+      for (const nd of state.nodes) { cx += nd.x; cy += nd.y; cz += nd.z; }
+      cx /= state.nodes.length || 1;
+      cy /= state.nodes.length || 1;
+      cz /= state.nodes.length || 1;
+      const bridging = (e: Edge): number => {
+        const a = posById.get(e.node_a);
+        const b = posById.get(e.node_b);
+        if (!a || !b) return 0;
+        const mx = (a.x + b.x) * 0.5;
+        const my = (a.y + b.y) * 0.5;
+        const mz = (a.z + b.z) * 0.5;
+        const distMidToCentre = Math.hypot(mx - cx, my - cy, mz - cz);
+        const len = Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
+        // Penalise mid-to-centre distance, reward length. A strut
+        // has length × (1 / (1 + d²)) ≈ length when d ≈ 0.
+        return len / (1 + distMidToCentre * distMidToCentre);
+      };
+      // "Spanning length": the larger the per-axis maximum
+      // |Δaxis|, the more an edge stretches the bounding box.
+      // Long edges that ALSO span a particular axis are stronger
+      // strut candidates than long edges parallel to a base
+      // plane.
+      const spanning = (e: Edge): number => {
+        const a = posById.get(e.node_a);
+        const b = posById.get(e.node_b);
+        if (!a || !b) return 0;
+        const dx = Math.abs(a.x - b.x);
+        const dy = Math.abs(a.y - b.y);
+        const dz = Math.abs(a.z - b.z);
+        const len = Math.hypot(dx, dy, dz);
+        return len * Math.max(dx, dy, dz);
+      };
+
+      const candidatePriorities: { name: string; fn: (e: Edge) => number }[] = [
+        { name: 'bridging', fn: bridging },
+        { name: 'spanning', fn: spanning },
+        { name: 'length', fn: edgeLen },
+        { name: 'strutness', fn: strutnessW },
+        { name: 'sum|W|', fn: sumAbsW },
+        { name: 'max|W|', fn: maxAbsW },
+      ];
+
+      const seenSigs = new Set<string>();
+      let probesRun = 0;
+      let probesFeasible = 0;
+      let probesNonTrivial = 0;
+      let probeMinResidual = Number.POSITIVE_INFINITY;
+
+      // Each priority gets a few random-tiebreak retries because
+      // `maximumMatching` resolves equal-priority edges with a
+      // `Math.random() - 0.5` shuffle, so successive calls with
+      // the same priority can yield different perfect matchings.
+      // The seenSigs filter dedupes, so worst case we run one LP
+      // per truly-distinct matching.
+      const RETRIES_PER_PRIORITY = 3;
+      const probeQueue: { name: string; fn: (e: Edge) => number }[] = [];
+      for (const cand of candidatePriorities) {
+        for (let r = 0; r < RETRIES_PER_PRIORITY; r++) probeQueue.push(cand);
+      }
+
+      for (const cand of probeQueue) {
+        const m = greedyMatching(edges0, cand.fn, 12);
+        if (m.length === 0) continue;
+        const sig = m.slice().sort((a, b) => a - b).join(',');
+        if (seenSigs.has(sig)) continue;
+        seenSigs.add(sig);
+        probesRun++;
+        const cables = edges0.filter(e => !m.includes(e.id)).map(e => e.id);
+        const probe = await lpClass1CheckAsync(
+          W0, idx0, m, cables,
+          async () => yieldFn(),
+        );
+        // Compute max|Wα| on this probe to filter out trivial-α
+        // "feasible" results.
+        let maxAbs = 0;
+        for (let i = 0; i < state.members.length; i++) {
+          let wa = 0;
+          for (let j = 0; j < W0[0].length; j++) wa += W0[i][j] * probe.alpha[j];
+          if (Math.abs(wa) > maxAbs) maxAbs = Math.abs(wa);
+        }
+        if (probe.feasible) probesFeasible++;
+        if (maxAbs >= 1e-3) probesNonTrivial++;
+        if (probe.residual < probeMinResidual) probeMinResidual = probe.residual;
+        if (probe.feasible && maxAbs >= 1e-3) {
+          // Commit this matching and return success.
+          applyAlpha(state, W0, probe.alpha, SIGN_EPS);
+          state.alpha = probe.alpha.slice();
+          state.matching = state.members
+            .filter(mm => mm.type === 'strut').map(mm => mm.member_id);
+          // Sanity-check: visual-connectivity guard so the early
+          // exit honours the same "no isolated dots" criterion as
+          // the main loop.
+          const conn = new Set<number>();
+          for (const mm of state.members) {
+            if (mm.type === 'candidate') continue;
+            conn.add(mm.node_a); conn.add(mm.node_b);
+          }
+          const allConn = state.nodes.every(nd => conn.has(nd.node_id));
+          if (allConn) {
+            logEvent(state, {
+              kind: 'success',
+              message:
+                `Early matching scan: ${cand.name}-priority matching is ` +
+                `LP-feasible (max|Wα|=${maxAbs.toExponential(2)}); ` +
+                `skipping iterative enforcement`,
+              matching_ids: state.matching,
+            });
+            bestHolder.value = updateBestFromState(
+              bestHolder.value, state, probe.residual, true,
+            );
+            return {
+              success: true,
+              alpha: probe.alpha,
+              matching: state.matching,
+              timedOut: false,
+            };
+          }
+          // Otherwise undo the type assignment so the iterative
+          // loop starts from a clean slate.
+          for (const mm of state.members) mm.type = 'candidate';
+        }
+      }
+      // Bail-out heuristic: if no probe LP was feasible AND every
+      // probe ended at α ≈ 0 (max|Wα| < 1e-3 for *all* of them),
+      // this cover's W is parked at the degenerate origin in
+      // every direction. The iterative enforcement loop won't
+      // help — it would just churn through strategic fusions
+      // until timeout. Return failure now so the caller can try
+      // the next cover.
+      const stuckAtOrigin =
+        probesRun > 0
+        && probesFeasible === 0
+        && probesNonTrivial === 0;
+      if (stuckAtOrigin) {
+        logEvent(state, {
+          kind: 'info',
+          message:
+            `Early matching scan: ${probesRun} distinct matchings probed, ` +
+            `all LP-infeasible and parked at trivial-α origin ` +
+            `(min residual ${probeMinResidual.toExponential(2)}); ` +
+            `bailing out so the next cover can be tried`,
+        });
+        // Best-result holder still captures the partial structure.
+        bestHolder.value = updateBestFromState(
+          bestHolder.value, state, probeMinResidual, false,
+        );
+        return {
+          success: false,
+          alpha: [],
+          matching: [],
+          timedOut: false,
+        };
+      }
+      logEvent(state, {
+        kind: 'info',
+        message:
+          `Early matching scan: probed ${probesRun} distinct matchings, ` +
+          `${probesFeasible} LP-feasible (best residual ` +
+          `${probeMinResidual.toExponential(2)}, none with non-trivial α + ` +
+          `visual connectivity); falling through to iterative enforcement`,
+      });
+    }
+  }
+
   let perturbSeed = 0;
   let adhesionGrowCount = 0;
   // High-order trap detection: we only declare the loop stuck
@@ -1651,7 +1888,7 @@ export async function searchClass1Tensegrity(
   options: Class1SearchOptions = {},
 ): Promise<Class1SearchResult> {
   const timeoutMs = Math.max(1, options.timeoutMs ?? 10_000);
-  const maxCoverCandidates = options.maxCoverCandidates ?? 8;
+  const maxCoverCandidates = options.maxCoverCandidates ?? 32;
   const startedAt = Date.now();
   const deadline = startedAt + timeoutMs;
 
