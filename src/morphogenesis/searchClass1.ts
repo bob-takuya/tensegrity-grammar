@@ -185,29 +185,61 @@ export function generateOrValidatePoints(
 
 // ─── Phase 1–2: build structure from the K₅ cover ──────────
 
+/**
+ * Result of buildStructureFromCover.
+ *
+ * The previous version returned a plain `boolean` where `true` meant
+ * *both* "normal completion" and "timeout after at least the seed was
+ * placed". That conflation hid a serious bug: when Phase 2 timed out
+ * after placing only the seed K₅, enforceClass1 would immediately
+ * observe the deadline, return with an empty α, and
+ * assignForceDensities would fall back to column 0 of W — handing
+ * the caller a raw K₅ prism with sign-violated cables.
+ *
+ * Splitting the outcome into three flags lets the caller distinguish:
+ *   - built = false              → no seed cell → hard failure
+ *   - built = true, complete = false → partial Phase 2 → skip Phase 3
+ *   - built = true, complete = true  → all cover cells adhered → run Phase 3
+ */
+interface BuildResult {
+  built: boolean;
+  complete: boolean;
+  timedOut: boolean;
+}
+
 async function buildStructureFromCover(
   P: Vec3[],
   state: MorphogenesisState,
   yieldFn: YieldFn,
-): Promise<boolean> {
+): Promise<BuildResult> {
   const cover = buildK5Cover(P);
-  if (cover.length === 0) return false;
+  if (cover.length === 0) {
+    return { built: false, complete: false, timedOut: false };
+  }
 
   logEvent(state, {
     kind: 'phase',
     message: `Phase 1 — K₅ cover built (${cover.length} cells)`,
   });
-  if (await yieldFn('Phase 1 · K₅ cover')) return true;
+  if (await yieldFn('Phase 1 · K₅ cover')) {
+    return { built: false, complete: false, timedOut: true };
+  }
 
   // Seed cell
   const seedIdx = cover[0].newIdx;
   const seedPoints = seedIdx.map(i => P[i]);
   const seedCell = initializeK5(state, seedPoints);
-  if (!seedCell) return false;
+  if (!seedCell) {
+    return { built: false, complete: false, timedOut: false };
+  }
   // Map source-point index → runtime node_id
   const nodeIdOf = new Map<number, number>();
   seedIdx.forEach((srcIdx, k) => nodeIdOf.set(srcIdx, seedCell.node_ids[k]));
-  if (await yieldFn('Phase 2 · seed K₅')) return true;
+  if (await yieldFn('Phase 2 · seed K₅')) {
+    // Seed is up, but the deadline hit before we could adhere any
+    // of the rest of the cover.
+    return { built: true, complete: false, timedOut: true };
+  }
 
   logEvent(state, {
     kind: 'phase',
@@ -218,7 +250,9 @@ async function buildStructureFromCover(
     // Deadline check at the top of the loop — we'd rather have a
     // partially-built but visible structure than an abrupt timeout
     // mid-adhesion, so we bail cleanly on the boundary.
-    if (await yieldFn(`Phase 2 · cell ${step}/${cover.length - 1}`)) return true;
+    if (await yieldFn(`Phase 2 · cell ${step}/${cover.length - 1}`)) {
+      return { built: true, complete: false, timedOut: true };
+    }
     const { sharedIdx, newIdx } = cover[step];
     const sharedNodeIds: number[] = [];
     let aborted = false;
@@ -259,10 +293,12 @@ async function buildStructureFromCover(
     // before we start the next one. Without this, Phase 2 runs to
     // completion in a single microtask and the user never sees the
     // structure growing step by step.
-    if (await yieldFn(`Phase 2 · cell ${step}/${cover.length - 1} adhered`)) return true;
+    if (await yieldFn(`Phase 2 · cell ${step}/${cover.length - 1} adhered`)) {
+      return { built: true, complete: false, timedOut: true };
+    }
   }
 
-  return true;
+  return { built: true, complete: true, timedOut: false };
 }
 
 // ─── Phase 3: Class-1 enforcement ──────────────────────────
@@ -419,9 +455,30 @@ async function enforceClass1(
   // normally terminate the search via the `timeoutMs` option instead;
   // `HARD_ITER_CAP` exists purely as a belt-and-braces guard.
   const HARD_ITER_CAP = 10_000;
-  const MAX_ADHESION_GROWS = 3;  // bound dim-W growth so small-n runs terminate
+  // FIX-A — dim-W growth budget is now computed from the actual
+  // target dimension, not a hard-coded 3. The Class-1 LP needs at
+  // least |M| + 3 ≈ ⌊n/2⌋ + 3 degrees of freedom in W to admit a
+  // feasible α; adding a little slack gives us a target of
+  // ⌊n/2⌋ + 4. The budget is the gap between that target and the
+  // current dim W, with a floor of 10 so small-n structures
+  // (where the initial dim W is already close to target) still
+  // get enough tries to break out of a "fuse → 1 → grow → 2"
+  // oscillation. Previously the cap was a flat 3, which caused
+  // n = 6 to exhaust its budget after 3 iterations and fall
+  // through to column-0 force-density assignment, returning a
+  // raw K₅ prism with sign-violated cables.
+  const targetDimW = Math.floor(state.nodes.length / 2) + 4;
+  const MAX_ADHESION_GROWS = Math.max(
+    10,
+    targetDimW - state.selfStressStates.length,
+  );
   const SIGN_EPS = 1e-8;
-  logEvent(state, { kind: 'phase', message: 'Phase 3 — Class-1 enforcement' });
+  logEvent(state, {
+    kind: 'phase',
+    message:
+      `Phase 3 — Class-1 enforcement ` +
+      `(dim W target=${targetDimW}, growth budget=${MAX_ADHESION_GROWS})`,
+  });
   if (await yieldFn('Phase 3 · enforce Class-1')) {
     return { success: false, alpha: [], matching: [], timedOut: true };
   }
@@ -502,17 +559,30 @@ async function enforceClass1(
     // struts sharing a node). So we accept the LP whenever the
     // sign-driven relabelling still yields a valid matching; otherwise
     // we fall through to conflict resolution.
-    if (lp.feasible) {
-      // Tentatively apply α with sign-based typing. We snapshot the
-      // original member types so we can roll back if the resulting
-      // strut set is not a valid matching.
+    // Whether or not the LP's hard-feasibility check passed, the
+    // important question is: "does applyAlpha(lp.alpha) yield a
+    // sign-consistent Class-1 matching?" The hard check has a fixed
+    // absolute margin that doesn't play nicely with heavy
+    // normalisation, so a solution with residual well below
+    // |E|·ε² can still be flagged infeasible even though sign(Wα)
+    // gives every member a clean, unique role. So we always try
+    // applyAlpha + matching check first and only fall into conflict
+    // resolution if the sign-based relabelling fails to produce a
+    // valid matching.
+    //
+    // The only case we skip is the trivial degenerate α = 0 (max|Wα|
+    // basically zero); applyAlpha would classify every member as
+    // 'candidate' and the empty strut set trivially passes V2 but
+    // that is not a tensegrity — validateMatching now rejects it.
+    const alphaIsNonTrivial = lp.alpha.some(v => Math.abs(v) > 1e-12);
+    if (alphaIsNonTrivial) {
       const savedTypes = state.members.map(m => m.type);
       const savedFD = state.members.map(m => m.force_density);
       const counts = applyAlpha(state, W, lp.alpha, SIGN_EPS);
 
       const struts = state.members.filter(m => m.type === 'strut');
       const seen = new Set<number>();
-      let matchingOK = true;
+      let matchingOK = struts.length > 0;
       for (const s of struts) {
         if (seen.has(s.node_a) || seen.has(s.node_b)) {
           matchingOK = false; break;
@@ -527,7 +597,8 @@ async function enforceClass1(
           kind: 'success',
           message:
             `Class-1 reached: ${counts.numStrut} struts, ${counts.numCable} cables` +
-            (counts.numZero > 0 ? `, ${counts.numZero} zero-force` : ''),
+            (counts.numZero > 0 ? `, ${counts.numZero} zero-force` : '') +
+            (lp.feasible ? '' : ` (LP residual=${lp.residual.toExponential(2)})`),
           matching_ids: actualStrutIds,
         });
         // Emit one more tick so the UI paints the final happy state.
@@ -540,9 +611,8 @@ async function enforceClass1(
         };
       }
 
-      // Roll back and treat as infeasible — the LP's sign assignment
-      // broke Class-1, so we need to retry with another matching or
-      // strategic fusion.
+      // Roll back — the sign-driven relabelling broke Class-1, so
+      // we need to retry with another matching or strategic fusion.
       state.members.forEach((m, i) => {
         m.type = savedTypes[i];
         m.force_density = savedFD[i];
@@ -550,8 +620,8 @@ async function enforceClass1(
       logEvent(state, {
         kind: 'info',
         message:
-          'LP α violates Class-1 when types are derived from sign(w*); ' +
-          'treating as infeasible',
+          `sign(Wα) yields Class-${Math.max(1, struts.length)} (not matching); ` +
+          'falling through to conflict resolution',
       });
     }
 
@@ -564,8 +634,27 @@ async function enforceClass1(
     });
 
     if (conflicts.length === 0) {
-      // No pairwise conflict is diagnosable — swap one edge of the
-      // matching (ALTERNATIVE_MATCHING) and retry.
+      // No PAIRWISE conflict — each individual (strut, cable) pair
+      // is linearly independent in W, so no fusion target is
+      // diagnosable. But LP infeasibility with 0 conflicts means
+      // the constraints are JOINTLY infeasible, typically because
+      // W has too few columns (dim W too small) to separate all
+      // |E| constraints into their demanded half-spaces. Growing
+      // dim W by adhesion is the natural move here — fusion would
+      // only make things worse.
+      //
+      // Fall back to ALTERNATIVE_MATCHING only if we've exhausted
+      // the adhesion budget.
+      if (adhesionGrowCount < MAX_ADHESION_GROWS) {
+        logEvent(state, {
+          kind: 'info',
+          message:
+            `No pairwise conflicts but LP infeasible → ` +
+            `growing dim W by adhesion (${adhesionGrowCount + 1}/${MAX_ADHESION_GROWS})`,
+        });
+        const grew = addAdhesionForDim(state);
+        if (grew) { adhesionGrowCount++; continue; }
+      }
       logEvent(state, {
         kind: 'info',
         message: 'No direct conflicts; perturbing matching',
@@ -617,16 +706,60 @@ async function enforceClass1(
         timedOut: false,
       };
     }
-    const pick = conflicts[0];
+    // FIX-C — protect strut candidates in the current matching.
+    //
+    // findConflicts reports pairs as (strutId, cableId) based on the
+    // matching we handed it above. But the matching is recomputed at
+    // the top of every iteration, and an edge that was a "cable" in
+    // iteration k can easily become a "strut" in iteration k + 1
+    // (greedy maximum-matching on a reshaped W produces different
+    // sets). If we blindly fuse the first conflict, we might delete
+    // a member that the NEW matching has already promoted to a
+    // strut candidate, which shrinks the matching instead of
+    // breaking a sign couple — the exact opposite of what strategic
+    // fusion should do.
+    //
+    // Prefer a conflict whose cable side is not currently a strut
+    // candidate. If every conflict's cable is already in the
+    // matching, we skip fusion for this iteration and let the next
+    // loop re-compute the matching on a different W (via adhesion
+    // or perturbation).
+    const matchingSet = new Set(matching);
+    const safePick = conflicts.find(c => !matchingSet.has(c.cableId));
+    if (!safePick) {
+      logEvent(state, {
+        kind: 'info',
+        message:
+          'All LP conflicts target current strut candidates; ' +
+          'skipping fusion this iteration',
+      });
+      // Try perturbing the matching instead — maybe a different
+      // strut set will expose a cable-only conflict next time.
+      const alt = perturbMatching(edges, matching, ++perturbSeed);
+      if (alt.join(',') === matching.join(',')) {
+        // Nothing else to try. Settle on what we have.
+        assignForceDensities(state);
+        state.matching = state.members
+          .filter(m => m.type === 'strut').map(m => m.member_id);
+        return {
+          success: false,
+          alpha: lp.alpha,
+          matching: state.matching,
+          timedOut: false,
+        };
+      }
+      continue;
+    }
+
     logEvent(state, {
       kind: 'strategic_fusion',
       message:
-        `Strategic fusion: dropping cable member #${pick.cableId} ` +
-        `(blocking strut #${pick.strutId}), dim W ${dimW} → …`,
-      member_ids: [pick.strutId, pick.cableId],
+        `Strategic fusion: dropping cable member #${safePick.cableId} ` +
+        `(blocking strut #${safePick.strutId}), dim W ${dimW} → …`,
+      member_ids: [safePick.strutId, safePick.cableId],
       dim_W_before: dimW,
     });
-    fuseOneEdge(state, pick.cableId);
+    fuseOneEdge(state, safePick.cableId);
   }
 
   // HARD_ITER_CAP reached — shouldn't happen in practice because the
@@ -797,9 +930,15 @@ export async function searchClass1Tensegrity(
   await yieldFn('Phase 0 · preparing points');
   const P = generateOrValidatePoints(n, points, seed);
 
-  const builtOK = await buildStructureFromCover(P, state, yieldFn);
-  if (!builtOK) {
-    logEvent(state, { kind: 'failure', message: 'Structure build failed' });
+  const buildResult = await buildStructureFromCover(P, state, yieldFn);
+
+  if (!buildResult.built) {
+    // Hard failure — we couldn't even lay down the seed K₅. Nothing
+    // else can run.
+    logEvent(state, {
+      kind: 'failure',
+      message: 'Structure build failed (no seed cell)',
+    });
     await yieldFn('aborted · build failed');
     return {
       state,
@@ -807,7 +946,54 @@ export async function searchClass1Tensegrity(
       rigid: false,
       class1: false,
       numPoints: n,
-      timedOut: Date.now() >= deadline,
+      timedOut: buildResult.timedOut,
+      elapsedMs: Date.now() - startedAt,
+    };
+  }
+
+  if (!buildResult.complete) {
+    // FIX-B — Phase 2 got the seed cell down but the deadline hit
+    // before the full K₅ cover could be adhered. We deliberately
+    // SKIP Phase 3 here: running enforceClass1 against a partial
+    // structure immediately observes the same deadline, returns
+    // an empty α, and assignForceDensities falls back to column 0
+    // of W — handing the caller a raw K₅ prism with sign-violated
+    // cables. Returning early keeps whatever partial structure
+    // Phase 2 managed to build, marked honestly as timed out.
+    logEvent(state, {
+      kind: 'info',
+      message:
+        `Phase 2 timed out after ${state.cells.length} cell(s); ` +
+        `skipping Phase 3`,
+    });
+    // Still sync force densities from column 0 so the viewer has
+    // something sign-consistent to paint. assignForceDensities
+    // now re-derives types from sign(q), so any members still
+    // classified from init/adhesion time get reconciled here.
+    assignForceDensities(state);
+
+    logEvent(state, { kind: 'phase', message: 'Phase 4 — validation (partial build)' });
+    await yieldFn('Phase 4 · validation');
+    const rigid = validateRigidity(state);
+    const signCheck = validateSignConsistency(state);
+    if (!signCheck.ok) {
+      logEvent(state, {
+        kind: 'failure',
+        message:
+          `V1 sign consistency FAILED on ${signCheck.violations.length} members ` +
+          `(partial Phase 2)`,
+        member_ids: signCheck.violations.map(v => v.id),
+      });
+    }
+    const class1 = validateMatching(state);
+    await yieldFn('done · timeout');
+    return {
+      state,
+      success: false,
+      rigid,
+      class1,
+      numPoints: n,
+      timedOut: true,
       elapsedMs: Date.now() - startedAt,
     };
   }

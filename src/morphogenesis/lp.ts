@@ -15,13 +15,21 @@
  *     f(α) = Σ_{strut e}  max(0, ε + (W α)_e)²
  *          + Σ_{cable e}  max(0, ε - (W α)_e)²
  *
- * drives f to zero. Because f is convex and piecewise-quadratic, the
- * descent is well-behaved and a line search converges in ~O(k²) steps
- * for the small problem sizes this app produces (k ≤ 40, |E| ≤ 200).
- *
- * The same loss doubles as an "infeasibility score" — callers use it
- * to rank conflicts when the primary LP check fails.
+ * drives f to zero. The critical subtlety: at α = 0 the gradient is
+ * ∇f(0) = 2ε · (Σ_cable W_e − Σ_strut W_e), whose magnitude is O(ε).
+ * With ε = 1e-6 a single descent step moves only ~1e-6 in α, so the
+ * updated Wα is still well inside the ε margin and the loss barely
+ * budges. Plain gradient descent therefore gets pinned at the trivial
+ * minimum f(0) = |E|·ε² ≈ 1e-11, which is NOT a feasible solution
+ * (it just has every component of Wα at zero). To escape this trap
+ * we prime the multi-start with the LEAST-SQUARES solution to
+ * Wα = b, where b_e = −target for struts and +target for cables.
+ * That point sits in the interior of the feasible polyhedron
+ * whenever one exists, and descent only needs to polish the
+ * boundary.
  */
+
+import { solve } from './linalg';
 
 export interface LPCheckResult {
   feasible: boolean;
@@ -51,8 +59,27 @@ export function lpClass1Check(
   const k = W[0].length;
   if (k === 0) return { feasible: false, alpha: [], residual: Infinity };
 
-  const strutRows = strutIds.map(id => memberIdx.get(id)).filter(i => i !== undefined) as number[];
-  const cableRows = cableIds.map(id => memberIdx.get(id)).filter(i => i !== undefined) as number[];
+  // Zero-row members are auto-satisfied mechanisms: their force
+  // density is identically 0 in every self-stress, so the LP can
+  // neither push them negative (for a strut) nor positive (for a
+  // cable). Including them would pin the hinge loss at #zero·ε²
+  // and make every call return "infeasible" even when the
+  // *non-degenerate* constraints are perfectly solvable. Drop them
+  // here; the caller can reclassify them as 'candidate' after the
+  // LP settles.
+  const rowIsZero = (row: number[]): boolean => {
+    let s = 0;
+    for (let j = 0; j < k; j++) s += row[j] * row[j];
+    return s < 1e-18;
+  };
+  const resolveRow = (id: number): number | null => {
+    const r = memberIdx.get(id);
+    if (r === undefined) return null;
+    if (rowIsZero(W[r])) return null;
+    return r;
+  };
+  const strutRows = strutIds.map(resolveRow).filter((r): r is number => r !== null);
+  const cableRows = cableIds.map(resolveRow).filter((r): r is number => r !== null);
 
   // Compute (Wα)_e for all e
   const evalWalpha = (alpha: number[]): number[] => {
@@ -90,21 +117,42 @@ export function lpClass1Check(
     return { f, g };
   };
 
-  // Multi-start: try a few initial directions so we don't get stuck
-  // on the zero α. Besides identity columns and random directions we
-  // also include a signed-indicator seed α₀ = W^T b where b_e = -1
-  // for struts and +1 for cables. This is the direction of steepest
-  // decrease of the hinge loss at α = 0, which in well-conditioned
-  // cases already lands inside the feasible polyhedron after a single
-  // normalisation — and for the degenerate cases it still gives the
-  // descent a vastly better starting basin than plain zero.
+  // Multi-start: identity columns, random, all-ones, and most
+  // importantly an analytical least-squares seed. The descent below
+  // can only polish a near-feasible point; without an informed seed
+  // it gets pinned at the ε²-scale minimum of f(0).
   const starts: number[][] = [];
+
+  // 1) Least-squares seed — the star attraction. We ask for
+  //       Wα = b      with b_e = -target (strut) or +target (cable),
+  //    and solve via the normal equations (handled by `solve`).
+  //    Target is chosen an order of magnitude larger than ε so the
+  //    LS solution lives comfortably inside the polytope whenever
+  //    one exists; even if it doesn't, it's a much better basin
+  //    than the origin for hinge-loss descent.
+  const target = Math.max(10 * eps, 0.1);
+  {
+    const b = new Array(E).fill(0);
+    for (const e of strutRows) b[e] = -target;
+    for (const e of cableRows) b[e] = +target;
+    const ls = solve(W, b);
+    if (ls && ls.every(v => Number.isFinite(v))) {
+      starts.push(ls);
+    }
+  }
+
+  // 2) Axis-aligned probes.
   for (let j = 0; j < Math.min(k, 5); j++) {
     const s = new Array(k).fill(0);
     s[j] = 1;
     starts.push(s);
   }
-  // Signed-indicator seed α₀ = W^T b.
+
+  // 3) Signed-indicator seed α₀ = W^T b (direction of steepest
+  //    descent at 0). Scaled up so that |α₀| is O(1) instead of
+  //    O(1/||W||) — this matters because the gradient at α = 0 is
+  //    O(ε), so without scaling the first step is invisible to the
+  //    line search.
   {
     const s = new Array(k).fill(0);
     for (const e of strutRows) {
@@ -113,10 +161,17 @@ export function lpClass1Check(
     for (const e of cableRows) {
       for (let j = 0; j < k; j++) s[j] += W[e][j];
     }
+    let norm = 0;
+    for (const v of s) norm += v * v;
+    norm = Math.sqrt(norm);
+    if (norm > 1e-12) {
+      for (let j = 0; j < k; j++) s[j] /= norm;
+    }
     starts.push(s);
-    // And its negation, in case we got the sign convention flipped.
     starts.push(s.map(x => -x));
   }
+
+  // 4) Random and all-ones as last-ditch fallbacks.
   starts.push(new Array(k).fill(0).map(() => Math.random() * 2 - 1));
   starts.push(new Array(k).fill(1));
 

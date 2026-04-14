@@ -247,6 +247,81 @@ export function Viewer3D() {
     orbitRef.current.distance = Math.max(1, Math.min(50, orbitRef.current.distance));
   };
 
+  // ─── Touch support for mobile ────────────────────────────────
+  //
+  // One finger = orbit (same as left-click).
+  // Two fingers = pan (same as right-click / middle-drag) and
+  //               pinch-to-zoom. The pinch distance is tracked
+  //               across touchmove events and applied to
+  //               orbitRef.current.distance.
+  const pinchRef = useRef<number | null>(null);
+
+  const handleTouchStart = (e: React.TouchEvent) => {
+    const o = orbitRef.current;
+    if (e.touches.length === 1) {
+      o.isDragging = true;
+      o.isPanning = false;
+      o.lastX = e.touches[0].clientX;
+      o.lastY = e.touches[0].clientY;
+      pinchRef.current = null;
+    } else if (e.touches.length === 2) {
+      o.isDragging = false;
+      o.isPanning = true;
+      const mx = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+      const my = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+      o.lastX = mx;
+      o.lastY = my;
+      pinchRef.current = Math.hypot(
+        e.touches[0].clientX - e.touches[1].clientX,
+        e.touches[0].clientY - e.touches[1].clientY,
+      );
+    }
+  };
+  const handleTouchMove = (e: React.TouchEvent) => {
+    if (e.touches.length === 0) return;
+    e.preventDefault();
+    const o = orbitRef.current;
+    if (e.touches.length === 1) {
+      const dx = e.touches[0].clientX - o.lastX;
+      const dy = e.touches[0].clientY - o.lastY;
+      o.lastX = e.touches[0].clientX;
+      o.lastY = e.touches[0].clientY;
+      if (o.isDragging) {
+        o.theta -= dx * 0.005;
+        o.phi = Math.max(0.1, Math.min(Math.PI - 0.1, o.phi - dy * 0.005));
+      }
+    } else if (e.touches.length === 2) {
+      // Pan
+      const mx = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+      const my = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+      const dx = mx - o.lastX, dy = my - o.lastY;
+      o.lastX = mx;
+      o.lastY = my;
+      const camera = cameraRef.current;
+      if (camera) {
+        const right = new THREE.Vector3();
+        right.crossVectors(camera.getWorldDirection(new THREE.Vector3()), new THREE.Vector3(0, 1, 0)).normalize();
+        o.target.addScaledVector(right, -dx * 0.005 * o.distance);
+        o.target.y += dy * 0.005 * o.distance;
+      }
+      // Pinch zoom
+      const pinch = Math.hypot(
+        e.touches[0].clientX - e.touches[1].clientX,
+        e.touches[0].clientY - e.touches[1].clientY,
+      );
+      if (pinchRef.current !== null && pinchRef.current > 0) {
+        const scale = pinchRef.current / pinch;
+        o.distance = Math.max(1, Math.min(50, o.distance * scale));
+      }
+      pinchRef.current = pinch;
+    }
+  };
+  const handleTouchEnd = () => {
+    orbitRef.current.isDragging = false;
+    orbitRef.current.isPanning = false;
+    pinchRef.current = null;
+  };
+
   const search = state.search;
   const running = search.status === 'running';
   const showSearchOverlay = running || search.status === 'timeout';
@@ -257,7 +332,10 @@ export function Viewer3D() {
     <div ref={containerRef} className="canvas-container viewer-3d"
       onMouseDown={handleMouseDown} onMouseMove={handleMouseMove}
       onMouseUp={handleMouseUp} onMouseLeave={handleMouseUp}
-      onWheel={handleWheel} onContextMenu={e => e.preventDefault()}>
+      onTouchStart={handleTouchStart} onTouchMove={handleTouchMove}
+      onTouchEnd={handleTouchEnd} onTouchCancel={handleTouchEnd}
+      onWheel={handleWheel} onContextMenu={e => e.preventDefault()}
+      style={{ touchAction: 'none' }}>
       <div className="viewer-3d-label">3D View</div>
 
       {showSearchOverlay && (
