@@ -48,6 +48,43 @@ export function createEmptyState(): MorphogenesisState {
   };
 }
 
+/**
+ * Deep-clone a MorphogenesisState so the beam-search driver in
+ * `searchClass1.ts` can explore branching fusion decisions
+ * independently. Every array is shallow-copied with inner objects
+ * cloned via spread — the relational schema has no cyclic
+ * references, so one level of object copies is enough to isolate
+ * branches. The `inputNodeIds` Set is copied (not shared) so that
+ * `addAdhesionForDim` updates on one branch don't leak into
+ * siblings.
+ */
+export function deepCloneState(state: MorphogenesisState): MorphogenesisState {
+  return {
+    nodes: state.nodes.map(n => ({ ...n })),
+    members: state.members.map(m => ({ ...m })),
+    cells: state.cells.map(c => ({ ...c, node_ids: [...c.node_ids] })),
+    cellMembers: state.cellMembers.map(cm => ({ ...cm })),
+    cellAdjacency: state.cellAdjacency.map(a => ({
+      ...a,
+      shared_members: [...a.shared_members],
+    })),
+    selfStressStates: state.selfStressStates.map(s => ({ ...s })),
+    selfStressEntries: state.selfStressEntries.map(e => ({ ...e })),
+    morphogenesisSteps: state.morphogenesisSteps.map(s => ({ ...s })),
+    removedMembers: state.removedMembers.map(r => ({ ...r })),
+    events: state.events.map(e => ({ ...e })),
+    alpha: [...state.alpha],
+    matching: [...state.matching],
+    inputNodeIds: new Set(state.inputNodeIds),
+    nextNodeId: state.nextNodeId,
+    nextMemberId: state.nextMemberId,
+    nextCellId: state.nextCellId,
+    nextStateId: state.nextStateId,
+    nextStepId: state.nextStepId,
+    nextEventId: state.nextEventId,
+  };
+}
+
 /** Append one event to the search trace. */
 export function logEvent(
   state: MorphogenesisState,

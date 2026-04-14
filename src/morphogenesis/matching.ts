@@ -268,3 +268,101 @@ export function perturbMatching(
   }
   return matching;
 }
+
+// ─── Matching enumeration for beam search ─────────────────
+
+/**
+ * Generate a sequence of *candidate* maximum matchings ordered
+ * roughly by "how well they fit the current W structure". The
+ * beam-search driver in `searchClass1.ts` feeds the top
+ * candidates to the LP as alternative strut sets when the first
+ * one fails.
+ *
+ * Strategy:
+ *   1. `strutness = max_j(-W[e,j])`: the most compressive
+ *      self-stress assignment any column gives to e. Edges that
+ *      are already "trying to be struts" in some basis direction
+ *      get high priority.
+ *   2. `totalMag = Σ_j |W[e,j]|`: total W magnitude. A
+ *      longer-in-all-directions edge.
+ *   3. One-edge swaps from candidate (1): for every edge of the
+ *      base matching, try replacing it with every non-matching
+ *      edge, keeping those that form a valid matching.
+ *
+ * Returns at most `maxCandidates` distinct matchings (identified
+ * by their sorted edge-id signature).
+ */
+export function enumerateMatchings(
+  edges: Edge[],
+  W: number[][],
+  memberIdx: Map<number, number>,
+  maxCandidates: number = 16,
+): number[][] {
+  if (edges.length === 0 || W.length === 0 || (W[0]?.length ?? 0) === 0) {
+    return [];
+  }
+
+  const k = W[0].length;
+  const out: number[][] = [];
+  const seen = new Set<string>();
+
+  const sigOf = (m: number[]): string =>
+    [...m].sort((a, b) => a - b).join(',');
+  const addIfNew = (m: number[]) => {
+    if (m.length === 0) return;
+    const s = sigOf(m);
+    if (seen.has(s)) return;
+    seen.add(s);
+    out.push(m);
+  };
+
+  // Priority 1: strutness = -min_j W[e,j]
+  addIfNew(maximumMatching(edges, (e) => {
+    const i = memberIdx.get(e.id);
+    if (i === undefined) return 0;
+    let mostNeg = 0;
+    for (let j = 0; j < k; j++) {
+      if (W[i][j] < mostNeg) mostNeg = W[i][j];
+    }
+    return -mostNeg;
+  }));
+
+  // Priority 2: total magnitude sum
+  addIfNew(maximumMatching(edges, (e) => {
+    const i = memberIdx.get(e.id);
+    if (i === undefined) return 0;
+    let s = 0;
+    for (let j = 0; j < k; j++) s += Math.abs(W[i][j]);
+    return s;
+  }));
+
+  // Priority 3: max absolute W value (peak rather than sum)
+  addIfNew(maximumMatching(edges, (e) => {
+    const i = memberIdx.get(e.id);
+    if (i === undefined) return 0;
+    let m = 0;
+    for (let j = 0; j < k; j++) {
+      const v = Math.abs(W[i][j]);
+      if (v > m) m = v;
+    }
+    return m;
+  }));
+
+  // Priority 4+: single-edge swaps from the base matching
+  if (out.length > 0) {
+    const base = [...out[0]];
+    const baseSet = new Set(base);
+    const outside = edges.filter(e => !baseSet.has(e.id));
+    outer: for (const eOut of base) {
+      for (const eIn of outside) {
+        const alt = base.filter(x => x !== eOut).concat(eIn.id);
+        if (isValidMatching(edges, alt)) {
+          addIfNew(alt);
+          if (out.length >= maxCandidates) break outer;
+        }
+      }
+    }
+  }
+
+  return out.slice(0, maxCandidates);
+}
