@@ -80,6 +80,42 @@ export function ControlPanel() {
     aborted: 'aborted',
   }[search.status];
 
+  /**
+   * Preset: load the 6 canonical Triplex points into the custom
+   * textarea. Bottom triangle {A, B, C} sits at z = 0 on angles
+   * 0°, 120°, 240°; top triangle {D, E, F} at z = h on angles
+   * 30°, 150°, 270° — a 30° (π/6) twist from the bottom. These
+   * are the coordinates used by the Triplex manual-construction
+   * regression test, so clicking the button gives the same
+   * starting configuration the algorithm is expected to solve.
+   */
+  const loadTriplexPreset = () => {
+    const r = 1.0;
+    const h = 1.2;
+    const twist = Math.PI / 6;
+    const fmt = (v: number) => v.toFixed(4);
+    const pt = (angle: number, z: number) =>
+      `${fmt(r * Math.cos(angle))} ${fmt(r * Math.sin(angle))} ${fmt(z)}`;
+
+    const lines = [
+      '# Triplex canonical configuration (Aloui et al. §5)',
+      '# Bottom triangle  A, B, C at z=0, angles 0° 120° 240°',
+      pt(0, 0),
+      pt((2 * Math.PI) / 3, 0),
+      pt((4 * Math.PI) / 3, 0),
+      '# Top triangle     D, E, F at z=h, twisted by 30°',
+      pt(twist, h),
+      pt(twist + (2 * Math.PI) / 3, h),
+      pt(twist + (4 * Math.PI) / 3, h),
+    ];
+    setCustomText(lines.join('\n'));
+    setCustomMode(true);
+    setN(6);
+    // Clear the seed so the user isn't confused about
+    // determinism — Triplex is exact, not stochastic.
+    setSeed('');
+  };
+
   return (
     <div className="control-panel">
       <h3>Class-1 Search</h3>
@@ -143,6 +179,32 @@ export function ControlPanel() {
             />
             Custom point positions
           </label>
+        </div>
+
+        <div className="param-group">
+          <button
+            type="button"
+            onClick={loadTriplexPreset}
+            disabled={isRunning}
+            style={{
+              width: '100%',
+              padding: '6px 10px',
+              fontSize: 11,
+              fontFamily: 'inherit',
+              background: '#eef3fa',
+              color: '#1565c0',
+              border: '1px solid #bcd2ea',
+              borderRadius: 4,
+              cursor: isRunning ? 'not-allowed' : 'pointer',
+            }}
+          >
+            Load Triplex preset (6 points)
+          </button>
+          <div className="param-hint">
+            Loads the canonical 6-node Triplex configuration: two
+            triangles of radius 1 separated by height 1.2 with a 30°
+            twist. Expected result is 3 struts (A–E, C–D, B–F).
+          </div>
         </div>
 
         {customMode && (
