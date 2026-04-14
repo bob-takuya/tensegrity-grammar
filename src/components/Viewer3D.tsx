@@ -99,6 +99,13 @@ export function Viewer3D() {
 
     // Members
     for (const member of morpho.members) {
+      // Skip candidate members — they have force_density ≈ 0 and
+      // are neither a strut nor a cable yet. Drawing them as thin
+      // cables while the LP is still running mis-represents the
+      // structure, and they disappear from the viewer as soon as
+      // applyAlpha classifies them based on sign(w*).
+      if (member.type === 'candidate') continue;
+
       const a = nodeMap.get(member.node_a), b = nodeMap.get(member.node_b);
       if (!a || !b) continue;
 

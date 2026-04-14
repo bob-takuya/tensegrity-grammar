@@ -9,6 +9,9 @@ function initialSearchInfo(): SearchLiveInfo {
     elapsedMs: 0,
     remainingMs: 0,
     timeoutMs: 0,
+    rigid: false,
+    class1: false,
+    lpSuccess: false,
   };
 }
 
@@ -64,6 +67,10 @@ export function appReducer(state: AppState, action: AppAction): AppState {
           elapsedMs: 0,
           remainingMs: action.timeoutMs,
           timeoutMs: action.timeoutMs,
+          // Clear validation flags — we don't know anything yet.
+          rigid: false,
+          class1: false,
+          lpSuccess: false,
         },
       };
 
@@ -90,6 +97,9 @@ export function appReducer(state: AppState, action: AppAction): AppState {
           status: action.status,
           elapsedMs: action.elapsedMs,
           remainingMs: Math.max(0, state.search.timeoutMs - action.elapsedMs),
+          rigid: action.rigid,
+          class1: action.class1,
+          lpSuccess: action.lpSuccess,
         },
       };
 

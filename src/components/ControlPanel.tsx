@@ -28,12 +28,15 @@ export function ControlPanel() {
   const nCells = morpho.cells.length;
   const nStruts = morpho.members.filter(m => m.type === 'strut').length;
   const nCables = morpho.members.filter(m => m.type === 'cable').length;
+  const nCandidates = morpho.members.filter(m => m.type === 'candidate').length;
   const stressDim = morpho.selfStressStates.length;
   const nEvents = morpho.events.length;
 
   const isRunning = search.status === 'running';
 
-  const actualMaxComp = nNodes > 0 ? Math.max(...morpho.nodes.map(n =>
+  // Max struts incident to a single node — still useful during live
+  // Phase 2/3 runs where the final validation flags aren't yet set.
+  const actualMaxComp = nNodes > 0 ? Math.max(0, ...morpho.nodes.map(n =>
     morpho.members.filter(m =>
       m.type === 'strut' && (m.node_a === n.node_id || m.node_b === n.node_id)
     ).length
@@ -258,23 +261,72 @@ export function ControlPanel() {
           <div className="stat-grid">
             <div className="stat"><span className="stat-label">Struts</span><span className="stat-value strut-color">{nStruts}</span></div>
             <div className="stat"><span className="stat-label">Cables</span><span className="stat-value cable-color">{nCables}</span></div>
+            <div className="stat"><span className="stat-label">Candidate</span><span className="stat-value">{nCandidates}</span></div>
             <div className="stat"><span className="stat-label">dim W</span><span className="stat-value">{stressDim}</span></div>
             <div className="stat"><span className="stat-label">Max strut/v</span><span className="stat-value">{actualMaxComp}</span></div>
           </div>
 
-          <div
-            className={`tensegrity-status ${actualMaxComp <= 1 && stressDim > 0 ? 'valid' : 'invalid'}`}
-            style={{ marginTop: 8 }}
-          >
-            <span className="status-icon">{actualMaxComp <= 1 && stressDim > 0 ? '✓' : '…'}</span>
-            <span>
-              {actualMaxComp <= 1 && stressDim > 0
-                ? 'Class-1 achieved'
-                : actualMaxComp === 0
-                  ? 'No struts assigned'
-                  : `Class-${actualMaxComp} (search in progress)`}
-            </span>
-          </div>
+          {(() => {
+            // Final label uses the validation flags recorded at
+            // SEARCH_DONE — not recomputed from live member types.
+            // During a run we still show the live max-strut/vertex
+            // tally so the user can watch Phase 2 sketch out a
+            // pre-LP Class-k approximation.
+            const settled = search.status === 'done'
+              || search.status === 'timeout'
+              || search.status === 'aborted';
+            const valid =
+              settled && search.rigid && search.class1 && search.lpSuccess;
+
+            let label: string;
+            let icon: string;
+            if (isRunning) {
+              icon = '…';
+              label = nStruts === 0
+                ? 'searching…'
+                : `Class-${actualMaxComp} (search in progress)`;
+            } else if (!settled) {
+              icon = '…';
+              label = 'idle';
+            } else if (valid) {
+              icon = '✓';
+              label = 'Class-1 tensegrity found';
+            } else {
+              icon = '✗';
+              const reasons: string[] = [];
+              if (!search.lpSuccess) reasons.push('LP failed');
+              if (!search.class1) reasons.push(`Class-${Math.max(1, actualMaxComp)}`);
+              if (!search.rigid) reasons.push('not rigid');
+              if (nStruts === 0) reasons.push('no struts');
+              label = reasons.length > 0
+                ? `Not Class-1 (${reasons.join(', ')})`
+                : 'Not Class-1';
+            }
+
+            return (
+              <div
+                className={`tensegrity-status ${valid ? 'valid' : 'invalid'}`}
+                style={{ marginTop: 8 }}
+              >
+                <span className="status-icon">{icon}</span>
+                <span>{label}</span>
+              </div>
+            );
+          })()}
+
+          {search.status !== 'idle' && search.status !== 'running' && (
+            <div
+              style={{
+                marginTop: 6,
+                fontSize: 10,
+                fontFamily: 'monospace',
+                color: '#666',
+              }}
+            >
+              rigid={String(search.rigid)} · class1={String(search.class1)} ·
+              lp={String(search.lpSuccess)}
+            </div>
+          )}
         </div>
       )}
 

@@ -25,6 +25,17 @@ export interface SearchLiveInfo {
   remainingMs: number;
   /** Full timeout budget (ms) the current run was started with. */
   timeoutMs: number;
+  /**
+   * Validation flags populated on SEARCH_DONE. All false while the
+   * search is still running. The UI uses these to decide whether to
+   * render a green "Class-1 achieved" badge — recomputing it from
+   * live morpho state (as the old ControlPanel did) is fragile
+   * because an empty strut set trivially satisfies the matching
+   * condition yet is clearly not a tensegrity.
+   */
+  rigid: boolean;
+  class1: boolean;
+  lpSuccess: boolean;
 }
 
 export interface AppState {
@@ -49,6 +60,9 @@ export type AppAction =
       morpho: MorphogenesisState;
       status: 'done' | 'timeout' | 'aborted';
       elapsedMs: number;
+      rigid: boolean;
+      class1: boolean;
+      lpSuccess: boolean;
     }
   | { type: 'CLEAR' }
   | { type: 'SELECT_NODES'; ids: number[] }

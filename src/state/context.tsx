@@ -33,22 +33,16 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
     dispatch({ type: 'SEARCH_START', timeoutMs: req.timeoutMs });
 
-    // Throttle UI dispatches: we don't need to re-render faster than
-    // the browser paints (~60 Hz = 16 ms). Dispatches in between are
-    // still picked up at the next tick because the state object is
-    // mutated in-place by the search.
-    const MIN_DISPATCH_INTERVAL_MS = 16;
-    let lastDispatchAt = 0;
-
     try {
       const result = await searchClass1Tensegrity(req.n, req.points, req.seed, {
         timeoutMs: req.timeoutMs,
         signal: ctrl.signal,
         yieldToEventLoop: true,
+        // No dispatch throttle — the search already paces itself via
+        // requestAnimationFrame inside its yield, so every tick
+        // corresponds to a browser frame. Dropping dispatches would
+        // just cause the viewer to skip frames.
         onProgress: (progress) => {
-          const now = Date.now();
-          if (now - lastDispatchAt < MIN_DISPATCH_INTERVAL_MS) return;
-          lastDispatchAt = now;
           dispatch({
             type: 'SEARCH_TICK',
             morpho: progress.state,
@@ -69,6 +63,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             ? 'timeout'
             : 'done',
         elapsedMs: result.elapsedMs,
+        rigid: result.rigid,
+        class1: result.class1,
+        lpSuccess: result.success,
       });
     } catch (err) {
       // A thrown error during the search shouldn't crash the app.
@@ -81,6 +78,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         morpho: state.morpho,
         status: 'aborted',
         elapsedMs: 0,
+        rigid: false,
+        class1: false,
+        lpSuccess: false,
       });
     }
   }, [state.morpho]);
