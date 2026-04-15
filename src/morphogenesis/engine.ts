@@ -14,11 +14,8 @@
  */
 
 import {
-  MorphogenesisState, Vec3, CellRow, MorphogenesisStepRow,
-  NodeRow, MemberRow,
+  MorphogenesisState, Vec3, NodeRow, MemberRow,
 } from './types';
-import { cellSelfStress, k5EdgePairs } from './k5cell';
-import { predictDeltaW } from './adhesion';
 import { buildEquilibriumMatrix, nullspace } from './linalg';
 import { vdist } from './geometry';
 
@@ -91,105 +88,6 @@ export function logEvent(
   ev: Omit<import('./types').SearchEvent, 'event_id'>,
 ): void {
   state.events.push({ event_id: state.nextEventId++, ...ev });
-}
-
-// ─── Row-level helpers ──────────────────────────────────────────
-
-function addNodeRow(state: MorphogenesisState, p: Vec3): number {
-  const id = state.nextNodeId++;
-  state.nodes.push({ node_id: id, x: p[0], y: p[1], z: p[2] });
-  return id;
-}
-
-function addMemberRow(
-  state: MorphogenesisState,
-  a: number, b: number,
-  type: 'strut' | 'cable' | 'candidate',
-): number {
-  const lo = Math.min(a, b), hi = Math.max(a, b);
-  const id = state.nextMemberId++;
-  state.members.push({
-    member_id: id, node_a: lo, node_b: hi, type, force_density: null,
-  });
-  return id;
-}
-
-// ─── INIT: seed with a K₅ cell ──────────────────────────────────
-
-/**
- * Initialise the state with a single K₅ cell spanning 5 given points.
- * This corresponds to the INIT block of the main algorithm:
- *
- *   G.V  ← initial_cell.nodes
- *   G.E  ← initial_cell.edges
- *   Gc.Vc ← { Cell_0 }
- *   w_1  ← cell_self_stress(Cell_0)
- *   dim_W ← 1
- *   RECORD step(0, adhesion, Δe=10, Δv=5, predict=-5)
- */
-export function initializeK5(state: MorphogenesisState, points: Vec3[]): CellRow | null {
-  if (points.length !== 5) return null;
-  const w = cellSelfStress(points);
-  if (!w) return null;
-
-  const stepId = state.nextStepId++;
-
-  const nodeIds: number[] = points.map(p => addNodeRow(state, p));
-  const pairs = k5EdgePairs();
-  const memberIds: number[] = pairs.map(([i, j]) => {
-    const mid = addMemberRow(state, nodeIds[i], nodeIds[j], 'candidate');
-    return mid;
-  });
-
-  // Type assignment from the sign of the first self-stress
-  for (let k = 0; k < 10; k++) {
-    const mem = state.members.find(m => m.member_id === memberIds[k])!;
-    mem.type = w[k] > 0 ? 'cable' : 'strut';
-    mem.force_density = w[k];
-  }
-
-  // CELL
-  const cellId = state.nextCellId++;
-  const cell: CellRow = {
-    cell_id: cellId, cell_type: 'regular', step_created: stepId,
-    node_ids: nodeIds,
-  };
-  state.cells.push(cell);
-  for (const mid of memberIds) state.cellMembers.push({ cell_id: cellId, member_id: mid });
-
-  // SELF_STRESS_STATE / ENTRY
-  const stateId = state.nextStateId++;
-  state.selfStressStates.push({ state_id: stateId, cell_id: cellId });
-  for (let k = 0; k < 10; k++) {
-    if (Math.abs(w[k]) > 1e-12) {
-      state.selfStressEntries.push({
-        state_id: stateId, member_id: memberIds[k], w_value: w[k],
-      });
-    }
-  }
-
-  // Journal
-  const step: MorphogenesisStepRow = {
-    step_id: stepId,
-    operation: 'init',
-    delta_e: 10,
-    delta_v: 5,
-    delta_dim_W_predicted: predictDeltaW(10, 5),  // -5 for K₅ (Maxwell rule),
-    delta_dim_W_actual: 1,                         // Eq.(13) gives 1D nullspace
-  };
-  state.morphogenesisSteps.push(step);
-
-  logEvent(state, {
-    kind: 'init',
-    message: `Seeded K₅ cell #${cellId} with 5 nodes, 10 members`,
-    cell_id: cellId,
-    node_ids: nodeIds,
-    member_ids: memberIds,
-    dim_W_before: 0,
-    dim_W_after: 1,
-  });
-
-  return cell;
 }
 
 // ─── Force density synthesis ────────────────────────────────────

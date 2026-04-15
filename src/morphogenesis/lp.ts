@@ -237,6 +237,198 @@ export function lpClass1Check(
   };
 }
 
+// ─── Strut-only LP (K_n null space approach) ──────────────
+
+/**
+ * Strut-only LP feasibility check used by the K_n null space
+ * algorithm.
+ *
+ *   "Does there exist α ∈ ℝ^k such that
+ *        (W α)_e ≤ -ε   for every e ∈ M
+ *    ?"
+ *
+ * Crucially, there are NO cable constraints: cables are whichever
+ * non-matching edges end up with (Wα)_e > +ε after the fact, and
+ * zero-force edges (|(Wα)_e| ≤ ε) are removed from the structure.
+ * This is the key asymmetry of the K_n approach — when W is the
+ * full null space of the complete graph, every known tensegrity
+ * (Triplex, n-prism, icosahedron, Snelson tower) has a feasible
+ * strut-only LP, and the cables/zero-force partition falls out
+ * from sign(Wα) with no additional constraints.
+ *
+ * The solver uses the same squared-hinge loss minimiser as the
+ * dual-sided `lpClass1Check` but with a gradient-aligned seed
+ * strategy tailored to the strut-only case. Since there is no
+ * cable penalty, α = 0 still has a non-zero loss (|M|·ε²) but
+ * the gradient at the origin is exactly −W_M^T·1, which points
+ * straight into the feasible region whenever one exists — so
+ * the descent rarely gets trapped.
+ *
+ * @param W          |E| × k dense K_n null space basis
+ * @param memberIdx  member_id → row index in W
+ * @param strutIds   member_ids that must be compressive (Wα ≤ -ε)
+ * @param eps        sign margin (default 1e-6)
+ * @param maxIters   per-seed descent cap (default 2000)
+ */
+export function lpStrutOnly(
+  W: number[][],
+  memberIdx: Map<number, number>,
+  strutIds: number[],
+  eps: number = 1e-6,
+  maxIters: number = 2000,
+): LPCheckResult {
+  const E = W.length;
+  if (E === 0) return { feasible: false, alpha: [], residual: Infinity };
+  const k = W[0].length;
+  if (k === 0) return { feasible: false, alpha: [], residual: Infinity };
+
+  // Drop zero-row members (force density identically 0 in every
+  // basis direction) — they can never be struts no matter what α
+  // we pick. Keeping them would pin the hinge loss at #zero·ε².
+  const rowIsZero = (row: number[]): boolean => {
+    let s = 0;
+    for (let j = 0; j < k; j++) s += row[j] * row[j];
+    return s < 1e-18;
+  };
+  const strutRows: number[] = [];
+  for (const id of strutIds) {
+    const r = memberIdx.get(id);
+    if (r === undefined) continue;
+    if (rowIsZero(W[r])) continue;
+    strutRows.push(r);
+  }
+
+  if (strutRows.length === 0) {
+    return { feasible: false, alpha: new Array(k).fill(0), residual: Infinity };
+  }
+
+  // Squared-hinge loss with strut-only penalties.
+  //   f(α) = Σ_{e∈M} max(0, ε + (Wα)_e)²
+  //   ∂f/∂α_j = Σ_{e∈M} 2 · max(0, ε + (Wα)_e) · W[e,j]
+  const lossAndGrad = (alpha: number[]): { f: number; g: number[] } => {
+    let f = 0;
+    const g = new Array(k).fill(0);
+    for (const e of strutRows) {
+      let wa = 0;
+      for (let j = 0; j < k; j++) wa += W[e][j] * alpha[j];
+      const v = eps + wa;
+      if (v > 0) {
+        f += v * v;
+        for (let j = 0; j < k; j++) g[j] += 2 * v * W[e][j];
+      }
+    }
+    return { f, g };
+  };
+
+  // ── Seeds ────────────────────────────────────────────────
+  const seeds: number[][] = [];
+
+  // (1) Gradient seed: α₀ = −Σ_{e∈M} W[e,:]. This is the direction
+  //     of steepest descent at the origin (scaled), and for every
+  //     known tensegrity it already lands inside or extremely close
+  //     to the feasible region. We add both the normalised and the
+  //     scaled-up (magnitude 1) versions so line search can pick
+  //     whichever steps the cleanest.
+  {
+    const s = new Array(k).fill(0);
+    for (const e of strutRows) {
+      for (let j = 0; j < k; j++) s[j] -= W[e][j];
+    }
+    let norm = 0;
+    for (const v of s) norm += v * v;
+    norm = Math.sqrt(norm);
+    if (norm > 1e-14) {
+      seeds.push(s.map((v) => v / norm));
+      seeds.push(s.map((v) => -v / norm));
+      // Also a scaled-up variant so the first gradient step exits
+      // the ε-sized basin in one line-search move.
+      seeds.push(s.map((v) => v / norm * 10));
+    }
+  }
+
+  // (2) Least-squares seed: solve Wα = b with b_e = −target on
+  //     strut rows and 0 elsewhere. LS gives a clean interior
+  //     point whenever the polytope is non-empty.
+  {
+    const target = Math.max(10 * eps, 0.1);
+    const b = new Array(E).fill(0);
+    for (const e of strutRows) b[e] = -target;
+    const ls = solve(W, b);
+    if (ls && ls.every((v) => Number.isFinite(v))) {
+      seeds.push(ls);
+    }
+  }
+
+  // (3) Axis-aligned probes ±e_j for the first few coordinates.
+  for (let j = 0; j < Math.min(k, 6); j++) {
+    const s = new Array(k).fill(0);
+    s[j] = 1;
+    seeds.push(s);
+    const s2 = new Array(k).fill(0);
+    s2[j] = -1;
+    seeds.push(s2);
+  }
+
+  // (4) Random uniform seeds.
+  for (let r = 0; r < 8; r++) {
+    const s = new Array(k).fill(0).map(() => Math.random() * 2 - 1);
+    let norm = 0;
+    for (const v of s) norm += v * v;
+    norm = Math.sqrt(norm);
+    if (norm > 1e-14) {
+      for (let j = 0; j < k; j++) s[j] /= norm;
+    }
+    seeds.push(s);
+  }
+
+  // ── Descent ──────────────────────────────────────────────
+  let best = seeds[0] ? [...seeds[0]] : new Array(k).fill(0);
+  let bestF = Infinity;
+
+  for (const seed of seeds) {
+    let alpha = [...seed];
+    let prevF = Infinity;
+    for (let iter = 0; iter < maxIters; iter++) {
+      const { f, g } = lossAndGrad(alpha);
+      if (f < 1e-14) { prevF = f; break; }
+      const gl = Math.sqrt(g.reduce((s, v) => s + v * v, 0));
+      if (gl < 1e-14) { prevF = f; break; }
+      // Back-tracking line search with Armijo-like acceptance.
+      let step = 1.0;
+      let improved = false;
+      for (let ls = 0; ls < 25; ls++) {
+        const trial = alpha.map((a, i) => a - step * g[i]);
+        const ft = lossAndGrad(trial).f;
+        if (ft < f - 1e-10) {
+          alpha = trial;
+          prevF = ft;
+          improved = true;
+          break;
+        }
+        step *= 0.5;
+      }
+      if (!improved) { prevF = f; break; }
+    }
+    const finalF = prevF < Infinity ? prevF : lossAndGrad(alpha).f;
+    if (finalF < bestF) {
+      bestF = finalF;
+      best = alpha;
+    }
+    if (bestF < 1e-14) break;
+  }
+
+  // ── Hard feasibility check ───────────────────────────────
+  const margin = eps * 0.5;
+  let feasible = true;
+  for (const e of strutRows) {
+    let wa = 0;
+    for (let j = 0; j < k; j++) wa += W[e][j] * best[j];
+    if (!(wa <= -margin)) { feasible = false; break; }
+  }
+
+  return { feasible, alpha: best, residual: bestF };
+}
+
 /**
  * Cheap 2-edge feasibility check used by FIND_CONFLICTS. Asks whether a
  * single pair of rows of W can simultaneously hit (-1, +1). The answer
