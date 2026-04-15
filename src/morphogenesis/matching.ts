@@ -81,13 +81,29 @@ export function maximumMatching(
   }
 
   // ── 2. Priority-seeded greedy. ──────────────────────────
+  //
+  // Compute each edge's priority ONCE up-front. The old code
+  // evaluated `priority(a)` and `priority(b)` inside the sort
+  // comparator — fine if the priority is a pure function, but
+  // the search drivers pass stateful RNG-backed priorities
+  // (`() => rng() * 2 - 1`) that advance their internal state
+  // on every call. The sort would then get different values
+  // for the same edge on every comparison, producing random
+  // garbage orderings and making the whole algorithm non-
+  // deterministic. Caching the priority eliminates the
+  // discrepancy and makes matching generation reproducible.
+  // We also use the edge.id (deterministic) as a tie-break
+  // instead of Math.random() for the same reason.
   const match: number[] = new Array(n).fill(-1);
   const order = [...edges];
   if (priority) {
+    const cached = new Map<number, number>();
+    for (const e of edges) cached.set(e.id, priority(e));
     order.sort((a, b) => {
-      const pa = priority(a), pb = priority(b);
+      const pa = cached.get(a.id) ?? 0;
+      const pb = cached.get(b.id) ?? 0;
       if (pa !== pb) return pb - pa;
-      return Math.random() - 0.5;
+      return a.id - b.id;
     });
   }
   for (const e of order) {

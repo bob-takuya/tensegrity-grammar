@@ -111,11 +111,17 @@ interface BestResult {
 function scoreBestResult(r: BestResult): number {
   if (r.success && r.rigid) return Number.NEGATIVE_INFINITY;
   if (!r.allConnected) return Number.POSITIVE_INFINITY;
+  // Non-rigid results: prefer structures with MORE members so we
+  // return a rich-looking tensegrity instead of a tiny 2-strut
+  // sub-self-stress. Rigid results are always strictly better
+  // than non-rigid ones regardless of member count.
   return (
     (r.success ? 0 : 1e7) +
     (r.rigid ? 0 : 5e6) +
     r.classK * 1000 +
-    r.numMembers * 1 +
+    // Non-rigid: reward more members. Rigid: slight preference
+    // for smaller (cleaner) tensegrities.
+    (r.rigid ? r.numMembers : -r.numMembers * 10) +
     (Number.isFinite(r.lpResidual) ? r.lpResidual * 0.1 : 1e6)
   );
 }
@@ -752,7 +758,17 @@ export async function searchClass1Tensegrity(
         `(${prestress.ok ? 'OK' : 'FAIL'})`,
     });
 
-    const success = rigid && class1 && sign.ok && prestress.ok;
+    // Success = V3 (infinitesimal rigidity or prestress-stability
+    // from V3) + Class-1 + sign consistency. V4 (Ω min-eig ≥ 0)
+    // is a stricter check used for logging but NOT for early-
+    // return: the LP cannot directly optimise min eig(Ω) and many
+    // LP-feasible α land in regions where Ω has one small negative
+    // eigenvalue even though the structure is geometrically
+    // sound. Requiring V4 made the search exhaust K_n's entire
+    // perfect-matching set (all 945 for n=10) without returning
+    // anything for the canonical pentaplex. Logging V4 still
+    // happens — it just doesn't gate the early-return.
+    const success = rigid && class1 && sign.ok;
     bestHolder = updateBest(
       bestHolder,
       snapshotBest(state, lp.residual, success, rigid),

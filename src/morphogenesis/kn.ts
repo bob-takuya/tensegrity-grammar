@@ -95,13 +95,23 @@ export function buildKnStructure(
   const { A, lengths } = buildEquilibriumMatrix(state.nodes, state.members);
   const basis = nullspace(A); // basis is a list of |E|-length column vectors
 
-  // Dense |E| × k W matrix.
+  // Dense |E| × k W matrix. We normalise each column of W to
+  // unit Euclidean norm so the magnitudes are invariant to
+  // conditioning of the equilibrium matrix A. Without this step,
+  // near-singular A (e.g. after Phase 0 perturbs coplanar prism
+  // points by 1e-3) produces basis vectors whose elements are
+  // ~1e3, which makes the LP's hinge-loss constants and max|Wα|
+  // unstable across runs.
   const E = state.members.length;
   const dimW = basis.length;
   const W: number[][] = Array.from({ length: E }, () => new Array(dimW).fill(0));
   for (let j = 0; j < dimW; j++) {
     const col = basis[j];
-    for (let e = 0; e < E; e++) W[e][j] = col[e];
+    let norm = 0;
+    for (let e = 0; e < E; e++) norm += col[e] * col[e];
+    norm = Math.sqrt(norm);
+    const inv = norm > 1e-18 ? 1 / norm : 1;
+    for (let e = 0; e < E; e++) W[e][j] = col[e] * inv;
   }
 
   // memberIdx: row-index in W (same as insertion order).
@@ -194,11 +204,14 @@ export function classifyKnEdges(
       maxAbs: 0,
     };
   }
-  // Default threshold: 1% of peak force. Members whose normalised
-  // |w*/max| is below this are zero-force noise; everything else is
-  // signal. The override path lets callers tune the cut-off if a
-  // particular structure has unusually fine-grained signal.
-  const signEps = signEpsOverride ?? 1e-2;
+  // Default threshold: 0.1% of peak force (normalised). A
+  // tighter cutoff than the original 1% so the classifier keeps
+  // more "weakly compressed/stretched" edges in the structure
+  // instead of pruning them as zero-force. Aggressive pruning at
+  // 1% was producing tiny 9-member sub-tensegrities for
+  // symmetric n-prisms because the LP tends to return a
+  // minimum-norm α where most edges sit just below the 1% line.
+  const signEps = signEpsOverride ?? 1e-3;
 
   const strutIds: number[] = [];
   const cableIds: number[] = [];

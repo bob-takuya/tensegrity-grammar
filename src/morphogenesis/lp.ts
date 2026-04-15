@@ -297,6 +297,9 @@ export function lpStrutOnly(
     if (rowIsZero(W[r])) continue;
     strutRows.push(r);
   }
+  // Canonicalise the strut row list so callers that pass the
+  // same member IDs in different orders get bit-identical α.
+  strutRows.sort((a, b) => a - b);
 
   if (strutRows.length === 0) {
     return { feasible: false, alpha: new Array(k).fill(0), residual: Infinity };
@@ -346,17 +349,41 @@ export function lpStrutOnly(
     }
   }
 
-  // (2) Least-squares seed: solve Wα = b with b_e = −target on
-  //     strut rows and 0 elsewhere. LS gives a clean interior
-  //     point whenever the polytope is non-empty.
+  // (2) Least-squares seeds. We use TWO variants:
+  //
+  //   (2a) b_e = −target on strut rows, 0 elsewhere. Minimum-
+  //        norm α that compresses the matching; good for very
+  //        sparse self-stresses.
+  //
+  //   (2b) b_e = −target on strut rows, +target on every non-
+  //        strut row. This asks the LP for an α that compresses
+  //        the matching AND stretches everything else, even
+  //        edges that "should" be zero-force. The LS solution
+  //        projects this over-constrained target onto the
+  //        nearest feasible α, which tends to have FULL SUPPORT
+  //        across the null space basis. For symmetric
+  //        structures like n-prisms and the icosahedron, this
+  //        is the seed that lands in the canonical self-stress
+  //        basin — the minimum-norm LS only finds sub-
+  //        tensegrities because it's allowed to zero out most
+  //        of K_n.
   {
     const target = Math.max(10 * eps, 0.1);
-    const b = new Array(E).fill(0);
-    for (const e of strutRows) b[e] = -target;
-    const ls = solve(W, b);
-    if (ls && ls.every((v) => Number.isFinite(v))) {
-      seeds.push(ls);
+    const strutRowSet = new Set(strutRows);
+    const b1 = new Array(E).fill(0);
+    const b2 = new Array(E).fill(0);
+    for (let e = 0; e < E; e++) {
+      if (strutRowSet.has(e)) {
+        b1[e] = -target;
+        b2[e] = -target;
+      } else {
+        b2[e] = +target;
+      }
     }
+    const ls1 = solve(W, b1);
+    if (ls1 && ls1.every((v) => Number.isFinite(v))) seeds.push(ls1);
+    const ls2 = solve(W, b2);
+    if (ls2 && ls2.every((v) => Number.isFinite(v))) seeds.push(ls2);
   }
 
   // (3) Axis-aligned probes ±e_j for the first few coordinates.
@@ -369,16 +396,45 @@ export function lpStrutOnly(
     seeds.push(s2);
   }
 
-  // (4) Random uniform seeds.
-  for (let r = 0; r < 8; r++) {
-    const s = new Array(k).fill(0).map(() => Math.random() * 2 - 1);
-    let norm = 0;
-    for (const v of s) norm += v * v;
-    norm = Math.sqrt(norm);
-    if (norm > 1e-14) {
-      for (let j = 0; j < k; j++) s[j] /= norm;
+  // (4) All-ones / all-negative-ones. These cover the "every
+  //     basis column contributes equally" direction, which for
+  //     symmetric structures (n-prisms, icosahedron) tends to
+  //     produce the canonical full-support self-stress instead
+  //     of a minimum-norm sub-tensegrity.
+  seeds.push(new Array(k).fill(1));
+  seeds.push(new Array(k).fill(-1));
+  // Also a large-magnitude variant so the first line-search move
+  // reaches deep into the feasible polytope.
+  seeds.push(new Array(k).fill(10));
+  seeds.push(new Array(k).fill(-10));
+
+  // (5) Deterministic pseudo-random uniform seeds (mulberry32
+  //     with a hash of the strut rows so each LP call has a
+  //     reproducible but unique sequence). Math.random() was
+  //     making the algorithm non-deterministic — identical
+  //     inputs gave different α across runs because the LP's
+  //     multi-start explored different basins.
+  {
+    let hashSeed = 0x12345678;
+    for (const e of strutRows) hashSeed = (hashSeed * 31 + e) | 0;
+    let rs = hashSeed >>> 0;
+    const rng = () => {
+      rs += 0x6d2b79f5;
+      let t = rs;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+    for (let r = 0; r < 8; r++) {
+      const s = new Array(k).fill(0).map(() => rng() * 2 - 1);
+      let norm = 0;
+      for (const v of s) norm += v * v;
+      norm = Math.sqrt(norm);
+      if (norm > 1e-14) {
+        for (let j = 0; j < k; j++) s[j] /= norm;
+      }
+      seeds.push(s);
     }
-    seeds.push(s);
   }
 
   // ── Descent ──────────────────────────────────────────────
