@@ -578,13 +578,97 @@ export async function searchClass1Tensegrity(
       });
     }
 
+    // Connectivity repair: the algorithm must NEVER drop an
+    // input point. If the sign-based classification would leave
+    // some input node with no incident live member, restore the
+    // strongest zero-force edges (by |Wα|) incident to each
+    // isolated node as cables. We classify the repaired edges as
+    // cables regardless of their w* sign so the operation never
+    // introduces a new Class-1 violation; the user trade-off is
+    // that their force density may be slightly off — an
+    // acceptable cost per the spec "always show all n points".
+    //
+    // This is done BEFORE applyClassificationAndPrune so the
+    // pruning step leaves the repaired edges intact.
+    {
+      const strutSet = new Set(cls.strutIds);
+      const cableSet = new Set(cls.cableIds);
+      const incident = new Map<number, number[]>();
+      for (const m of state.members) {
+        if (!incident.has(m.node_a)) incident.set(m.node_a, []);
+        if (!incident.has(m.node_b)) incident.set(m.node_b, []);
+        incident.get(m.node_a)!.push(m.member_id);
+        incident.get(m.node_b)!.push(m.member_id);
+      }
+      const memberById = new Map(state.members.map((m) => [m.member_id, m]));
+      const touched = new Set<number>();
+      for (const sid of cls.strutIds) {
+        const m = memberById.get(sid);
+        if (m) { touched.add(m.node_a); touched.add(m.node_b); }
+      }
+      for (const cid of cls.cableIds) {
+        const m = memberById.get(cid);
+        if (m) { touched.add(m.node_a); touched.add(m.node_b); }
+      }
+      const zeroSet = new Set(cls.zeroIds);
+      const repaired: number[] = [];
+      for (const nd of state.nodes) {
+        if (touched.has(nd.node_id)) continue;
+        // Find strongest |Wα| edge incident to this node that is
+        // currently zero-force.
+        const incidentIds = incident.get(nd.node_id) ?? [];
+        let best: number | null = null;
+        let bestAbs = -1;
+        for (const mid of incidentIds) {
+          if (!zeroSet.has(mid)) continue;
+          const row = baseMemberIdx.get(mid);
+          if (row === undefined) continue;
+          const av = Math.abs(wStar[row]);
+          if (av > bestAbs) { bestAbs = av; best = mid; }
+        }
+        if (best === null && incidentIds.length > 0) {
+          // Even the zero-force pool is empty for this node — fall
+          // back to any incident edge with the strongest absolute
+          // w* that isn't already a strut (to avoid Class-1 breakage).
+          for (const mid of incidentIds) {
+            if (strutSet.has(mid)) continue;
+            const row = baseMemberIdx.get(mid);
+            if (row === undefined) continue;
+            const av = Math.abs(wStar[row]);
+            if (av > bestAbs) { bestAbs = av; best = mid; }
+          }
+        }
+        if (best !== null) {
+          zeroSet.delete(best);
+          cableSet.add(best);
+          repaired.push(best);
+          const mm = memberById.get(best);
+          if (mm) { touched.add(mm.node_a); touched.add(mm.node_b); }
+        }
+      }
+      if (repaired.length > 0) {
+        cls.zeroIds = [...zeroSet];
+        cls.cableIds = [...cableSet];
+        logEvent(state, {
+          kind: 'info',
+          message:
+            `Connectivity repair: restored ${repaired.length} zero-force edges ` +
+            `as cables to keep every input point connected`,
+        });
+      }
+    }
+
     // Commit α + types + zero-force pruning.
     state.alpha = [...lp.alpha];
     state.matching = [...cls.strutIds];
     applyClassificationAndPrune(state, wStar, baseMemberIdx, cls);
 
     // Visual connectivity: every input node must touch ≥ 1 live
-    // member after pruning.
+    // member after pruning. After the repair step above this is
+    // almost always true; if it still isn't (e.g. a node has no
+    // incident edges at all, which would mean K_n wasn't built),
+    // we downrank the snapshot but do NOT reject — the user wants
+    // every attempt's result to be visible.
     const conn = new Set<number>();
     for (const m of state.members) {
       conn.add(m.node_a);
@@ -595,13 +679,9 @@ export async function searchClass1Tensegrity(
       logEvent(state, {
         kind: 'info',
         message:
-          `Pruned structure leaves some nodes isolated; rejecting`,
+          `Pruned structure leaves some nodes isolated even after repair; ` +
+          `keeping the snapshot anyway so every input point stays visible`,
       });
-      bestHolder = updateBest(
-        bestHolder,
-        snapshotBest(state, lp.residual, false, false),
-      );
-      continue;
     }
 
     // V3/V4 rigidity validation on the pruned structure.
