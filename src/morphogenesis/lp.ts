@@ -35,6 +35,13 @@ export interface LPCheckResult {
   feasible: boolean;
   alpha: number[];
   residual: number;     // final loss value; 0 ⇔ feasible
+  /**
+   * All α's that hit the feasibility floor during the multi-
+   * start. The caller can score each one against a secondary
+   * criterion (e.g. min-eig of Ω for V4 prestress stability)
+   * and pick whichever passes. Empty if no seed converged.
+   */
+  feasibleAlphas?: number[][];
 }
 
 /**
@@ -349,41 +356,44 @@ export function lpStrutOnly(
     }
   }
 
-  // (2) Least-squares seeds. We use TWO variants:
-  //
-  //   (2a) b_e = −target on strut rows, 0 elsewhere. Minimum-
-  //        norm α that compresses the matching; good for very
-  //        sparse self-stresses.
-  //
-  //   (2b) b_e = −target on strut rows, +target on every non-
-  //        strut row. This asks the LP for an α that compresses
-  //        the matching AND stretches everything else, even
-  //        edges that "should" be zero-force. The LS solution
-  //        projects this over-constrained target onto the
-  //        nearest feasible α, which tends to have FULL SUPPORT
-  //        across the null space basis. For symmetric
-  //        structures like n-prisms and the icosahedron, this
-  //        is the seed that lands in the canonical self-stress
-  //        basin — the minimum-norm LS only finds sub-
-  //        tensegrities because it's allowed to zero out most
-  //        of K_n.
+  // (2) Least-squares seeds. We generate a family of LS seeds
+  //     with different strut/cable magnitude ratios, so the
+  //     caller's V4 scan downstream has several distinct α's
+  //     to pick from. Each canonical tensegrity has a specific
+  //     ratio between strut and cable force densities — Triplex
+  //     wants strut:cable ≈ -3:+1, icosahedron closer to -1:+1,
+  //     n-prisms vary with twist angle. Generating multiple
+  //     ratios lets one of them land in the canonical basin.
   {
-    const target = Math.max(10 * eps, 0.1);
     const strutRowSet = new Set(strutRows);
-    const b1 = new Array(E).fill(0);
-    const b2 = new Array(E).fill(0);
-    for (let e = 0; e < E; e++) {
-      if (strutRowSet.has(e)) {
-        b1[e] = -target;
-        b2[e] = -target;
-      } else {
-        b2[e] = +target;
-      }
+    // b1: strut rows = -target, zero elsewhere (minimum-norm).
+    const target = Math.max(10 * eps, 0.1);
+    {
+      const b = new Array(E).fill(0);
+      for (const e of strutRows) b[e] = -target;
+      const ls = solve(W, b);
+      if (ls && ls.every((v) => Number.isFinite(v))) seeds.push(ls);
     }
-    const ls1 = solve(W, b1);
-    if (ls1 && ls1.every((v) => Number.isFinite(v))) seeds.push(ls1);
-    const ls2 = solve(W, b2);
-    if (ls2 && ls2.every((v) => Number.isFinite(v))) seeds.push(ls2);
+    // b2, b3, ...: varied strut:cable ratios, to cover both
+    // "compress-heavy" (Triplex-like) and "tension-heavy" cases.
+    const ratios: Array<[number, number]> = [
+      [-1, +1],
+      [-1, +0.3],
+      [-1, +3],
+      [-3, +1],
+      [-0.3, +1],
+      [-1, +0.5],
+      [-2, +1],
+      [-1, +2],
+    ];
+    for (const [sC, cC] of ratios) {
+      const b = new Array(E).fill(0);
+      for (let e = 0; e < E; e++) {
+        b[e] = strutRowSet.has(e) ? sC * target : cC * target;
+      }
+      const ls = solve(W, b);
+      if (ls && ls.every((v) => Number.isFinite(v))) seeds.push(ls);
+    }
   }
 
   // (3) Axis-aligned probes ±e_j for the first few coordinates.
@@ -438,8 +448,17 @@ export function lpStrutOnly(
   }
 
   // ── Descent ──────────────────────────────────────────────
+  //
+  // We collect ALL feasible α's from the multi-start (the ones
+  // where the hinge loss hit zero) and return a ranked list so
+  // the caller can pick whichever one best serves its
+  // downstream criterion — typically the α that gives the
+  // highest min-eig(Ω), aka passes V4 prestress stability. If
+  // no seed reached feasibility, we return the single best
+  // (lowest hinge loss) α and mark feasible = false.
   let best = seeds[0] ? [...seeds[0]] : new Array(k).fill(0);
   let bestF = Infinity;
+  const feasibleCandidates: number[][] = [];
 
   for (const seed of seeds) {
     let alpha = [...seed];
@@ -449,7 +468,6 @@ export function lpStrutOnly(
       if (f < 1e-14) { prevF = f; break; }
       const gl = Math.sqrt(g.reduce((s, v) => s + v * v, 0));
       if (gl < 1e-14) { prevF = f; break; }
-      // Back-tracking line search with Armijo-like acceptance.
       let step = 1.0;
       let improved = false;
       for (let ls = 0; ls < 25; ls++) {
@@ -470,7 +488,17 @@ export function lpStrutOnly(
       bestF = finalF;
       best = alpha;
     }
-    if (bestF < 1e-14) break;
+    // Collect every α that reached the feasibility floor. The
+    // hinge loss can hover around |E|·ε² at the trivial-α origin,
+    // so we use a loose "hard feasible" test (every strut row
+    // has Wα ≤ -ε/2) to decide whether to include this seed.
+    let isHardFeasible = true;
+    for (const e of strutRows) {
+      let wa = 0;
+      for (let j = 0; j < k; j++) wa += W[e][j] * alpha[j];
+      if (!(wa <= -eps * 0.5)) { isHardFeasible = false; break; }
+    }
+    if (isHardFeasible) feasibleCandidates.push([...alpha]);
   }
 
   // ── Hard feasibility check ───────────────────────────────
@@ -482,7 +510,12 @@ export function lpStrutOnly(
     if (!(wa <= -margin)) { feasible = false; break; }
   }
 
-  return { feasible, alpha: best, residual: bestF };
+  return {
+    feasible,
+    alpha: best,
+    residual: bestF,
+    feasibleAlphas: feasibleCandidates,
+  };
 }
 
 /**

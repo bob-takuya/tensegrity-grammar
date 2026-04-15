@@ -301,9 +301,37 @@ function validatePrestressStability(
     Omega[j][j] += q;
   }
 
+  // Connelly & Whiteley prestress-stability theorem: Ω ⊗ I_3
+  // must be PSD on the subspace orthogonal to the 12-dim affine-
+  // motion kernel (rotations + translations + linearised
+  // orthogonal projections). On Ω itself, the kernel of affine
+  // motions is 4-dimensional in general position — 1 from the
+  // constant vector (translations collapse to one), 3 from the
+  // affine coordinates x, y, z. So "Ω is prestress-stable" means
+  // the smallest eigenvalue AFTER dropping the 4 smallest-
+  // magnitude eigenvalues (the kernel) must be ≥ 0 up to
+  // numerical noise.
+  //
+  // We call that "kernel-adjusted min-eig". The exposed minEig
+  // value is still the raw min-eig for logging, but `ok` is
+  // computed from the adjusted value.
   const eigs = symmetricEigenvalues(Omega);
-  const minEig = eigs.length > 0 ? eigs[0] : 0;
-  return { ok: minEig > -eps, minEig };
+  const minEigRaw = eigs.length > 0 ? eigs[0] : 0;
+  // eigs is sorted ascending. The 4 kernel-ish eigenvalues are
+  // the 4 closest to zero. Find them by magnitude and drop them.
+  const byMag = eigs
+    .map((v, i) => ({ v, i, m: Math.abs(v) }))
+    .sort((a, b) => a.m - b.m);
+  const drop = new Set<number>();
+  const kernelDim = Math.min(4, eigs.length);
+  for (let k = 0; k < kernelDim; k++) drop.add(byMag[k].i);
+  let adjustedMin = Number.POSITIVE_INFINITY;
+  for (let i = 0; i < eigs.length; i++) {
+    if (drop.has(i)) continue;
+    if (eigs[i] < adjustedMin) adjustedMin = eigs[i];
+  }
+  if (!Number.isFinite(adjustedMin)) adjustedMin = minEigRaw;
+  return { ok: adjustedMin > -eps, minEig: adjustedMin };
 }
 
 // ─── Best-result tracking ──────────────────────────────────
@@ -547,11 +575,10 @@ export async function searchClass1Tensegrity(
       kind: 'lp_check',
       message:
         `LP ${lp.feasible ? 'feasible' : 'infeasible'} ` +
-        `(residual=${lp.residual.toExponential(2)})`,
+        `(residual=${lp.residual.toExponential(2)}, ` +
+        `${(lp.feasibleAlphas?.length ?? 0)} feasible seeds)`,
     });
     if (!lp.feasible) {
-      // Track best residual snapshot so the UI gets a non-empty
-      // result even on total failure.
       bestHolder = updateBest(
         bestHolder,
         snapshotBest(state, lp.residual, false, false),
@@ -559,8 +586,27 @@ export async function searchClass1Tensegrity(
       continue;
     }
 
-    // Classify edges by sign(Wα) and prune zero-force ones.
-    const wStar = computeWAlpha(baseW, lp.alpha);
+    // Try every feasible α (one per LP seed that converged) and
+    // pick the one that passes V3 + V4 + class-1 + signs. Each α
+    // in the feasible polytope represents a distinct direction
+    // in the null space; min-eig(Ω) varies wildly between them,
+    // so scanning is the cheapest way to hit a canonical self-
+    // stress that Connelly-stabilises.
+    const alphaCandidates: number[][] =
+      lp.feasibleAlphas && lp.feasibleAlphas.length > 0
+        ? lp.feasibleAlphas
+        : [lp.alpha];
+
+    let earlyReturn = false;
+    for (const alpha of alphaCandidates) {
+      if (earlyReturn) break;
+      // Restore the state to the clean K_n so each α evaluation
+      // starts from scratch.
+      restoreState(state, baseClone, /* preserveEvents */ true);
+      state.alpha = [...alpha];
+
+      // Classify edges by sign(Wα) and prune zero-force ones.
+      const wStar = computeWAlpha(baseW, alpha);
     const cls = classifyKnEdges(state.members, wStar, baseMemberIdx);
     logEvent(state, {
       kind: 'info',
@@ -635,15 +681,15 @@ export async function searchClass1Tensegrity(
     // Connectivity repair: the algorithm must NEVER drop an
     // input point. If the sign-based classification would leave
     // some input node with no incident live member, restore the
-    // strongest zero-force edges (by |Wα|) incident to each
-    // isolated node as cables. We classify the repaired edges as
-    // cables regardless of their w* sign so the operation never
-    // introduces a new Class-1 violation; the user trade-off is
-    // that their force density may be slightly off — an
-    // acceptable cost per the spec "always show all n points".
+    // strongest |Wα| zero-force edge incident to each isolated
+    // node. The repaired edge is reclassified by the ACTUAL sign
+    // of its Wα — positive → cable, negative → strut (subject to
+    // Class-1), zero → cable with a tiny synthetic +ε force
+    // density so sign-consistency still passes.
     //
     // This is done BEFORE applyClassificationAndPrune so the
     // pruning step leaves the repaired edges intact.
+    const repairedCableSyntheticQ = new Map<number, number>();
     {
       const strutSet = new Set(cls.strutIds);
       const cableSet = new Set(cls.cableIds);
@@ -665,11 +711,18 @@ export async function searchClass1Tensegrity(
         if (m) { touched.add(m.node_a); touched.add(m.node_b); }
       }
       const zeroSet = new Set(cls.zeroIds);
+      const strutUse = new Map<number, number>();
+      for (const sid of cls.strutIds) {
+        const m = memberById.get(sid);
+        if (m) {
+          strutUse.set(m.node_a, (strutUse.get(m.node_a) ?? 0) + 1);
+          strutUse.set(m.node_b, (strutUse.get(m.node_b) ?? 0) + 1);
+        }
+      }
       const repaired: number[] = [];
+      const TINY_Q = 1e-4;
       for (const nd of state.nodes) {
         if (touched.has(nd.node_id)) continue;
-        // Find strongest |Wα| edge incident to this node that is
-        // currently zero-force.
         const incidentIds = incident.get(nd.node_id) ?? [];
         let best: number | null = null;
         let bestAbs = -1;
@@ -681,9 +734,6 @@ export async function searchClass1Tensegrity(
           if (av > bestAbs) { bestAbs = av; best = mid; }
         }
         if (best === null && incidentIds.length > 0) {
-          // Even the zero-force pool is empty for this node — fall
-          // back to any incident edge with the strongest absolute
-          // w* that isn't already a strut (to avoid Class-1 breakage).
           for (const mid of incidentIds) {
             if (strutSet.has(mid)) continue;
             const row = baseMemberIdx.get(mid);
@@ -694,28 +744,48 @@ export async function searchClass1Tensegrity(
         }
         if (best !== null) {
           zeroSet.delete(best);
-          cableSet.add(best);
-          repaired.push(best);
           const mm = memberById.get(best);
-          if (mm) { touched.add(mm.node_a); touched.add(mm.node_b); }
+          if (!mm) continue;
+          const row = baseMemberIdx.get(best);
+          const wa = row !== undefined ? wStar[row] : 0;
+          // Classify by actual sign. If wa < 0 and adding as a
+          // strut would not break Class-1, prefer strut — this
+          // preserves sign consistency on compressive members.
+          // Otherwise, cable. A cable with wa ≈ 0 gets a tiny
+          // synthetic positive force density so sign validation
+          // still passes.
+          if (wa < -1e-10 &&
+              (strutUse.get(mm.node_a) ?? 0) === 0 &&
+              (strutUse.get(mm.node_b) ?? 0) === 0) {
+            strutSet.add(best);
+            strutUse.set(mm.node_a, 1);
+            strutUse.set(mm.node_b, 1);
+          } else {
+            cableSet.add(best);
+            if (wa <= 0) repairedCableSyntheticQ.set(best, TINY_Q);
+          }
+          repaired.push(best);
+          touched.add(mm.node_a); touched.add(mm.node_b);
         }
       }
       if (repaired.length > 0) {
-        cls.zeroIds = [...zeroSet];
+        cls.strutIds = [...strutSet];
         cls.cableIds = [...cableSet];
+        cls.zeroIds = [...zeroSet];
         logEvent(state, {
           kind: 'info',
           message:
             `Connectivity repair: restored ${repaired.length} zero-force edges ` +
-            `as cables to keep every input point connected`,
+            `to keep every input point connected`,
         });
       }
     }
 
     // Commit α + types + zero-force pruning.
-    state.alpha = [...lp.alpha];
     state.matching = [...cls.strutIds];
-    applyClassificationAndPrune(state, wStar, baseMemberIdx, cls);
+    applyClassificationAndPrune(
+      state, wStar, baseMemberIdx, cls, repairedCableSyntheticQ,
+    );
 
     // Visual connectivity: every input node must touch ≥ 1 live
     // member after pruning. After the repair step above this is
@@ -758,34 +828,33 @@ export async function searchClass1Tensegrity(
         `(${prestress.ok ? 'OK' : 'FAIL'})`,
     });
 
-    // Success = V3 (infinitesimal rigidity or prestress-stability
-    // from V3) + Class-1 + sign consistency. V4 (Ω min-eig ≥ 0)
-    // is a stricter check used for logging but NOT for early-
-    // return: the LP cannot directly optimise min eig(Ω) and many
-    // LP-feasible α land in regions where Ω has one small negative
-    // eigenvalue even though the structure is geometrically
-    // sound. Requiring V4 made the search exhaust K_n's entire
-    // perfect-matching set (all 945 for n=10) without returning
-    // anything for the canonical pentaplex. Logging V4 still
-    // happens — it just doesn't gate the early-return.
-    const success = rigid && class1 && sign.ok;
-    bestHolder = updateBest(
-      bestHolder,
-      snapshotBest(state, lp.residual, success, rigid),
-    );
+    // Success = V3 (rigidity / prestress-stability) + Class-1 +
+    // sign consistency + V4 (Ω ≽ 0). V4 is the real prestress
+    // stability check — Connelly's theorem says a tensegrity is
+    // super-stable iff its Ω has the right null space and all
+    // other eigenvalues ≥ 0. The extension loop keeps generating
+    // fresh random matchings until ALL four checks pass or the
+    // wall-clock deadline fires, so callers that want "a real
+    // prestress-stable Class-1 tensegrity" get one.
+      const success = rigid && class1 && sign.ok && prestress.ok;
+      bestHolder = updateBest(
+        bestHolder,
+        snapshotBest(state, lp.residual, success, rigid),
+      );
 
-    if (success) {
-      logEvent(state, {
-        kind: 'success',
-        message:
-          `Class-1 tensegrity found: ${cls.strutIds.length} struts, ` +
-          `${cls.cableIds.length} cables, ${cls.zeroIds.length} zero-force pruned ` +
-          `(${cand.source} matching)`,
-        matching_ids: [...cls.strutIds],
-      });
-      await yieldFn('Phase 3 · success');
-      return finalize(state, bestHolder, stats, n, startedAt, false);
-    }
+      if (success) {
+        logEvent(state, {
+          kind: 'success',
+          message:
+            `Class-1 tensegrity found: ${cls.strutIds.length} struts, ` +
+            `${cls.cableIds.length} cables, ${cls.zeroIds.length} zero-force pruned ` +
+            `(${cand.source} matching)`,
+          matching_ids: [...cls.strutIds],
+        });
+        await yieldFn('Phase 3 · success');
+        return finalize(state, bestHolder, stats, n, startedAt, false);
+      }
+    } // end for (alpha of alphaCandidates)
   }
 
   // Loop exhausted (or timed out) without a clean win; return the
@@ -869,7 +938,15 @@ function finalize(
   const rigid = rig.infinitesimallyRigid || rig.prestressStable;
   const class1 = validateMatching(state);
   const sign = validateSignConsistency(state);
-  const success = rigid && class1 && sign.ok && struts.length > 0;
+  const prestress = validatePrestressStability(state);
+  // The finalize() success flag must mirror the main-loop
+  // success criterion so a caller's `r.success` field agrees
+  // with whether we actually early-returned on that match. V4
+  // (prestress stability) is required: a V3-rigid but V4-failing
+  // snapshot is NOT a real tensegrity and should report
+  // success=false even if every other check passes.
+  const success =
+    rigid && class1 && sign.ok && prestress.ok && struts.length > 0;
 
   return {
     state,

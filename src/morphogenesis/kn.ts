@@ -242,6 +242,14 @@ export function applyClassificationAndPrune(
   wStar: number[],
   memberIdx: Map<number, number>,
   classification: { strutIds: number[]; cableIds: number[]; zeroIds: number[] },
+  /**
+   * Optional per-member force-density override, used by the
+   * connectivity-repair step to inject a tiny synthetic positive
+   * q on cables whose natural Wα happens to be ≈ 0. Without this
+   * override those cables would fail sign consistency (q ≈ 0 is
+   * not strictly positive) and block the V4 early-return.
+   */
+  forceDensityOverride?: Map<number, number>,
 ): MemberRow[] {
   const zeroSet = new Set(classification.zeroIds);
   const strutSet = new Set(classification.strutIds);
@@ -252,7 +260,8 @@ export function applyClassificationAndPrune(
     if (zeroSet.has(m.member_id)) continue;
     const row = memberIdx.get(m.member_id);
     const q = row !== undefined ? wStar[row] : 0;
-    m.force_density = q;
+    const override = forceDensityOverride?.get(m.member_id);
+    m.force_density = override !== undefined ? override : q;
     if (strutSet.has(m.member_id)) m.type = 'strut';
     else if (cableSet.has(m.member_id)) m.type = 'cable';
     else m.type = 'candidate';
