@@ -39,6 +39,7 @@ import {
   classifyKnEdges,
   applyClassificationAndPrune,
   generateMatchingCandidates,
+  generateRandomMatching,
 } from './kn';
 import { maximumMatching } from './matching';
 import { vol } from './geometry';
@@ -466,12 +467,59 @@ export async function searchClass1Tensegrity(
 
   let bestHolder: BestResult | null = null;
 
-  for (let ci = 0; ci < candidates.length; ci++) {
-    if (await yieldFn(`Phase 3 · matching ${ci + 1}/${candidates.length}`)) {
+  // ── Iterate matching candidates until success OR timeout ──
+  //
+  // We FIRST exhaust the deterministic candidate list (strutness,
+  // length, spanning, random with the seed RNG). If none of those
+  // yield a V3+V4 valid structure, we KEEP generating fresh
+  // random matchings on a caller-time-seeded RNG until the
+  // wall-clock deadline — the user asked the algorithm not to
+  // stop just because V3/V4 haven't succeeded on the initial
+  // batch of matchings. Each new matching is deduplicated against
+  // everything we've already tried so we never waste an LP call
+  // on a repeat.
+  const triedSignatures = new Set<string>();
+  const sigOf = (ids: number[]) =>
+    ids.slice().sort((a, b) => a - b).join(',');
+  for (const c of candidates) triedSignatures.add(sigOf(c.ids));
+
+  const extensionRng = mulberry32((seed ?? Date.now()) ^ 0xdeadbeef);
+  let extensionIdx = 0;
+
+  async function* matchingStream() {
+    for (const cand of candidates) yield cand;
+    // Keep generating new random matchings until the driver's
+    // timeout loop observer fires. We bound the extension count
+    // at a generous ceiling so an absurdly high timeout can't
+    // spin forever even if the LP is pathologically cheap.
+    //
+    // IMPORTANT: generate on the *untouched* K_n clone, not the
+    // live state. Between yields the main loop prunes zero-force
+    // edges from state.members, so passing `state` here would
+    // shrink the candidate edge set every iteration and
+    // eventually return an empty matching, ending the stream
+    // prematurely. baseClone always holds the pristine K_n edge
+    // list, so random matchings are always drawn from the full
+    // pool.
+    const HARD_CAP = 10_000;
+    while (extensionIdx < HARD_CAP) {
+      extensionIdx++;
+      const ids = generateRandomMatching(baseClone, extensionRng);
+      if (ids.length === 0) return;
+      const sig = sigOf(ids);
+      if (triedSignatures.has(sig)) continue;
+      triedSignatures.add(sig);
+      yield { ids, source: `extend#${extensionIdx}` };
+    }
+  }
+
+  let ci = 0;
+  for await (const cand of matchingStream()) {
+    ci++;
+    if (await yieldFn(`Phase 3 · matching ${ci}`)) {
       // Time's up.
       break;
     }
-    const cand = candidates[ci];
     stats.matchingsTried++;
     stats.nodesExpanded++;
 
@@ -483,7 +531,7 @@ export async function searchClass1Tensegrity(
     logEvent(state, {
       kind: 'matching',
       message:
-        `Iter ${ci + 1}: ${cand.source} matching, size ${cand.ids.length} / ⌊n/2⌋=${Math.floor(n / 2)}`,
+        `Iter ${ci}: ${cand.source} matching, size ${cand.ids.length} / ⌊n/2⌋=${Math.floor(n / 2)}`,
       matching_ids: [...cand.ids],
     });
 

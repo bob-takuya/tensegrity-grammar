@@ -252,6 +252,24 @@ export function applyClassificationAndPrune(
 // ── Matching enumeration ─────────────────────────────────────
 
 /**
+ * Produce a single random maximum matching on the given state's
+ * members. The caller drives its own RNG so successive calls in
+ * a long-running search are reproducible.
+ */
+export function generateRandomMatching(
+  state: MorphogenesisState,
+  rng: () => number,
+): number[] {
+  const edges = state.members.map((m) => ({
+    id: m.member_id,
+    node_a: m.node_a,
+    node_b: m.node_b,
+  }));
+  if (edges.length === 0) return [];
+  return maximumMatching(edges, () => rng() * 2 - 1);
+}
+
+/**
  * A single strutness-priority candidate matching. The caller
  * consumes these one at a time and runs lpStrutOnly on each.
  */
